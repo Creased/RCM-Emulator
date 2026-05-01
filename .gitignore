@@ -1,0 +1,22 @@
+# Build artifacts
+rcm_emu
+*.o
+*.d
+
+# Runtime captures
+last_fb.rgba
+last_fb.meta
+last_fb*.png
+out.log
+emu_run*.log
+
+# User data — never commit dumps or keys
+*.img
+*.bin
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+__pycache__/
+*.pyc
