@@ -21,7 +21,10 @@ OBJS = $(SRCS:.cpp=.o)
 OUTPUT = rcm_emu
 
 CXX = g++
-CXXFLAGS = -Wall -g -O2 -std=c++17 -I. -I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends
+# -MMD -MP emits .d sidecar files with each .o so a header change forces a
+# rebuild of every TU that includes it. Avoids stale-layout bugs when EmuState
+# (or any other shared header) gains a new field.
+CXXFLAGS = -Wall -g -O2 -std=c++17 -MMD -MP -I. -I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends
 LDFLAGS =
 LIBS = -lunicorn -lSDL2 -lpthread
 
@@ -41,14 +44,12 @@ all: $(OUTPUT)
 $(OUTPUT): $(OBJS)
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-# Header dependencies
-main.o: main.cpp emu_state.h t210/memory_map.h t210/mmio.h display/sdl_display.h display/config_window.h
-t210/mmio.o: t210/mmio.cpp t210/mmio.h t210/memory_map.h t210/tegra_bl.h emu_state.h
-display/sdl_display.o: display/sdl_display.cpp display/sdl_display.h display/config_window.h emu_state.h t210/tegra_bl.h
-display/config_window.o: display/config_window.cpp display/config_window.h emu_state.h
-
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
+# Pull in the header-dep .d sidecars produced by -MMD. Silenced on first build
+# (or after `make clean`) since the files don't exist yet.
+-include $(OBJS:.o=.d)
+
 clean:
-	rm -f $(OUTPUT) $(OBJS)
+	rm -f $(OUTPUT) $(OBJS) $(OBJS:.o=.d)
