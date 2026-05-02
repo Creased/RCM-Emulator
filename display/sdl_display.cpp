@@ -1,4 +1,5 @@
 #include "sdl_display.h"
+#include "config_window.h"
 #include "../emu_state.h"
 #include "../t210/memory_map.h"
 
@@ -6,6 +7,24 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+
+// Some SDL events are not window-targeted (e.g. SDL_QUIT). Returns true only
+// for events that carry a windowID matching the config window.
+static bool event_targets_config_window(const SDL_Event &ev) {
+    Uint32 cfg_id = config_window_id();
+    if (cfg_id == 0) return false;
+    switch (ev.type) {
+    case SDL_WINDOWEVENT:      return ev.window.windowID    == cfg_id;
+    case SDL_KEYDOWN:
+    case SDL_KEYUP:            return ev.key.windowID       == cfg_id;
+    case SDL_TEXTINPUT:        return ev.text.windowID      == cfg_id;
+    case SDL_MOUSEBUTTONDOWN:
+    case SDL_MOUSEBUTTONUP:    return ev.button.windowID    == cfg_id;
+    case SDL_MOUSEMOTION:      return ev.motion.windowID    == cfg_id;
+    case SDL_MOUSEWHEEL:       return ev.wheel.windowID     == cfg_id;
+    default:                   return false;
+    }
+}
 
 static SDL_Window *window = nullptr;
 static SDL_Renderer *renderer = nullptr;
@@ -379,6 +398,23 @@ bool sdl_display_poll_events(EmuState *state, uc_engine *uc) {
       state->running = false;
       return false;
     }
+    // SDL_QUIT only fires when the *last* window closes; in multi-window
+    // setups the per-window close button just emits SDL_WINDOWEVENT_CLOSE.
+    // Treat closing the main window as "quit", and let the config window's
+    // close be handled by its own handler below (which just hides it).
+    if (event.type == SDL_WINDOWEVENT &&
+        event.window.event == SDL_WINDOWEVENT_CLOSE &&
+        event.window.windowID != config_window_id()) {
+      state->running = false;
+      return false;
+    }
+    // Route events targeting the hardware config window to ImGui and skip
+    // the main-window handlers below (so e.g. typing into a hex input doesn't
+    // also press POWER).
+    if (event_targets_config_window(event)) {
+      config_window_handle_event(event);
+      continue;
+    }
     // ---- Mouse → FTS4 touchscreen events ----
     if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
       uint16_t px = 0, py = 0;
@@ -469,6 +505,11 @@ bool sdl_display_poll_events(EmuState *state, uc_engine *uc) {
             (g_swizzle_override == -1) ? 0 : (g_swizzle_override == 0 ? 2 : -1);
         printf("[diag] Swizzle Override: %d (-1=Auto, 0=Pitch, 2=Block)\n",
                g_swizzle_override);
+        break;
+      case SDLK_m:
+        config_window_toggle();
+        printf("[diag] Config window %s\n",
+               config_window_is_visible() ? "OPEN" : "CLOSED");
         break;
       case SDLK_ESCAPE:
         state->running = false;

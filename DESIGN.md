@@ -12,13 +12,20 @@ flowchart TB
 
     main -->|uc_emu_start| uc["<b>Unicorn Engine</b><br/>ARM32, T210<br/>IRAM / DRAM / MMIO"]
     main -->|sdl_display_*| sdl["<b>display/sdl_display</b><br/>block-linear de-swizzle<br/>rotate, blit"]
+    main -->|config_window_*| cfg["<b>display/config_window</b><br/>2nd SDL window + ImGui<br/>live hardware tweaks"]
 
     uc -->|MMIO trap| mmio["<b>t210/mmio.cpp</b><br/>central read/write dispatch<br/>by address range"]
 
     mmio --> sdmmc["<b>sdmmc</b><br/>SDMMC1 / SDMMC4<br/>CMD0..18, EXT_CSD, ADMA2"]
     mmio --> se["<b>se_engine</b><br/>AES-128, SHA-256<br/>BIS keyslot override"]
     mmio --> i2c["<b>i2c3</b><br/>STMFTS / FTS4 touch"]
+    mmio --> i2c1["<b>I2C_1 slaves</b> (inline)<br/>MAX17050, TMP451,<br/>BQ24193, BM92T36"]
+    mmio --> i2c5["<b>I2C_5 slaves</b> (inline)<br/>MAX77620, MAX77621"]
     mmio --> stubs["<b>inline stubs</b><br/>GPIO, PMC, TSEC, KFUSE,<br/>PWM, DC, CLK, TMR, FUSE, UART"]
+
+    cfg -.->|writes atomics| state["<b>EmuState</b><br/>(emu_state.h)"]
+    i2c1 -.->|reads atomics| state
+    i2c5 -.->|reads atomics| state
 ```
 
 `EmuState` (`emu_state.h`) is the single shared struct. It holds button atomics,
@@ -134,6 +141,81 @@ SDL keyboard handler. The MMIO read handlers map them onto:
 - VOL+ and VOL– map to GPIO X6 and X7 (active-low) on port X.
 - POWER routes through the MAX77620 PMIC (Power Management IC), reported via
   `ONOFFSTAT.EN0` over I²C5.
+- GPIO Port Z bit 1 reflects `state->sd_inserted` (active-low). Toggle it from
+  the config window to simulate SD eject mid-boot.
+
+### I²C-attached chips (battery, charger, thermal, USB-PD, PMIC ID)
+
+Modelled inline in `t210/mmio.cpp::i2c_read`. The bus is disambiguated by
+`bool on_i2c5 = (addr >= I2C5_BASE)`, which lets the same slave address
+serve different chips on different buses. The Synaptics RMI4 stub on I²C1
+@ 0x4C was retired once `i2c3.cpp` took over real touch handling, and
+TMP451 took the freed address.
+
+| Chip       | Bus / addr     | Reg dispatch                                        |
+| ---------- | -------------- | --------------------------------------------------- |
+| MAX17050   | I²C\_1 @ 0x36  | "Small" path (CMD\_DATA1 read), 13 regs handled     |
+| TMP451     | I²C\_1 @ 0x4C  | Small path; int byte + frac-nibble per channel      |
+| BQ24193    | I²C\_1 @ 0x6B  | Small path; 7 regs reverse-encoded from EmuState    |
+| BM92T36    | I²C\_1 @ 0x18  | Packet-mode path (TX\_FIFO/RX\_FIFO FSM)            |
+| MAX77620   | I²C\_5 @ 0x3C  | Small path; ONOFFSTAT + CID3/CID4/CID5              |
+| MAX77621   | I²C\_5 @ 0x1B  | Small path; CHIPID1                                 |
+
+Every register handler reverse-encodes the user-facing decoded value
+(stored in `EmuState`) to match the chip's raw register format that the
+Hekate `bdk/power/*.c` drivers expect. A slider that reads "2000 mA"
+maps to the BQ24193 INLIMIT bucket whose decode formula yields back
+2000 mA. Round-trip clean. The encoders mirror the `*_get_property()`
+formulas in Hekate. If those units change upstream, re-derive ours from
+the same source.
+
+#### Packet-mode I²C (BM92T36)
+
+Most slaves on the Switch use Hekate's "small" I²C transactions: write a
+register byte, read 1–4 bytes back via `CMD_DATA1`. BM92T36 (USB-PD,
+USB Power Delivery) uses the Tegra packet mode instead. A 3-word header
+is streamed into `TX_FIFO`, then the CPU drains data from `RX_FIFO`
+while polling `FIFO_STATUS`. `mmio.cpp` carries a per-bus `PacketState`
+FSM (Finite State Machine):
+
+1. Watch `TX_FIFO` writes. The PROT magic word (`BIT(4)`) starts a new
+   packet, and subsequent words are `(size-1, header, payload…)`.
+2. The header word carries `dev_addr` and a `READ` flag.
+3. On a read header, populate a 64-byte `rx_buf` for the slave/register
+   pair. Currently only BM92T36 needs this (`bm92t36_fill_rx`).
+4. `RX_FIFO` reads drain `rx_buf` 4 bytes at a time.
+   `PACKET_TRANSFER_STATUS` returns `(payload_size - 1) << 4` so the
+   Hekate wait loop exits immediately.
+
+Adding a new packet-mode slave is one extra branch in `packet_populate_rx`
+plus a `<slave>_fill_rx` helper.
+
+### Live config window (`display/config_window.cpp`)
+
+A second SDL window (`SDL_WINDOW_HIDDEN` until the user presses `M`)
+hosting Dear ImGui sliders, combos and hex inputs. Edits write directly
+to the `EmuState` atomics that the I²C, GPIO and fuse handlers read on
+each register access. Two cooperative pieces:
+
+- Window dispatch. `display/sdl_display.cpp::sdl_display_poll_events`
+  inspects each SDL event's `windowID`. Events targeting the config
+  window are forwarded to `config_window_handle_event`, which feeds the
+  ImGui SDL2 backend. Events targeting the main window run through the
+  existing Switch-button handlers.
+- Lifecycle. `main.cpp` calls `config_window_init` once after
+  `sdl_display_init`, calls `config_window_render` in the same 16 ms
+  display tick, and calls `config_window_shutdown` before the SDL display
+  tear-down.
+
+`SDL_QUIT` only fires when the last window closes. The main poll loop
+also catches `SDL_WINDOWEVENT_CLOSE` on the main window ID and treats it
+as quit. The config window's close button just hides it (`M` reopens).
+
+ImGui ships as a git submodule under `third_party/imgui`. A shallow
+clone is sufficient. Only the `imgui_*.cpp` core plus the SDL2 and
+SDL\_Renderer2 backends are compiled in (not the demo). The Makefile
+lists those sources explicitly, so later additions like `imgui_demo.cpp`
+do not auto-creep into the build.
 
 ### Display pipeline (`display/sdl_display.cpp`)
 
@@ -178,6 +260,12 @@ TegraExplorer tree, not this repo.
 - **Timer and RTC.** Backed by `EmuState::emu_usec`, incremented per CPU
   batch by a fixed amount so timing is deterministic across runs. The
   auto-script feature relies on this.
+- **Probe-magic constants.** Several reads return fixed values, not because
+  they are tweakable but because the chip-detection code expects exact
+  cookies: `MAX17050.DevName=0x00AC`, `BQ24193.VendorPart=0x2F`, the BM92T36
+  `FW_TYPE`/`MAN_ID`/`DEV_ID` triple, `TSEC.STATUS=0xB0B0B0B0`,
+  `KFUSE.STATE=DONE|CRCPASS`, `PLL_BASE=ENABLE|LOCK`. Changing them breaks
+  the Hekate init path. They are hardcoded by design.
 
 ## Determinism and the auto-script flag
 

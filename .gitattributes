@@ -1,0 +1,10 @@
+# Normalize text files to LF in the repo. Platform-native on checkout.
+* text=auto eol=lf
+
+# Binary file types kept untouched.
+*.png  binary
+*.jpg  binary
+*.bmp  binary
+*.bin  binary
+*.img  binary
+*.bso  binary

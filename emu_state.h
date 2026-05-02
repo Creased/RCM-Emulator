@@ -116,6 +116,63 @@ struct EmuState {
     std::atomic<int> touch_phase{0};
     uint16_t touch_x = 360; // Portrait X coordinate (0-719)
     uint16_t touch_y = 640; // Portrait Y coordinate (0-1279)
+
+    // ==================== Tweakable hardware values (config window) ====================
+    // Battery fuel gauge (MAX17050, I2C_1 @ 0x36).
+    // UI-friendly units; the I2C handler converts to MAX17050's raw register
+    // encoding (cf. Hekate's max17050_get_property formulas).
+    std::atomic<uint16_t> bat_soc_pct{80};          // RepSOC: percent (0-100)
+    std::atomic<uint16_t> bat_vcell_mv{3950};       // VCELL:  mV
+    std::atomic<int16_t>  bat_temp_c10{250};        // TEMP:   °C * 10 (UI unit), e.g. 250 -> 25.0°C
+    std::atomic<int16_t>  bat_current_ma{0};        // Current: signed mA
+    std::atomic<uint16_t> bat_capacity_mah{3500};   // RepCap:  mAh (current charge)
+    std::atomic<uint16_t> bat_full_cap_mah{4000};   // FullCAP: mAh (learned full capacity)
+    std::atomic<uint16_t> bat_design_cap_mah{4310}; // DesignCap: mAh (Switch nominal)
+    std::atomic<uint16_t> bat_ocv_mv{3960};         // OCVInternal: mV (open-circuit)
+    std::atomic<uint16_t> bat_v_empty_mv{3300};     // V_empty: mV
+    std::atomic<uint16_t> bat_min_volt_mv{3500};    // MinMaxVolt low byte * 20
+    std::atomic<uint16_t> bat_max_volt_mv{4200};    // MinMaxVolt high byte * 20
+    std::atomic<uint8_t>  bat_age_pct{100};         // Age: percent (Age MSB)
+    std::atomic<uint16_t> bat_cycles{0};            // Cycles count
+
+    // Main PMIC OEM (MAX77620 CID4): 0x35 = Erista, 0x53 = Mariko, other = Unknown
+    std::atomic<uint8_t>  pmic_otp{0x35};
+    std::atomic<uint8_t>  pmic_silicon_rev{0};       // MAX77620 CID3 low nibble: "max77620 v%d"
+    std::atomic<uint8_t>  cpu_pmic_version{0};       // MAX77621 CHIPID1: "max77621 v%d"
+
+    // SD card insertion (GPIO Port Z bit 1 = 0 means inserted).
+    std::atomic<bool>     sd_inserted{true};
+
+    // SoC thermal sensor (TMP451, I2C5 @ 0x4C).
+    std::atomic<int16_t>  soc_temp_c10{420};        // remote channel (SoC die): °C * 10
+    std::atomic<int16_t>  pcb_temp_c10{350};        // local channel (PCB):     °C * 10
+
+    // Charger (BQ24193, I2C1 @ 0x6B).
+    std::atomic<uint8_t>  chg_vbus_stat{0};         // 0=none, 1=USB-SDP, 2=adapter, 3=OTG
+    std::atomic<uint8_t>  chg_chrg_stat{0};         // 0=not charging, 1=pre, 2=fast, 3=done
+    std::atomic<bool>     chg_power_good{false};
+
+    // BQ24193 charger limits (encoded into regs 0x00/0x01/0x02/0x04/0x06).
+    // mmio.cpp does the reverse-encoding from these decoded values; the user
+    // sees real units, the chip sees the closest legal register value.
+    std::atomic<uint16_t> chg_input_current_ma{2000};   // table: 100/150/500/900/1200/1500/2000/3000
+    std::atomic<uint16_t> chg_input_voltage_mv{4280};   // 3880-5080 mV, 80 mV step
+    std::atomic<uint16_t> chg_system_min_mv{3500};      // 3000-3700 mV, 100 mV step
+    std::atomic<uint16_t> chg_fast_current_ma{1856};    // 512-4544 mA, 64 mA step
+    std::atomic<uint16_t> chg_charge_voltage_mv{4208}; // 3504-4512 mV, 16 mV step
+    std::atomic<uint8_t>  chg_thermal_c{60};            // 60 / 80 / 100 / 120 °C
+
+    // USB-PD controller (BM92T36, I2C1 @ 0x18). One synthesized fixed PDO.
+    std::atomic<bool>     usb_pd_inserted{false};
+    std::atomic<uint16_t> usb_pd_voltage_mv{5000};
+    std::atomic<uint16_t> usb_pd_amperage_ma{1500};
+
+    // Fuse driver (FUSE @ 0x7000F800). Names per Hekate's bdk/soc/fuse.h.
+    std::atomic<uint32_t> fuse_0x100{1};            // FUSE_PRODUCTION_MODE  (1 = production unit)
+    std::atomic<uint32_t> fuse_0x110{0x83};         // FUSE_SKU_INFO         (0x83 = SKU_ODIN, required by Minerva)
+    std::atomic<uint32_t> fuse_0x118{1785};         // FUSE_CPU_IDDQ_CALIB
+    std::atomic<uint32_t> fuse_0x148{0x83000001};   // FUSE_OPT_FT_REV / mixed
+    std::atomic<uint32_t> fuse_0x1A0{0x06};         // FUSE_OPT_VENDOR_CODE
 };
 
 #endif // EMU_STATE_H

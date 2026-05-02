@@ -24,6 +24,8 @@ slow or destructive.
 - Replay deterministic button sequences via `--auto-pin-recovery` or
   `--auto-te-script`, so a payload flow can be exercised from a CI run or a
   one-shot script.
+- Tweak emulated hardware live (battery, charger, thermal, USB-PD, PMIC,
+  fuses, SD insertion) from a side window. See [Live hardware tweaks](#live-hardware-tweaks).
 - Read real eMMC (embedded MMC) dumps (`BOOT0`, multi-part `rawnand.bin.NN`)
   and decrypt them with XTS-AES-128 (XEX-based Tweaked-codebook with ciphertext
   stealing) against keys from `prod.keys`.
@@ -66,7 +68,7 @@ PIN-recovery script) and bakes it into `sd.img`:
 ```bash
 # 1. Pull the latest HATS release from sthetix.
 HATS_URL=$(curl -s https://api.github.com/repos/sthetix/HATS/releases/latest \
-    | grep -oE '"browser_download_url":"[^"]+\.zip"' \
+    | grep -oE '"browser_download_url": "[^"]+\.zip"' \
     | head -1 | cut -d'"' -f4)
 curl -L -o hats.zip "$HATS_URL"
 mkdir -p sd_root
@@ -115,6 +117,51 @@ green:
 
 ![PIN recovery demo](img/pin_recovery_demo.png)
 
+## Live hardware tweaks
+
+Press `M` in the main window to open a second window that exposes the values
+the payload reads from the emulated chips. Edits apply on the next register
+read, with no restart and no recompile. Use it to exercise payload code that
+branches on hardware state (low-battery warnings, thermal throttling, charger
+detect, SD eject, OEM-specific PMIC forks, and similar) without needing the
+state to occur on real hardware.
+
+![Live hardware-config window](img/config_menu.png)
+
+What's tweakable, grouped by chip:
+
+| Chip                    | Bus / addr      | Tweakable                                                                                       |
+| ----------------------- | --------------- | ----------------------------------------------------------------------------------------------- |
+| **MAX17050** fuel gauge | I2C\_1 @ 0x36   | SOC %, VCELL, OCV, Temp, Current, RepCap, FullCAP, DesignCap, V\_empty, Min/Max volt, Age, Cycles |
+| **TMP451** thermal      | I2C\_1 @ 0x4C   | SoC die temp, PCB temp                                                                          |
+| **BQ24193** charger     | I2C\_1 @ 0x6B   | VBUS, charge state, power-good, input current/voltage limit, system min, fast-charge current, charge voltage limit, thermal regulation |
+| **BM92T36** USB-PD      | I2C\_1 @ 0x18   | Cable-inserted, PDO voltage, PDO amperage                                                       |
+| **MAX77620** main PMIC  | I2C\_5 @ 0x3C   | OTP (Erista / Mariko), silicon revision                                                         |
+| **MAX77621** CPU/GPU PMIC | I2C\_5 @ 0x1B | Chip ID                                                                                         |
+| **Tegra fuses**         | FUSE 0x7000F800 | 5 fuse offsets read by Hekate (SKU info, fuse ID, etc.)                                         |
+| **GPIO**                | Port Z bit 1    | SD card insert / eject                                                                          |
+| **Display**             | EmuState        | Backlight, rotation override                                                                    |
+| **Emulation**           | EmuState        | Pause / resume, button visualization                                                            |
+
+A few example tweaks:
+
+- Drag SOC % down to 5%. The Hekate "low battery" branch fires.
+- Drop SoC temp to 95 °C. The thermal-throttle path triggers.
+- Toggle VBUS to None and Power good off. Hekate flips to the "no charger"
+  state.
+- Set Charge voltage limit to 4096 mV. The Battery Info screen reflects it
+  on the next poll.
+- Toggle SD card inserted off mid-boot. The SD-detect path sees no card,
+  which is useful for testing failure handling.
+- Switch PMIC OTP to Mariko (0x53). The OEM-detection branch prints
+  "Mariko OTP" instead of "Erista OTP".
+
+The full layout (sliders, combos, hex inputs for fuses) lives in
+[display/config_window.cpp](display/config_window.cpp). Encoding logic that
+maps each user-facing decoded value back to the chip's raw register format
+is in [t210/mmio.cpp](t210/mmio.cpp). Each encoder mirrors a corresponding
+`*_get_property()` formula in the Hekate `bdk/power/` tree.
+
 ## Controls
 
 | Key            | Switch button / action          |
@@ -122,6 +169,7 @@ green:
 | `↑` / `↓`      | VOL+ / VOL–                     |
 | `Enter`        | POWER                           |
 | Mouse click    | Touch (Nyx, TE menus)           |
+| `M`            | Open / close hardware-config window (see [Live hardware tweaks](#live-hardware-tweaks)) |
 | `R` / `Shift+R`| Cycle display rotation CW / CCW |
 | `P`            | Pause or resume emulation       |
 | `S`            | Cycle swizzle override          |

@@ -48,8 +48,9 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
   }
 
   if (offset == 0x61C) {
-    printf("[gpio] R: Port Z IN = 0x00 (SD Inserted)\n");
-    return 0; // Bit 1 = 0 (Inserted)
+    // Port Z IN. Bit 1 active-low = SD card detect.
+    uint32_t val = state->sd_inserted.load() ? 0x00 : (1u << 1);
+    return val;
   }
 
   printf("[gpio] R: offset 0x%X = 0\n", offset);
@@ -84,74 +85,87 @@ void gpio_write(EmuState *state, uint64_t addr, uint32_t val) {
 static uint8_t i2c_slave_addr = 0;
 static uint8_t i2c_reg_addr = 0;
 
-// ==================== Synaptics RMI4 touch controller (I2C addr 0x4C on I2C1) ====================
-// Synaptics S7509A capacitive touch IC.  hekate polls two registers per cycle:
-//   0x01 – F01 interrupt status  (bit 2 = F11 touch interrupt)
-//   0x10 – F11 finger data       (state, X/Y/W/Z in successive registers)
-//
-// hekate reads DATA1 (bytes 0-3) and optionally DATA2 (bytes 4-7) per
-// transaction via auto-increment.  The register pointer is set by writing
-// the register address as a 1-byte payload to the device.
-//
-// Coordinate system: portrait 720×1280.
-//   reg 0x10 = finger_state  (0x01 = one finger)
-//   reg 0x11 = X[11:4]
-//   reg 0x12 = Y[11:4]
-//   reg 0x13 = X[3:0]<<4 | Y[3:0]
-//   reg 0x14 = Wx<<4 | Wy
-//   reg 0x15 = Z (pressure)
-
-static uint8_t rmi4_regs[256] = {0};
-static uint8_t rmi4_read_ptr  = 0;
-static bool    rmi4_initialized = false;
-static bool    rmi4_touch_updated = false; // prevent double-advance per poll
-
-static void rmi4_init() {
-    memset(rmi4_regs, 0, sizeof(rmi4_regs));
-    rmi4_initialized = true;
-}
-
-static void rmi4_update_touch(EmuState *state) {
-    int phase = state->touch_phase.load();
-    uint16_t x = state->touch_x;
-    uint16_t y = state->touch_y;
-
-    if (phase == 1) {
-        rmi4_regs[0x01] = 0x04;                        // F11 interrupt
-        rmi4_regs[0x10] = 0x01;                        // finger 0 present
-        rmi4_regs[0x11] = (x >> 4) & 0xFF;             // X[11:4]
-        rmi4_regs[0x12] = (y >> 4) & 0xFF;             // Y[11:4]
-        rmi4_regs[0x13] = ((x & 0xF) << 4) | (y & 0xF);
-        rmi4_regs[0x14] = 0x44;                        // Wx=4, Wy=4
-        rmi4_regs[0x15] = 0x40;                        // pressure
-        state->touch_phase = 2;
-        printf("[touch] RMI4: DOWN at portrait (%d,%d)\n", x, y);
-    } else if (phase == 2) {
-        rmi4_regs[0x01] = 0x04;                        // F11 interrupt (lift)
-        rmi4_regs[0x10] = 0x00;                        // no finger
-        memset(&rmi4_regs[0x11], 0, 5);
-        state->touch_phase = 3;
-        printf("[touch] RMI4: UP\n");
-    } else {
-        rmi4_regs[0x01] = 0x00;
-        rmi4_regs[0x10] = 0x00;
-    }
-}
-
-// Pack 4 consecutive rmi4_regs bytes into a little-endian uint32_t
-static uint32_t rmi4_read4(uint8_t start) {
-    uint32_t v = 0;
-    for (int i = 0; i < 4; i++)
-        v |= (uint32_t)rmi4_regs[(start + i) & 0xFF] << (i * 8);
-    return v;
-}
+// (Touch controller is the STMFTS at I2C_3 / slave 0x49, handled separately
+// in t210/i2c3.cpp. Nothing else lives at I2C_1 / slave 0x4C besides TMP451.)
 
 #define MAX77620_REG_ONOFFSTAT 0x15
 #define MAX77620_ONOFFSTAT_EN0 BIT(2)
 
+// ---- Packet-mode I2C (BM92T36 USB-PD on I2C_1 @ 0x18) ----
+// MAX17050/MAX77620/BQ24193 use the simple "normal" path (CMD_DATA1 reads).
+// BM92T36 uses Hekate's i2c_xfer_packet, which streams a multi-word header
+// through TX_FIFO and reads data back through RX_FIFO. This is a small FSM
+// that watches TX_FIFO writes, captures the slave/register/direction, and
+// pre-fills an RX buffer when a read header arrives.
+struct PacketState {
+    int      hdr_idx       = 0;   // word index since last PROT magic
+    uint8_t  dev_addr      = 0;
+    uint32_t payload_size  = 0;   // bytes
+    bool     is_read       = false;
+    uint8_t  reg_addr      = 0;   // captured from prior write phase
+    uint8_t  rx_buf[64]    = {0};
+    uint32_t rx_size       = 0;
+    uint32_t rx_pos        = 0;
+};
+static PacketState pkt_i2c1;
+static PacketState pkt_i2c5;
+
+#define I2C_PACKET_PROT_I2C  (1u << 4)
+#define I2C_HEADER_READ      (1u << 19)
+
+static void bm92t36_fill_rx(EmuState *state, uint8_t reg, uint8_t *buf, uint32_t size) {
+    // All multi-byte values are little-endian on the wire (Hekate reassembles
+    // with `(buf[1] << 8) | buf[0]`). FW_TYPE is the exception — Hekate uses
+    // `(buf[0] << 4) | buf[1]` and expects 0x36, so buf[0]=3, buf[1]=6.
+    auto put = [&](uint32_t i, uint8_t v) { if (i < size) buf[i] = v; };
+    switch (reg) {
+    case 0x03: // STATUS1: bit 7 = cable inserted
+        put(0, state->usb_pd_inserted.load() ? 0x80 : 0x00);
+        break;
+    case 0x4B: // FW_TYPE_REG -> VER_36 = 0x36
+        put(0, 0x03); put(1, 0x06);
+        break;
+    case 0x4D: // MAN_ID_REG -> MAN_ROHM = 0x04B5
+        put(0, 0xB5); put(1, 0x04);
+        break;
+    case 0x4E: // DEV_ID_REG -> DEV_BM92T = 0x03B0
+        put(0, 0xB0); put(1, 0x03);
+        break;
+    case 0x08:   // READ_PDOS_SRC: byte0 = PDO-bytes count, then 4-byte PDOs
+    case 0x28: { // CURRENT_PDO:    same layout, 1 PDO
+        // Synthesize a single Fixed-type PDO from the EmuState values.
+        // pd_object_t bitfields (LSB->MSB): amp:10, volt:10, info:10, type:2.
+        uint32_t amp_lsb  = (uint32_t)(state->usb_pd_amperage_ma.load() / 10) & 0x3FF;
+        uint32_t volt_lsb = (uint32_t)(state->usb_pd_voltage_mv.load() / 50) & 0x3FF;
+        uint32_t pdo = amp_lsb | (volt_lsb << 10);
+        put(0, 4);
+        put(1, (uint8_t)(pdo >>  0));
+        put(2, (uint8_t)(pdo >>  8));
+        put(3, (uint8_t)(pdo >> 16));
+        put(4, (uint8_t)(pdo >> 24));
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static void packet_populate_rx(EmuState *state, bool on_i2c5, PacketState &p) {
+    p.rx_pos  = 0;
+    p.rx_size = std::min((uint32_t)sizeof(p.rx_buf), p.payload_size);
+    memset(p.rx_buf, 0, sizeof(p.rx_buf));
+    if (!on_i2c5 && p.dev_addr == 0x18) {
+        bm92t36_fill_rx(state, p.reg_addr, p.rx_buf, p.rx_size);
+    }
+    // Add other packet-mode slaves here as needed.
+}
+
 uint32_t i2c_read(EmuState *state, uint64_t addr) {
-  uint32_t base = (addr >= I2C5_BASE) ? I2C5_BASE : I2C1_BASE;
+  bool on_i2c5 = (addr >= I2C5_BASE);
+  uint32_t base = on_i2c5 ? I2C5_BASE : I2C1_BASE;
   uint32_t offset = (uint32_t)(addr - base);
+
+  PacketState &pkt = on_i2c5 ? pkt_i2c5 : pkt_i2c1;
 
   switch (offset) {
   case 0x1C:          // I2C_STATUS
@@ -160,43 +174,195 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
     return 0;         // MSTR_CONFIG_LOAD (bit 0) cleared = load complete
   case 0x68:          // I2C_INT_STATUS
     return (1 << 11); // BUS_CLEAR_DONE (bit 11)
-  case 0x10: {        // I2C_CMD_DATA2 (bytes 4-7 of current chunk)
-    if (i2c_slave_addr == 0x4C) {
-      if (!rmi4_initialized) rmi4_init();
-      return rmi4_read4(rmi4_read_ptr + 4);
+  case 0x54: {        // I2C_RX_FIFO  (packet-mode receive)
+    uint32_t word = 0;
+    uint32_t n = std::min((uint32_t)4, pkt.rx_size - pkt.rx_pos);
+    for (uint32_t i = 0; i < n; i++) {
+      word |= (uint32_t)pkt.rx_buf[pkt.rx_pos++] << (i * 8);
+    }
+    return word;
+  }
+  case 0x58:          // I2C_PACKET_TRANSFER_STATUS
+    // Hekate waits for ((status >> 4) & 0xFFF) == size-1 after each phase.
+    // Return the last-captured payload size shifted; phase always completes
+    // synchronously in our emulator.
+    return (pkt.payload_size ? (pkt.payload_size - 1) : 0) << 4;
+  case 0x60: {        // I2C_FIFO_STATUS
+    // Bits[3:0] = RX_FIFO_FULL_CNT (entries available, each entry = 4 bytes).
+    if (pkt.rx_size > pkt.rx_pos) {
+      uint32_t words = (pkt.rx_size - pkt.rx_pos + 3) / 4;
+      return words & 0xF;
     }
     return 0;
   }
+  case 0x10:          // I2C_CMD_DATA2 (bytes 4-7) — no slaves currently need a >4 byte response
+    return 0;
   case 0x0C:          // I2C_CMD_DATA1
-    // Synaptics RMI4 touch controller (slave 0x4C on I2C1)
-    if (i2c_slave_addr == 0x4C) {
-      if (!rmi4_initialized) rmi4_init();
-      // When hekate reads interrupt status (reg 0x01), update touch state once per poll
-      if (rmi4_read_ptr == 0x01 && !rmi4_touch_updated) {
-        rmi4_update_touch(state);
-        rmi4_touch_updated = true;
-      }
-      return rmi4_read4(rmi4_read_ptr);
-    }
-    // Return simulated data based on slave and register
-    if (i2c_slave_addr == 0x36) { // MAX17050_ADDR
+    // TMP451 SoC/PCB thermal sensor (slave 0x4C on I2C_1).
+    // Hekate reads (per bdk/thermal/tmp451.c) the integer °C from
+    //   PCB: 0x00, SoC: 0x01
+    // and the fractional byte from
+    //   SoC dec: 0x10, PCB dec: 0x15
+    // The fractional byte's high nibble is units of 1/16 °C; Hekate decodes
+    //   tenths_of_C = ((dec >> 4) * 625) / 100
+    // So encoding from a UI value of °C×10:
+    //   lsb = (c10 * 8) / 5    // total LSBs (1 LSB = 1/16 °C = 0.625 c10)
+    //   int_byte =  lsb >> 4
+    //   dec_byte = (lsb & 0xF) << 4
+    if (!on_i2c5 && i2c_slave_addr == 0x4C) {
+      auto encode_lsb = [](int16_t c10) -> uint16_t {
+        return (uint16_t)((int32_t)c10 * 8 / 5);
+      };
+      uint16_t soc_lsb = encode_lsb(state->soc_temp_c10.load());
+      uint16_t pcb_lsb = encode_lsb(state->pcb_temp_c10.load());
       switch (i2c_reg_addr) {
-      case 0x06:
-        return 0x5000; // ~80% battery MAX17050_REP_SOC
-      case 0x09:
-        return 3950; // 3950 mV MAX17050_VCELL
+      case 0x00: return (pcb_lsb >> 4) & 0xFF;          // PCB int (local)
+      case 0x01: return (soc_lsb >> 4) & 0xFF;          // SoC int (remote)
+      case 0x10: return (uint8_t)((soc_lsb & 0xF) << 4); // SoC dec
+      case 0x15: return (uint8_t)((pcb_lsb & 0xF) << 4); // PCB dec
+      default:   return 0;
+      }
+    }
+    // MAX17050 fuel gauge (slave 0x36 on I2C_1).
+    // All raw encodings here are the inverse of Hekate's max17050_get_property
+    // formulas in bdk/power/max17050.c. Switch hardware uses Rsense=5mΩ with
+    // CGAIN=2 → ADJ_RSENSE = 10mΩ, which sets the per-LSB units below.
+    if (!on_i2c5 && i2c_slave_addr == 0x36) {
+      switch (i2c_reg_addr) {
+      case 0x05: { // RepCap   — 0.5 mAh/LSB (= mAh * 2)
+        return (uint16_t)(state->bat_capacity_mah.load() * 2);
+      }
+      case 0x06: { // RepSOC   — %·256, Hekate displays (raw >> 8)
+        return (uint16_t)(state->bat_soc_pct.load() << 8);
+      }
+      case 0x07: { // Age      — %·256, Hekate displays (raw >> 8)
+        return (uint16_t)((uint16_t)state->bat_age_pct.load() << 8);
+      }
+      case 0x08: { // TEMP     — °C/256 signed, UI is °C·10
+        int32_t scaled = (int32_t)state->bat_temp_c10.load() * 256 / 10;
+        return (uint16_t)(int16_t)scaled;
+      }
+      case 0x09:   // VCELL    — 0.625 mV/LSB on the upper 13 bits, i.e. (raw >> 3) * 625 / 1000 = mV
+      case 0x19:   // AvgVCELL — same encoding
+      case 0xFB: { // OCVInternal — same encoding
+        uint16_t mv = (i2c_reg_addr == 0xFB) ? state->bat_ocv_mv.load() : state->bat_vcell_mv.load();
+        return (uint16_t)(((uint32_t)mv * 8000) / 625);
+      }
+      case 0x0A:   // Current   — 156.25 µA/LSB signed, UI is mA
+      case 0x0B: { // AvgCurrent — same encoding
+        int32_t raw = (int32_t)state->bat_current_ma.load() * 64 / 10;
+        return (uint16_t)(int16_t)raw;
+      }
+      case 0x10: { // FullCAP    — 0.5 mAh/LSB
+        return (uint16_t)(state->bat_full_cap_mah.load() * 2);
+      }
+      case 0x17: { // Cycles
+        return state->bat_cycles.load();
+      }
+      case 0x18: { // DesignCap  — 0.5 mAh/LSB
+        return (uint16_t)(state->bat_design_cap_mah.load() * 2);
+      }
+      case 0x1B: { // MinMaxVolt — packed (max << 8) | min, units of 20 mV
+        uint16_t lo = (uint16_t)(state->bat_min_volt_mv.load() / 20) & 0xFF;
+        uint16_t hi = (uint16_t)(state->bat_max_volt_mv.load() / 20) & 0xFF;
+        return (hi << 8) | lo;
+      }
+      case 0x21:   // DevName — must be 0x00AC for max17050_get_version() to succeed
+        return 0x00AC;
+      case 0x3A: { // V_empty — (raw >> 7) * 10 = mV
+        return (uint16_t)(((uint32_t)state->bat_v_empty_mv.load() / 10) << 7);
+      }
       default:
         return 0;
       }
     }
-    if (i2c_slave_addr == 0x3C) { // MAX77620_ADDR
-      if (i2c_reg_addr == 0x15) { // MAX77620_REG_ONOFFSTAT
-        uint32_t val = 0;
-        if (state->btn_power)
-          val |= (1 << 2); // MAX77620_ONOFFSTAT_EN0
-        return val;
+    // MAX77620 PMIC (slave 0x3C on I2C_5).
+    if (on_i2c5 && i2c_slave_addr == 0x3C) {
+      switch (i2c_reg_addr) {
+      case 0x15: { // ONOFFSTAT — EN0 bit reflects power button
+        return state->btn_power.load() ? (1 << 2) : 0;
       }
-      return 0x00; // Default PMIC regs
+      case 0x5B: return state->pmic_silicon_rev.load() & 0xF; // CID3: low nibble shown as "v%d"
+      case 0x5C: return state->pmic_otp.load();                // CID4: 0x35 Erista, 0x53 Mariko
+      case 0x5D: return 0; // CID5: ES version
+      default:   return 0;
+      }
+    }
+    // MAX77621 CPU/GPU regulator (slave 0x1B on I2C_5). Hekate reads CHIPID1
+    // (reg 0x04) and prints the byte verbatim as the version number.
+    if (on_i2c5 && i2c_slave_addr == 0x1B) {
+      if (i2c_reg_addr == 0x04) return state->cpu_pmic_version.load();
+      return 0;
+    }
+    // BQ24193 charger (slave 0x6B on I2C_1).
+    // Each register is reverse-encoded from a decoded EmuState value (mA / mV
+    // / °C) so the user-facing tweak reads in real units; the formulas mirror
+    // bq24193_get_property() in bdk/power/bq24193.c.
+    if (!on_i2c5 && i2c_slave_addr == 0x6B) {
+      auto encode_input_current = [](uint16_t ma) -> uint8_t {
+        // Table-quantized: pick nearest legal bucket.
+        static const uint16_t tbl[8] = {100,150,500,900,1200,1500,2000,3000};
+        uint8_t best = 0; int best_d = 0x7FFFFFFF;
+        for (uint8_t i = 0; i < 8; i++) {
+          int d = (int)tbl[i] - (int)ma; if (d < 0) d = -d;
+          if (d < best_d) { best_d = d; best = i; }
+        }
+        return best;
+      };
+      auto clamp_div = [](uint16_t v, uint16_t base, uint16_t step, uint8_t maxbits) -> uint8_t {
+        if (v < base) v = base;
+        uint16_t units = (v - base) / step;
+        uint16_t cap = (1u << maxbits) - 1;
+        if (units > cap) units = cap;
+        return (uint8_t)units;
+      };
+      switch (i2c_reg_addr) {
+      case 0x00: { // InputSource: VINDPM[6:3] | INLIMIT[2:0]
+        uint8_t ilim   = encode_input_current(state->chg_input_current_ma.load());
+        uint8_t vindpm = clamp_div(state->chg_input_voltage_mv.load(), 3880, 80, 4);
+        return (uint32_t)((vindpm << 3) | ilim);
+      }
+      case 0x01: { // PORConfig: keep CHGCONFIG=charger-en, set SYSMIN[3:1]
+        uint8_t sysmin = clamp_div(state->chg_system_min_mv.load(), 3000, 100, 3);
+        return (uint32_t)((1u << 4) | (sysmin << 1));
+      }
+      case 0x02: { // ChrgCurr: ICHG[7:2]
+        uint8_t ichg = clamp_div(state->chg_fast_current_ma.load(), 512, 64, 6);
+        return (uint32_t)(ichg << 2);
+      }
+      case 0x04: { // ChrgVolt: VREG[7:2]
+        uint8_t vreg = clamp_div(state->chg_charge_voltage_mv.load(), 3504, 16, 6);
+        return (uint32_t)(vreg << 2);
+      }
+      case 0x06: { // IRCompThermal: THERM[1:0]
+        uint8_t c = state->chg_thermal_c.load();
+        uint8_t therm = (c >= 110) ? 3 : (c >= 90) ? 2 : (c >= 70) ? 1 : 0;
+        return (uint32_t)therm;
+      }
+      case 0x08: {            // Status: bits[7:6]=VBUS, [5:4]=CHRG, [2]=PG
+        uint32_t v = 0;
+        v |= (uint32_t)(state->chg_vbus_stat.load() & 0x3) << 6;
+        v |= (uint32_t)(state->chg_chrg_stat.load() & 0x3) << 4;
+        if (state->chg_power_good.load()) v |= (1 << 2);
+        return v;
+      }
+      case 0x09: { // FaultReg: bits[2:0] = THERM_STAT (charger NTC thermistor).
+        // Hekate decodes this independently of MAX17050's TEMP, but on real
+        // hardware both sensors track the battery, so derive it from the
+        // battery temp slider for consistency. Code map (per gui_info.c):
+        //   0=Normal, 2=Warm, 3=Cool, 5=Cold, 6=Hot
+        int16_t t10 = state->bat_temp_c10.load();
+        uint8_t therm;
+        if      (t10 <    0) therm = 5; // Cold
+        else if (t10 <  100) therm = 3; // Cool
+        else if (t10 <  450) therm = 0; // Normal
+        else if (t10 <  500) therm = 2; // Warm
+        else                 therm = 6; // Hot
+        return therm;
+      }
+      case 0x0A: return 0x2F; // VendorPart — must be 0x2F for bq24193_get_version()
+      default:   return 0;
+      }
     }
     return 0;
   default:
@@ -205,8 +371,11 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
 }
 
 void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
-  uint32_t base = (addr >= I2C5_BASE) ? I2C5_BASE : I2C1_BASE;
+  bool on_i2c5 = (addr >= I2C5_BASE);
+  uint32_t base = on_i2c5 ? I2C5_BASE : I2C1_BASE;
   uint32_t offset = (uint32_t)(addr - base);
+
+  PacketState &pkt = on_i2c5 ? pkt_i2c5 : pkt_i2c1;
 
   switch (offset) {
   case I2C_CMD_ADDR0:
@@ -214,11 +383,38 @@ void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
     break;
   case I2C_CMD_DATA1:
     i2c_reg_addr = val & 0xFF;
-    // Synaptics RMI4 (slave 0x4C): track register pointer for reads
-    if (i2c_slave_addr == 0x4C) {
-      if (!rmi4_initialized) rmi4_init();
-      rmi4_read_ptr = val & 0xFF;
-      rmi4_touch_updated = false;
+    break;
+  case 0x50: {        // I2C_TX_FIFO  (packet-mode dispatch)
+    // Each packet starts with the PROT magic word; subsequent words follow a
+    // fixed layout: [size-1, header, payload...]. The header carries dev_addr
+    // and a READ flag; for write phases the first payload byte is the slave's
+    // register address that the matching read phase will target.
+    if (val == I2C_PACKET_PROT_I2C) {
+      pkt.hdr_idx = 1;  // word 0 (PROT) just consumed
+      return;
+    }
+    int idx = pkt.hdr_idx++;
+    if (idx == 1) {
+      pkt.payload_size = (val & 0xFFF) + 1;
+    } else if (idx == 2) {
+      pkt.dev_addr = (val >> 1) & 0x7F;
+      pkt.is_read  = (val & I2C_HEADER_READ) != 0;
+      i2c_slave_addr = pkt.dev_addr; // mirror for any cross-path lookups
+      if (pkt.is_read) {
+        packet_populate_rx(state, on_i2c5, pkt);
+      }
+    } else if (!pkt.is_read && idx == 3) {
+      // First (and for our slaves, only) payload byte = register address.
+      pkt.reg_addr = val & 0xFF;
+    }
+    break;
+  }
+  case 0x5C:          // I2C_FIFO_CONTROL — TX/RX flush at the start of each xfer
+    if (val & 0x3) {
+      pkt.hdr_idx = 0;
+      pkt.rx_size = 0;
+      pkt.rx_pos  = 0;
+      // reg_addr intentionally preserved across the write→read transition
     }
     break;
   }
@@ -1019,18 +1215,12 @@ void clk_rst_write(EmuState *state, uint64_t addr, uint32_t val) {
 uint32_t fuse_read(EmuState *state, uint64_t addr) {
   uint32_t offset = (uint32_t)(addr - FUSE_BASE);
   switch (offset) {
-  case 0x100:
-    return 0x83;
-  case 0x110:
-    return 0x07;
-  case 0x1A0:
-    return 0x06;
-  case 0x148:
-    return 0x83000001;
-  case 0x118:
-    return 1785;
-  default:
-    return 0;
+  case 0x100: return state->fuse_0x100.load();
+  case 0x110: return state->fuse_0x110.load();
+  case 0x1A0: return state->fuse_0x1A0.load();
+  case 0x148: return state->fuse_0x148.load();
+  case 0x118: return state->fuse_0x118.load();
+  default:    return 0;
   }
 }
 

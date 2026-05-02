@@ -25,6 +25,7 @@
 #include "t210/memory_map.h"
 #include "t210/mmio.h"
 #include "display/sdl_display.h"
+#include "display/config_window.h"
 
 // ==================== Payload Loading ====================
 
@@ -150,10 +151,12 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
 
     // Pre-set Hekate's "watchdog fired" magic at IRAM 0x4003FF18 (cookie "WDT")
     // so its early boot does `goto skip_lp0_minerva_config`, skipping both
-    // libsys_lp0.bso and the Minerva DRAM-training path. EXCP_EN_ADDR
-    // (0x4003FF1C) stays zeroed so ERR_EXCEPTION is *not* set and no warning
-    // screen appears. EMC/MC training touches hardware we don't model; this is
-    // the same path Hekate takes on real silicon after a legitimate WDT reset.
+    // libsys_lp0.bso and the Minerva DRAM-training path. The matching
+    // EXCP_EN_ADDR (0x4003FF1C) is intentionally left zeroed so ERR_EXCEPTION
+    // is *not* set and the user doesn't see a "hang detected" warning screen.
+    // We can't model EMC/MC well enough for real Minerva training, so this is
+    // the cleanest opt-out (the same path Hekate uses on hardware after a
+    // legitimate WDT reset).
     {
         uint32_t wdt_magic = 0x544457; // "WDT"
         uc_mem_write(uc, 0x4003FF18, &wdt_magic, sizeof(wdt_magic));
@@ -347,8 +350,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Initialize the hardware-tweak config window (hidden until 'M' is pressed).
+    if (!config_window_init()) {
+        fprintf(stderr, "[warn] Config window init failed; M-key menu disabled\n");
+    }
+
     printf("\n[emu] Starting emulation...\n");
-    printf("[emu] Press Escape to quit\n\n");
+    printf("[emu] Press Escape to quit, M to toggle hardware config\n\n");
 
     // ---- Emulation loop ----
     // We run emulation in batches, interleaving with SDL event handling
@@ -514,6 +522,7 @@ int main(int argc, char *argv[]) {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_display_update);
         if (elapsed.count() >= DISPLAY_UPDATE_MS) {
             sdl_display_update(&state, uc);
+            config_window_render(&state);
             last_display_update = now;
         }
     }
@@ -533,6 +542,7 @@ int main(int argc, char *argv[]) {
             final_insn[4], final_insn[5], final_insn[6], final_insn[7]);
     }
 
+    config_window_shutdown();
     sdl_display_shutdown();
     uc_close(uc);
 
