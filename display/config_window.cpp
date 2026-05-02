@@ -79,6 +79,11 @@ void reset_to_defaults(EmuState *s) {
     s->dram_rev_id1      = 2;
     s->dram_rev_id2      = 0;
     s->dram_density      = 0x18;          // 4 GB die
+    s->panel_id_raw      = 0x099310;      // JDI LAM062M109A rev 0x93
+    s->touch_panel_idx   = 0;             // NISSHA NFT-K12D
+    s->touch_fw_id       = 0x32000001;    // 4CD60D/1
+    s->touch_ftb_ver     = 0x0123;
+    s->touch_fw_rev      = 0x4567;
     s->backlight         = 100;
     s->rotation_override = -1;
 }
@@ -381,6 +386,102 @@ void build_ui(EmuState *state) {
         if (ImGui::Combo("Rotation", &rot_idx, rot_items, IM_ARRAYSIZE(rot_items))) {
             state->rotation_override = rot_idx - 1;
         }
+    }
+
+    if (ImGui::CollapsingHeader("Display panel (DSI)")) {
+        // Decoded ID is `((raw >> 8) & 0xFF00) | (raw & 0xFF)`, which means
+        // the high byte of the decoded ID lives in raw[23:16] (MSB of raw)
+        // and the low byte lives in raw[7:0]. raw[15:8] is the rev byte that
+        // Hekate uses to disambiguate AZ1/AZ2/AZ3 etc.
+        struct PanelEntry { uint32_t raw; const char *name; };
+        static const PanelEntry kPanels[] = {
+            {0x099310, "JDI LAM062M109A      (10 93 09)"},
+            {0x269310, "JDI LPM062M326A      (10 93 26)"},
+            {0x0F9320, "InnoLux P062CCA-AZ1  (20 93 0F)"},
+            {0x0F9330, "AUO A062TAN00        (30 93 0F)"},
+            {0x109320, "InnoLux 2J055IA-27A  (20 93 10)"},
+            {0x109330, "AUO A055TAN01        (30 93 10)"},
+            {0x109340, "Sharp LQ055T1SW10    (40 93 10)"},
+            {0x205050, "Samsung AMS699VC01   (50 50 20)"},
+            {0xCCCCCC, "Failed (sentinel CC CC CC)"},
+        };
+        uint32_t cur = state->panel_id_raw.load() & 0xFFFFFF;
+        const char *match = "Custom";
+        for (const auto &p : kPanels) if (p.raw == cur) { match = p.name; break; }
+        char preview[64];
+        snprintf(preview, sizeof(preview), "%s", match);
+        if (ImGui::BeginCombo("Panel preset", preview)) {
+            for (const auto &p : kPanels) {
+                bool sel = (p.raw == cur);
+                if (ImGui::Selectable(p.name, sel)) state->panel_id_raw.store(p.raw);
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        atomic_hex_input("Raw 24-bit", state->panel_id_raw);
+        ImGui::TextDisabled("Hekate prints \"ID: b0 b1 b2\" with b0 = raw & 0xFF, etc.");
+    }
+
+    if (ImGui::CollapsingHeader("Touch panel (FTS4)")) {
+        // Hekate pairs each FW ID with a specific panel idx. Keeping the two
+        // selectors in sync avoids landing in the "Error" pairing branch.
+        // Index aligns with the panel combo: kPairedFw[idx] is the FW ID
+        // Hekate marks "Paired" for that panel.
+        static constexpr uint32_t kPairedFw[] = {
+            0x32000001, // 0: NISSHA NFT-K12D  -> 4CD60D/1
+            0x32000102, // 1: GiS GGM6 B2X     -> 4CD60D/2
+            0x32000302, // 2: NISSHA NBF-K9A   -> 4CD60D/3
+            0x32000402, // 3: GiS 5.5"         -> 4CD60D/4
+            0x32000501, // 4: Samsung TSP      -> 4CD60D/5
+            0x00100100, // 5: GiS VA 6.2"      -> 4CD60D/0 (Hekate stores idx -1)
+        };
+        const char *kPanelNames[] = {
+            "0 - NISSHA NFT-K12D", "1 - GiS GGM6 B2X",
+            "2 - NISSHA NBF-K9A",  "3 - GiS 5.5\"",
+            "4 - Samsung TSP",     "5 - GiS VA 6.2\"",
+        };
+        int idx = (int)state->touch_panel_idx.load();
+        if (ImGui::Combo("Panel", &idx, kPanelNames, IM_ARRAYSIZE(kPanelNames))) {
+            state->touch_panel_idx.store((uint8_t)idx);
+            state->touch_fw_id.store(kPairedFw[idx]);
+        }
+
+        struct FwEntry { uint32_t id; const char *label; uint8_t panel_idx; };
+        static const FwEntry kFwIds[] = {
+            {0x00100100, "4CD60D/0 (GiS VA 6.2\")",  5},
+            {0x32000001, "4CD60D/1 (NISSHA NFT-K12D)", 0},
+            {0x32000102, "4CD60D/2 (GiS GGM6 B2X)",    1},
+            {0x32000302, "4CD60D/3 (NISSHA NBF-K9A)",  2},
+            {0x32000402, "4CD60D/4 (GiS 5.5\")",       3},
+            {0x32000501, "4CD60D/5 (Samsung TSP)",     4},
+        };
+        uint32_t cur_fw = state->touch_fw_id.load();
+        const char *fw_match = "Custom";
+        for (const auto &e : kFwIds) if (e.id == cur_fw) { fw_match = e.label; break; }
+        if (ImGui::BeginCombo("FW preset", fw_match)) {
+            for (const auto &e : kFwIds) {
+                bool sel = (e.id == cur_fw);
+                if (ImGui::Selectable(e.label, sel)) {
+                    state->touch_fw_id.store(e.id);
+                    state->touch_panel_idx.store(e.panel_idx);
+                }
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        atomic_hex_input("FW ID raw", state->touch_fw_id);
+
+        uint16_t ftb = state->touch_ftb_ver.load();
+        if (ImGui::InputScalar("FTB ver", ImGuiDataType_U16, &ftb, nullptr, nullptr, "%04X",
+                               ImGuiInputTextFlags_CharsHexadecimal))
+            state->touch_ftb_ver.store(ftb);
+        // Hekate prints fw_rev byte-swapped, so we expose the value the user
+        // sees on screen and swap on store. byte_swap_16 is self-inverse.
+        uint16_t raw = state->touch_fw_rev.load();
+        uint16_t shown = (uint16_t)((raw >> 8) | (raw << 8));
+        if (ImGui::InputScalar("FW rev", ImGuiDataType_U16, &shown, nullptr, nullptr, "%04X",
+                               ImGuiInputTextFlags_CharsHexadecimal))
+            state->touch_fw_rev.store((uint16_t)((shown >> 8) | (shown << 8)));
     }
 
     if (ImGui::CollapsingHeader("Fuses (advanced)")) {

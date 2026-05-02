@@ -534,6 +534,11 @@ void display_write(EmuState *state, uint64_t addr, uint32_t val) {
 // PINMUX read-back cache to satisfy polling
 static uint32_t pinmux_reg[0x1000 / 4] = {0};
 
+// Forward decls — these handlers live further down this file but are reached
+// from misc_read's catch-all routing for DSI accesses.
+uint32_t dsi_read(EmuState *state, uint64_t addr);
+void     dsi_write(EmuState *state, uint64_t addr, uint32_t val);
+
 uint32_t misc_read(EmuState *state, uint64_t addr) {
   if (addr >= PINMUX_BASE && addr < PINMUX_BASE + PINMUX_SIZE) {
     return pinmux_reg[(addr - PINMUX_BASE) / 4];
@@ -556,7 +561,7 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
   }
   // DSI
   if (addr >= DSI_BASE && addr < DSI_BASE + DSI_SIZE) {
-    return 0;
+    return dsi_read(state, addr);
   }
   // MC
   if (addr >= MC_BASE && addr < MC_BASE + MC_SIZE) {
@@ -1353,6 +1358,76 @@ void emc_write(EmuState *state, uint64_t addr, uint32_t val) {
   }
 }
 
+// ==================== DSI (display panel ID over MIPI-DSI) ====================
+//
+// Hekate's display init calls display_dsi_read(MIPI_DCS_GET_DISPLAY_ID, 3, ...)
+// to identify the LCD panel. The read sequence:
+//   1. send (cmd << 8) | MIPI_DSI_DCS_READ to DSI_WR_DATA, then write
+//      DSI_TRIGGER = HOST. We capture the requested DCS reg here.
+//   2. write DSI_HOST_CONTROL with bit 3 (IMM_BTA) set, then poll until that
+//      bit clears. We auto-clear it on the next read and prep an RX FIFO.
+//   3. read DSI_STATUS for fifo count, then drain DSI_RD_DATA. We expose
+//      three words: DSI_ESCAPE_CMD, (3 << 8) | DCS_LONG_RD_RES, panel_id_raw.
+//
+// On any unrecognized DCS read, _panel_id_raw stays at the 0xCCCCCC sentinel
+// Hekate seeds, which renders as "Failed to get info!". Default panel reply
+// matches a JDI LAM062M109A (0x099310 -> decoded 0x0910).
+
+static constexpr uint32_t DSI_RD_DATA      = 0x9 << 2;  // 0x024
+static constexpr uint32_t DSI_WR_DATA      = 0xA << 2;  // 0x028
+static constexpr uint32_t DSI_HOST_CONTROL = 0xF << 2;  // 0x03C
+static constexpr uint32_t DSI_TRIGGER      = 0x13 << 2; // 0x04C
+static constexpr uint32_t DSI_STATUS       = 0x15 << 2; // 0x054
+
+static constexpr uint8_t MIPI_DSI_DCS_READ            = 0x06;
+static constexpr uint8_t MIPI_DCS_GET_DISPLAY_ID      = 0x04;
+static constexpr uint8_t DSI_ESCAPE_CMD               = 0x87;
+static constexpr uint8_t DCS_LONG_RD_RES              = 0x1C;
+
+static uint8_t  g_dsi_pending_dcs_cmd = 0;
+static uint32_t g_dsi_rx_fifo[8]      = {0};
+static uint32_t g_dsi_rx_count        = 0;
+static uint32_t g_dsi_rx_pos          = 0;
+
+static void dsi_prepare_response(EmuState *state) {
+  if (g_dsi_pending_dcs_cmd != MIPI_DCS_GET_DISPLAY_ID) {
+    g_dsi_rx_count = 0;
+    return;
+  }
+  g_dsi_rx_fifo[0] = DSI_ESCAPE_CMD;
+  g_dsi_rx_fifo[1] = (3u << 8) | DCS_LONG_RD_RES;
+  g_dsi_rx_fifo[2] = state->panel_id_raw.load() & 0xFFFFFF;
+  g_dsi_rx_count   = 3;
+  g_dsi_rx_pos     = 0;
+}
+
+uint32_t dsi_read(EmuState *state, uint64_t addr) {
+  uint32_t offset = (uint32_t)(addr - DSI_BASE);
+  switch (offset) {
+  case DSI_STATUS: {
+    uint32_t left = (g_dsi_rx_pos < g_dsi_rx_count) ? (g_dsi_rx_count - g_dsi_rx_pos) : 0;
+    return left & 0x1F; // DSI_STATUS_RX_FIFO_SIZE mask
+  }
+  case DSI_RD_DATA:
+    if (g_dsi_rx_pos < g_dsi_rx_count)
+      return g_dsi_rx_fifo[g_dsi_rx_pos++];
+    return 0;
+  case DSI_HOST_CONTROL: return 0; // IMM_BTA always clear (we ack instantly)
+  case DSI_TRIGGER:      return 0; // trigger always clear
+  default:               return 0;
+  }
+  (void)state;
+}
+
+void dsi_write(EmuState *state, uint64_t addr, uint32_t val) {
+  uint32_t offset = (uint32_t)(addr - DSI_BASE);
+  if (offset == DSI_WR_DATA && (val & 0xFF) == MIPI_DSI_DCS_READ) {
+    g_dsi_pending_dcs_cmd = (val >> 8) & 0xFF;
+  } else if (offset == DSI_HOST_CONTROL && (val & (1u << 3))) {
+    dsi_prepare_response(state);
+  }
+}
+
 // ==================== SE (Security Engine) ====================
 // Real AES-128 implementation lives in t210/se_engine.cpp. The functions
 // below are thin shims so the existing dispatcher routing keeps working.
@@ -1633,6 +1708,8 @@ static void hook_mmio_write(uc_engine *uc, uc_mem_type type, uint64_t address,
     } else if (address >= DISPLAY_A_BASE &&
                address < DISPLAY_A_BASE + DISPLAY_SIZE) {
       display_write(state, address, val);
+    } else if (address >= DSI_BASE && address < DSI_BASE + DSI_SIZE) {
+      dsi_write(state, address, val);
     } else if (address >= PMC_BASE && address < PMC_BASE + PMC_SIZE) {
       pmc_write(state, address, val);
     } else if (address >= 0x60007000 && address < 0x60007000 + 0x1000) {

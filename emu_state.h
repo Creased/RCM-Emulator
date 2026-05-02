@@ -219,6 +219,21 @@ struct EmuState {
     std::atomic<uint8_t>  dram_rev_id1{2};          // MR6 REV_ID1
     std::atomic<uint8_t>  dram_rev_id2{0};          // MR7 REV_ID2
     std::atomic<uint8_t>  dram_density{0x18};       // MR8 DENSITY (bits 5:2 = density code)
+
+    // Display panel ID (DSI). Hekate reads MIPI_DCS_GET_DISPLAY_ID (0x04) over
+    // DSI and stores 3 raw bytes; the screen prints them as "ID: b0 b1 b2"
+    // and decodes them as `((raw >> 8) & 0xFF00) | (raw & 0xFF)`. Default
+    // 0x099310 -> JDI LAM062M109A rev 0x93 (a common Erista launch panel).
+    std::atomic<uint32_t> panel_id_raw{0x099310};
+
+    // Touch panel + FW info (FTS4 controller, I2C3 @ 0x49). Idx maps to the
+    // _panels[] table in Hekate's bdk/input/touch.c (0=NISSHA NFT-K12D pairs
+    // with fw_id 4CD60D/1, etc.). Defaults render as "NISSHA NFT-K12D" with
+    // ID "32.00.00.01 (Paired)".
+    std::atomic<uint8_t>  touch_panel_idx{0};       // 0..4 -> known panels, 5 -> GiS VA 6.2"
+    std::atomic<uint32_t> touch_fw_id{0x32000001};  // displayed as 4CD60D/<n>
+    std::atomic<uint16_t> touch_ftb_ver{0x0123};
+    std::atomic<uint16_t> touch_fw_rev{0x4567};     // Hekate byte-swaps before printing
 };
 
 #endif // EMU_STATE_H

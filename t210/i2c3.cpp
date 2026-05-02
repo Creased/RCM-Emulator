@@ -42,7 +42,10 @@ constexpr uint8_t  FTS4_CMD_SYSTEM_RESET         = 0xA0;
 constexpr uint8_t  FTS4_CMD_CLEAR_EVENT_STACK    = 0xA1;
 constexpr uint8_t  FTS4_CMD_HW_REG_READ          = 0xB6; // also HW_REG_WRITE
 constexpr uint8_t  FTS4_CMD_SWITCH_SENSE_MODE    = 0xC3;
+constexpr uint8_t  FTS4_CMD_VENDOR               = 0xCF;
 constexpr uint8_t  FTS4_CMD_FB_REG_READ          = 0xD0; // also FB_REG_WRITE
+
+constexpr uint8_t  FTS4_VENDOR_GPIO_STATE        = 0x01;
 
 // ---- FTS4 HW register addresses (accessed via 0xB6) ----
 constexpr uint16_t FTS4_HW_REG_CHIP_ID_INFO_ALT  = 0x0002; // returns chip_id at bytes [3..4]
@@ -59,6 +62,7 @@ constexpr uint8_t  FTS4_EV_MULTI_TOUCH_ENTER     = 0x03;
 constexpr uint8_t  FTS4_EV_MULTI_TOUCH_LEAVE     = 0x04;
 constexpr uint8_t  FTS4_EV_MULTI_TOUCH_MOTION    = 0x05;
 constexpr uint8_t  FTS4_EV_CONTROLLER_READY      = 0x10;
+constexpr uint8_t  FTS4_EV_VENDOR                = 0x20;
 
 // ---- Tegra I²C packet header flags (mmio.h-style bit positions) ----
 constexpr uint32_t I2C_HEADER_CONT_XFER          = 1u << 15;
@@ -201,8 +205,62 @@ void execute(EmuState *state, uint32_t expected_rx_size) {
     break;
   }
   case FTS4_CMD_FB_REG_READ: { // 0xD0
-    // FB read of FW info etc — return zeros, Hekate just memcpys the result.
+    // touch_get_fw_info() does two reads:
+    //   1. cmd = {0xD0, 0x00, 0x60}; reads 3 bytes. Hekate then forms the
+    //      next address as cmd[1] = buf[2]; cmd[2] = buf[1]; — i.e. the
+    //      payload of the second read lives at offset (buf[2] << 8) | buf[1].
+    //      We hand back {x, 0x70, 0x00} so the second read targets 0x0070.
+    //   2. cmd = {0xD0, 0x00, 0x70}; reads 9 bytes. Hekate decodes it as
+    //         fw_id   = (buf[1] << 24) | (buf[2] << 16) | (buf[3] << 8) | buf[4]
+    //         ftb_ver = (buf[6] <<  8) |  buf[5]
+    //         fw_rev  = (buf[8] <<  8) |  buf[7]
+    if (tx_buf.size() >= 3) {
+      uint16_t fb_off = ((uint16_t)tx_buf[1] << 8) | tx_buf[2];
+      if (fb_off == 0x0060) {
+        rx_buf = {0x00, 0x70, 0x00};
+        break;
+      }
+      if (fb_off == 0x0070) {
+        uint32_t fw  = state->touch_fw_id.load();
+        uint16_t ftb = state->touch_ftb_ver.load();
+        uint16_t rev = state->touch_fw_rev.load();
+        rx_buf = {
+          0x00,
+          (uint8_t)((fw >> 24) & 0xFF), (uint8_t)((fw >> 16) & 0xFF),
+          (uint8_t)((fw >>  8) & 0xFF), (uint8_t)(fw & 0xFF),
+          (uint8_t)(ftb & 0xFF),        (uint8_t)((ftb >> 8) & 0xFF),
+          (uint8_t)(rev & 0xFF),        (uint8_t)((rev >> 8) & 0xFF),
+        };
+        break;
+      }
+    }
+    // Anything else: zero-pad to whatever the controller expects.
     rx_buf.assign(expected_rx_size ? expected_rx_size : 4, 0);
+    break;
+  }
+  case FTS4_CMD_VENDOR: { // 0xCF
+    // touch_get_panel_vendor() sends one byte (FTS4_VENDOR_GPIO_STATE) and
+    // waits for an FTS4_EV_VENDOR event whose status byte matches. The event
+    // payload (tmp[2..]) carries gpio0/gpio1/gpio2, looked up against the
+    // _panels[] table in Hekate's bdk/input/touch.c. We mirror that table.
+    static constexpr uint8_t kPanelGpios[][3] = {
+      {1, 1, 1}, // 0: NISSHA NFT-K12D
+      {0, 1, 1}, // 1: GiS GGM6 B2X
+      {0, 0, 0}, // 2: NISSHA NBF-K9A
+      {1, 0, 0}, // 3: GiS 5.5"
+      {0, 0, 1}, // 4: Samsung TSP
+      {1, 0, 1}, // 5: GiS VA 6.2"  (Hekate stores idx=-1 for this row)
+    };
+    if (tx_buf.size() >= 2 && tx_buf[1] == FTS4_VENDOR_GPIO_STATE) {
+      uint8_t idx = state->touch_panel_idx.load();
+      if (idx >= sizeof(kPanelGpios) / sizeof(kPanelGpios[0])) idx = 0;
+      std::array<uint8_t, 8> ev = {
+        FTS4_EV_VENDOR, FTS4_VENDOR_GPIO_STATE,
+        kPanelGpios[idx][0], kPanelGpios[idx][1], kPanelGpios[idx][2],
+        0, 0, 0,
+      };
+      if (ev_stack.size() < 32) ev_stack.push_back(ev);
+    }
     break;
   }
   case FTS4_CMD_LATEST_EVENT:
