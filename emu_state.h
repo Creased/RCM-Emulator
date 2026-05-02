@@ -143,6 +143,11 @@ struct EmuState {
 
     // Main PMIC OEM (MAX77620 CID4): 0x35 = Erista, 0x53 = Mariko, other = Unknown
     std::atomic<uint8_t>  pmic_otp{0x35};
+
+    // Tegra X1 generation (drives APB_MISC_GP_HIDREV major nibble: 1 = T210
+    // Erista, 2 = T210B01 Mariko). Hekate's h_cfg.t210b01 derives from this,
+    // which controls the pkg1 OEM-header skip among other things.
+    std::atomic<bool>     is_mariko{false};
     std::atomic<uint8_t>  pmic_silicon_rev{0};       // MAX77620 CID3 low nibble: "max77620 v%d"
     std::atomic<uint8_t>  cpu_pmic_version{0};       // MAX77621 CHIPID1: "max77621 v%d"
 

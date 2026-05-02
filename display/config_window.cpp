@@ -50,6 +50,7 @@ void reset_to_defaults(EmuState *s) {
     s->usb_pd_voltage_mv = 5000;
     s->usb_pd_amperage_ma = 1500;
     s->pmic_otp          = 0x35;
+    s->is_mariko         = false;
     s->pmic_silicon_rev  = 0;
     s->cpu_pmic_version  = 0;
     s->sd_inserted       = true;
@@ -193,10 +194,19 @@ void build_ui(EmuState *state) {
         atomic_slider_temp<int16_t>("PCB temp", state->pcb_temp_c10, 0.0f,  80.0f);
     }
 
-    if (ImGui::CollapsingHeader("PMIC (MAX77620 / MAX77621)", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::CollapsingHeader("SoC / PMIC", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // SoC generation drives APB_MISC_GP_HIDREV (1=Erista, 2=Mariko).
+        // Selecting it also flips the PMIC OTP byte to match — they go
+        // together on real hardware.
+        const char *gen_items[] = {"Erista (T210)", "Mariko (T210B01)"};
+        int gidx = state->is_mariko.load() ? 1 : 0;
+        if (ImGui::Combo("SoC", &gidx, gen_items, IM_ARRAYSIZE(gen_items))) {
+            state->is_mariko.store(gidx == 1);
+            state->pmic_otp.store(gidx == 1 ? 0x53 : 0x35);
+        }
         const char *otp_items[] = {"Erista (0x35)", "Mariko (0x53)"};
         int idx = (state->pmic_otp.load() == 0x53) ? 1 : 0;
-        if (ImGui::Combo("OTP", &idx, otp_items, IM_ARRAYSIZE(otp_items))) {
+        if (ImGui::Combo("PMIC OTP", &idx, otp_items, IM_ARRAYSIZE(otp_items))) {
             state->pmic_otp.store(idx == 1 ? 0x53 : 0x35);
         }
         atomic_slider_int<uint8_t>("MAX77620 silicon rev", state->pmic_silicon_rev,    0, 15);

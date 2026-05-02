@@ -268,7 +268,7 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <payload.bin> [--sd <sd.img>] [--boot0 <boot0.bin>] [--rawnand <rawnand_prefix>] [--prod-keys <prod.keys>]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <payload.bin> [--sd <sd.img>] [--boot0 <boot0.bin>] [--rawnand <rawnand_prefix>] [--prod-keys <prod.keys>] [--oem erista|mariko]\n", argv[0]);
         fprintf(stderr, "\nControls:\n");
         fprintf(stderr, "  Arrow Up/Down = VOL+/VOL- buttons\n");
         fprintf(stderr, "  Enter         = POWER button\n");
@@ -303,6 +303,19 @@ int main(int argc, char *argv[]) {
             rawnand_prefix = argv[++i];
         } else if (strcmp(argv[i], "--prod-keys") == 0 && i + 1 < argc) {
             prod_keys_path = argv[++i];
+        } else if (strcmp(argv[i], "--oem") == 0 && i + 1 < argc) {
+            const char *oem = argv[++i];
+            if (strcmp(oem, "mariko") == 0 || strcmp(oem, "t210b01") == 0) {
+                state.is_mariko = true;
+                state.pmic_otp  = 0x53;
+                printf("[emu] OEM: Mariko (T210B01)\n");
+            } else if (strcmp(oem, "erista") == 0 || strcmp(oem, "t210") == 0) {
+                state.is_mariko = false;
+                state.pmic_otp  = 0x35;
+                printf("[emu] OEM: Erista (T210)\n");
+            } else {
+                fprintf(stderr, "[emu] Unknown --oem value '%s'; expected 'erista' or 'mariko'\n", oem);
+            }
         }
     }
 

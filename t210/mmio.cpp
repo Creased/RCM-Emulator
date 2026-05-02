@@ -538,9 +538,14 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
   if (addr >= PINMUX_BASE && addr < PINMUX_BASE + PINMUX_SIZE) {
     return pinmux_reg[(addr - PINMUX_BASE) / 4];
   }
-  // APB_MISC_GP_HIDREV - hardware revision (Erista)
+  // APB_MISC_GP_HIDREV - hardware revision.
+  // Bits 11:8 = chip ID (0x21 for both T210 / T210B01),
+  // Bits  7:4 = major rev (1 = Erista T210, 2 = Mariko T210B01),
+  // Bits  3:0 = minor.
+  // Hekate's hw_get_chip_id() does `(HIDREV >> 4) & 0xF` and compares against
+  // GP_HIDREV_MAJOR_T210B01 (=2) to decide h_cfg.t210b01.
   if (addr == APB_MISC_BASE + 0x804)
-    return 0x01; // T210
+    return state->is_mariko.load() ? 0x20 : 0x10;
 
   // UART
   if (addr >= 0x70006000 && addr < 0x70006500) {

@@ -184,6 +184,7 @@ is in [t210/mmio.cpp](t210/mmio.cpp). Each encoder mirrors a corresponding
 | `--boot0`             | `BOOT0`       | eMMC BOOT0 partition file (SDMMC4).                       |
 | `--rawnand`           | `rawnand.bin` | eMMC GPP partition prefix (auto-detects `.00`, `.01`, …). |
 | `--prod-keys`         | `prod.keys`   | Override BIS keys from a Lockpick-style key file.         |
+| `--oem`               | `erista` \| `mariko` | Switch SoC generation. Drives `APB_MISC_GP_HIDREV` so Hekate's `h_cfg.t210b01` matches and pkg1 identification skips the right OEM header. Default `erista`. |
 | `--auto-pin-recovery` | (none)        | Drive the Lockpick PIN-recovery menu without user input.  |
 | `--auto-te-script`    | (none)        | Drive `recover_pin.te` in TegraExplorer without input.    |
 
