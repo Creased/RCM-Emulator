@@ -1,8 +1,9 @@
 #ifndef EMU_STATE_H
 #define EMU_STATE_H
 
-#include <cstdint>
+#include <array>
 #include <atomic>
+#include <cstdint>
 #include <vector>
 #include <string>
 
@@ -203,13 +204,67 @@ struct EmuState {
     std::atomic<uint16_t> usb_pd_voltage_mv{5000};
     std::atomic<uint16_t> usb_pd_amperage_ma{1500};
 
-    // Fuse driver (FUSE @ 0x7000F800). Names per Hekate's bdk/soc/fuse.h.
-    std::atomic<uint32_t> fuse_0x100{1};            // FUSE_PRODUCTION_MODE  (1 = production unit)
-    std::atomic<uint32_t> fuse_0x110{0x83};         // FUSE_SKU_INFO         (0x83 = SKU_ODIN, required by Minerva)
-    std::atomic<uint32_t> fuse_0x118{1785};         // FUSE_CPU_IDDQ_CALIB
-    std::atomic<uint32_t> fuse_0x148{0x83000001};   // FUSE_OPT_FT_REV / mixed
-    std::atomic<uint32_t> fuse_0x1A0{0x06};         // FUSE_OPT_VENDOR_CODE
-    std::atomic<uint32_t> fuse_0x1D8{0x20};         // FUSE_RESERVED_ODM4    (bits 7:3 = dram_id, 0x20 = id 4)
+    // Fuse driver (FUSE @ 0x7000F800). One u32 per offset, indexed by
+    // offset/4. The HW & Fuses Info screen reads several dozen offsets
+    // (speedos, IDDQ, SBK, public key, lot/wafer, etc.); seeding plausible
+    // defaults here keeps the screen rendering meaningful values without a
+    // dedicated atomic per field. Defaults populated by init_fuse_defaults().
+    static constexpr size_t FUSE_WORDS = 0x100;
+    std::array<std::atomic<uint32_t>, FUSE_WORDS> fuse_word{};
+    std::atomic<uint32_t>& fuse_at(uint32_t offset) { return fuse_word[(offset & 0x3FC) / 4]; }
+
+    void init_fuse_defaults() {
+        // Names below mirror Hekate's bdk/soc/fuse.h. Values picked from a
+        // typical Erista golden-sample dump (any retail Switch is similar).
+        fuse_at(0x100).store(1);            // FUSE_PRODUCTION_MODE
+        fuse_at(0x110).store(0x83);         // FUSE_SKU_INFO          (SKU_ODIN)
+        fuse_at(0x114).store(2289);         // FUSE_CPU_SPEEDO_0_CALIB
+        fuse_at(0x118).store(1786);         // FUSE_CPU_IDDQ_CALIB    (x4 -> 7144)
+        fuse_at(0x128).store(0x82);         // FUSE_OPT_FT_REV        (4.02)
+        fuse_at(0x12C).store(2330);         // FUSE_CPU_SPEEDO_1_CALIB
+        fuse_at(0x130).store(2342);         // FUSE_CPU_SPEEDO_2_CALIB
+        fuse_at(0x134).store(1801);         // FUSE_SOC_SPEEDO_0_CALIB
+        fuse_at(0x138).store(0x80);         // FUSE_SOC_SPEEDO_1_CALIB (BROM rev)
+        fuse_at(0x13C).store(1817);         // FUSE_SOC_SPEEDO_2_CALIB
+        fuse_at(0x140).store(1500);         // FUSE_SOC_IDDQ_CALIB    (x4 -> 6000)
+        fuse_at(0x148).store(0x83000001);   // FUSE_FA
+        // Public key (8 words). Hekate prints them byte-swapped, so storage
+        // is the byte-reverse of the desired displayed hex string. Two rows
+        // of "5F1B7A4D8E2C6F09B3A815C7D4E0F26B" / "A91F4C8B7D2E0653F1A8B4C7E0D962F4".
+        fuse_at(0x164).store(0x4D7A1B5F);
+        fuse_at(0x168).store(0x096F2C8E);
+        fuse_at(0x16C).store(0xC715A8B3);
+        fuse_at(0x170).store(0x6BF2E0D4);
+        fuse_at(0x174).store(0x8B4C1FA9);
+        fuse_at(0x178).store(0x53062E7D);
+        fuse_at(0x17C).store(0xC7B4A8F1);
+        fuse_at(0x180).store(0xF462D9E0);
+        fuse_at(0x190).store(0x100);        // FUSE_OPT_CP_REV         (8.00)
+        fuse_at(0x1A0).store(0x06);         // FUSE_SECURITY_MODE
+        // SBK + DK placeholders. Same byte-swap convention as the public key.
+        // SBK displays as "C8E5719FA34D6B208E14F7B965A028D3", DK as "47A1F39E".
+        // --prod-keys overrides these via the SE keytable at runtime.
+        fuse_at(0x1A4).store(0x9F71E5C8);
+        fuse_at(0x1A8).store(0x206B4DA3);
+        fuse_at(0x1AC).store(0xB9F7148E);
+        fuse_at(0x1B0).store(0xD328A065);
+        fuse_at(0x1B4).store(0x9EF3A147);
+        // RESERVED_SW bit 7 selects USB controller string in Hekate. Off = "USB2".
+        fuse_at(0x1C0).store(0x00);
+        fuse_at(0x1D8).store(0x20);         // FUSE_RESERVED_ODM4 (DRAM ID 4)
+        fuse_at(0x200).store(0x06);         // FUSE_OPT_VENDOR_CODE
+        fuse_at(0x204).store(0x12);         // FUSE_OPT_FAB_CODE      ('I' = base36[18])
+        // LOT_CODE_0 holds five base36 chars in 6-bit fields at bits 29:24,
+        // 23:18, 17:12, 11:6, 5:0. Each digit must stay <= 35 or Hekate
+        // indexes past the base36[] table and prints garbage. Encoded "K1SHQ".
+        fuse_at(0x208).store(0x1405C45A);
+        fuse_at(0x210).store(1);            // FUSE_OPT_WAFER_ID
+        // Wafer X/Y must land inside the Erista lithography map
+        // (X in [-9, 15], Y in [0, 24]) or _hw_info_wafer marks "Error".
+        fuse_at(0x214).store(5);            // FUSE_OPT_X_COORDINATE
+        fuse_at(0x218).store(12);           // FUSE_OPT_Y_COORDINATE
+        fuse_at(0x228).store(1500);         // FUSE_GPU_IDDQ_CALIB    (x5 -> 7500)
+    }
 
     // DRAM mode register responses. Hekate reads these via the EMC controller
     // (sdram_read_mrx) to populate the "Vendor / Rev / Density" columns on

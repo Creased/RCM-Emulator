@@ -69,12 +69,7 @@ void reset_to_defaults(EmuState *s) {
     s->emmc_cid_serial   = 0x12345678;
     s->emmc_cid_month    = 6;
     s->emmc_cid_year     = 2017;
-    s->fuse_0x100        = 1;
-    s->fuse_0x110        = 0x83;
-    s->fuse_0x1A0        = 0x06;
-    s->fuse_0x148        = 0x83000001;
-    s->fuse_0x118        = 1785;
-    s->fuse_0x1D8        = 0x20;          // DRAM ID 4 (Samsung K4UBE3D4AA)
+    s->init_fuse_defaults();              // resets all 256 fuse words
     s->dram_vendor       = 1;             // Samsung
     s->dram_rev_id1      = 2;
     s->dram_rev_id2      = 0;
@@ -389,6 +384,8 @@ void build_ui(EmuState *state) {
     }
 
     if (ImGui::CollapsingHeader("Display panel (DSI)")) {
+        // Panel ID raw bytes are read by Hekate via MIPI_DCS_GET_DISPLAY_ID.
+        // The decoded ID is ((raw >> 8) & 0xFF00) | (raw & 0xFF).
         // Decoded ID is `((raw >> 8) & 0xFF00) | (raw & 0xFF)`, which means
         // the high byte of the decoded ID lives in raw[23:16] (MSB of raw)
         // and the low byte lives in raw[7:0]. raw[15:8] is the rev byte that
@@ -485,12 +482,48 @@ void build_ui(EmuState *state) {
     }
 
     if (ImGui::CollapsingHeader("Fuses (advanced)")) {
-        atomic_hex_input("FUSE 0x100", state->fuse_0x100);
-        atomic_hex_input("FUSE 0x110 (SKU)", state->fuse_0x110);
-        atomic_hex_input("FUSE 0x118 (ID)",  state->fuse_0x118);
-        atomic_hex_input("FUSE 0x148",       state->fuse_0x148);
-        atomic_hex_input("FUSE 0x1A0",       state->fuse_0x1A0);
-        atomic_hex_input("FUSE 0x1D8 (ODM4)", state->fuse_0x1D8);
+        // Each row corresponds to a FUSE_BASE offset in Hekate's
+        // bdk/soc/fuse.h. Defaults match a typical Erista golden sample.
+        atomic_hex_input("0x100 PRODUCTION_MODE",  state->fuse_at(0x100));
+        atomic_hex_input("0x110 SKU_INFO",         state->fuse_at(0x110));
+        atomic_hex_input("0x114 CPU_SPEEDO_0",     state->fuse_at(0x114));
+        atomic_hex_input("0x118 CPU_IDDQ",         state->fuse_at(0x118));
+        atomic_hex_input("0x128 OPT_FT_REV",       state->fuse_at(0x128));
+        atomic_hex_input("0x12C CPU_SPEEDO_1",     state->fuse_at(0x12C));
+        atomic_hex_input("0x130 CPU_SPEEDO_2",     state->fuse_at(0x130));
+        atomic_hex_input("0x134 SOC_SPEEDO_0",     state->fuse_at(0x134));
+        atomic_hex_input("0x138 SOC_SPEEDO_1 (BROM rev)", state->fuse_at(0x138));
+        atomic_hex_input("0x13C SOC_SPEEDO_2",     state->fuse_at(0x13C));
+        atomic_hex_input("0x140 SOC_IDDQ",         state->fuse_at(0x140));
+        atomic_hex_input("0x148 FA",               state->fuse_at(0x148));
+        atomic_hex_input("0x190 OPT_CP_REV",       state->fuse_at(0x190));
+        atomic_hex_input("0x1A0 SECURITY_MODE",    state->fuse_at(0x1A0));
+        atomic_hex_input("0x1C0 RESERVED_SW",      state->fuse_at(0x1C0));
+        atomic_hex_input("0x1D8 RESERVED_ODM4",    state->fuse_at(0x1D8));
+        atomic_hex_input("0x200 OPT_VENDOR_CODE",  state->fuse_at(0x200));
+        atomic_hex_input("0x204 OPT_FAB_CODE",     state->fuse_at(0x204));
+        atomic_hex_input("0x208 OPT_LOT_CODE_0",   state->fuse_at(0x208));
+        atomic_hex_input("0x210 OPT_WAFER_ID",     state->fuse_at(0x210));
+        atomic_hex_input("0x214 OPT_X_COORDINATE", state->fuse_at(0x214));
+        atomic_hex_input("0x218 OPT_Y_COORDINATE", state->fuse_at(0x218));
+        atomic_hex_input("0x228 GPU_IDDQ",         state->fuse_at(0x228));
+        ImGui::Separator();
+        ImGui::TextDisabled("Public key (8 words, byte-swapped on display)");
+        atomic_hex_input("0x164 PK0", state->fuse_at(0x164));
+        atomic_hex_input("0x168 PK1", state->fuse_at(0x168));
+        atomic_hex_input("0x16C PK2", state->fuse_at(0x16C));
+        atomic_hex_input("0x170 PK3", state->fuse_at(0x170));
+        atomic_hex_input("0x174 PK4", state->fuse_at(0x174));
+        atomic_hex_input("0x178 PK5", state->fuse_at(0x178));
+        atomic_hex_input("0x17C PK6", state->fuse_at(0x17C));
+        atomic_hex_input("0x180 PK7", state->fuse_at(0x180));
+        ImGui::Separator();
+        ImGui::TextDisabled("SBK (4 words) + DK (1 word). --prod-keys overrides at runtime.");
+        atomic_hex_input("0x1A4 SBK0", state->fuse_at(0x1A4));
+        atomic_hex_input("0x1A8 SBK1", state->fuse_at(0x1A8));
+        atomic_hex_input("0x1AC SBK2", state->fuse_at(0x1AC));
+        atomic_hex_input("0x1B0 SBK3", state->fuse_at(0x1B0));
+        atomic_hex_input("0x1B4 DK",   state->fuse_at(0x1B4));
         ImGui::TextDisabled("DRAM ID = (ODM4 >> 3) & 0x1F (T210B01 also OR's bits 14:12 << 5)");
     }
 

@@ -1280,25 +1280,35 @@ void clk_rst_write(EmuState *state, uint64_t addr, uint32_t val) {
 
 // ==================== Fuse ====================
 
+// Latched value from the last FUSE_ADDR write. Hekate's fuse_read(addr) walks
+// the raw fuse macroarray via FUSE_ADDR + FUSE_CTRL=READ + FUSE_RDATA, used by
+// the "Dump fuses" Nyx button to write fuse_array_raw_*.bin to SD.
+static uint32_t g_fuse_ctrl_addr = 0;
+
 uint32_t fuse_read(EmuState *state, uint64_t addr) {
   uint32_t offset = (uint32_t)(addr - FUSE_BASE);
   switch (offset) {
-  case 0x100: return state->fuse_0x100.load();
-  case 0x110: return state->fuse_0x110.load();
-  case 0x1A0: return state->fuse_0x1A0.load();
-  case 0x148: return state->fuse_0x148.load();
-  case 0x118: return state->fuse_0x118.load();
-  // FUSE_RESERVED_ODM4 - bits 7:3 carry the DRAM ID on T210, with bits 14:12
-  // appended on T210B01 to extend the range past 7.
-  case 0x1D8: return state->fuse_0x1D8.load();
-  default:    return 0;
+  case 0x00:
+    // FUSE_CTRL: bits 20:16 = status (4 = IDLE), bit 30 = sense data ready.
+    // Returning IDLE unconditionally lets fuse_wait_idle() exit; otherwise
+    // Dump Fuses spins forever after issuing a READ command.
+    return (1u << 30) | (4u << 16);
+  case 0x08:
+    // FUSE_RDATA: would return the raw macroarray word at FUSE_ADDR. We
+    // don't model the raw array (only the cached fuse register file at
+    // offset 0x100+), so return zeros here. The dump file ends up zero-
+    // filled but the operation completes successfully.
+    (void)g_fuse_ctrl_addr;
+    return 0;
   }
+  if (offset >= EmuState::FUSE_WORDS * 4) return 0;
+  return state->fuse_at(offset).load();
 }
 
 void fuse_write(EmuState *state, uint64_t addr, uint32_t val) {
   (void)state;
-  (void)addr;
-  (void)val;
+  uint32_t offset = (uint32_t)(addr - FUSE_BASE);
+  if (offset == 0x04) g_fuse_ctrl_addr = val; // FUSE_ADDR
 }
 
 // ==================== EMC (DRAM mode register reads) ====================

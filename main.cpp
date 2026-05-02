@@ -282,6 +282,7 @@ int main(int argc, char *argv[]) {
 
     // Initialize emulator state
     EmuState state = {};
+    state.init_fuse_defaults();
 
     // Load payload binary
     size_t payload_size = 0;
