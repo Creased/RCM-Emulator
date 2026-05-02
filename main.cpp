@@ -228,6 +228,14 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
     uc_mem_map(uc, 0x7000E000, 0x1000, UC_PROT_ALL); // RTC/PMC
     uc_mem_map(uc, 0x6000C000, 0x2000, UC_PROT_ALL); // SYSREG/APB_SEMAPH
 
+    // BootROM (iROM) at 0x100000, 96 KB. We don't have the real BootROM
+    // contents, but mapping the region as zero-filled lets Hekate's "Bootrom
+    // Info" / "Dump Bootrom" features read it without faulting. The IPATCH
+    // CAM at 0x6001DC00 is also zero-mapped so the ipatches table renders
+    // empty (which matches an unpatched SoC).
+    uc_mem_map(uc, 0x00100000, 0x18000, UC_PROT_READ | UC_PROT_EXEC); // iROM
+    uc_mem_map(uc, 0x6001D000, 0x1000,  UC_PROT_ALL);                 // IPATCH CAM page
+
     // ---- heap region (32MB @ 0x90000000) ----
     // Already mapped as part of 2GB DRAM chunk
 
