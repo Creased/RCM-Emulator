@@ -138,7 +138,8 @@ What's tweakable, grouped by chip:
 | **BM92T36** USB-PD      | I2C\_1 @ 0x18   | Cable-inserted, PDO voltage, PDO amperage                                                       |
 | **MAX77620** main PMIC  | I2C\_5 @ 0x3C   | OTP (Erista / Mariko), silicon revision                                                         |
 | **MAX77621** CPU/GPU PMIC | I2C\_5 @ 0x1B | Chip ID                                                                                         |
-| **Tegra fuses**         | FUSE 0x7000F800 | 5 fuse offsets read by Hekate (SKU info, fuse ID, etc.)                                         |
+| **Tegra fuses**         | FUSE 0x7000F800 | 6 fuse offsets read by Hekate (SKU info, fuse ID, ODM4, etc.)                                   |
+| **DRAM modules**        | EMC 0xEC (MR5-8)| Vendor (MR5), Rev ID 1/2 (MR6/MR7), per-die density (MR8 5:2)                                   |
 | **GPIO**                | Port Z bit 1    | SD card insert / eject                                                                          |
 | **Display**             | EmuState        | Backlight, rotation override                                                                    |
 | **Emulation**           | EmuState        | Pause / resume, button visualization                                                            |

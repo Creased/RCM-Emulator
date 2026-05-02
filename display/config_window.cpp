@@ -74,6 +74,11 @@ void reset_to_defaults(EmuState *s) {
     s->fuse_0x1A0        = 0x06;
     s->fuse_0x148        = 0x83000001;
     s->fuse_0x118        = 1785;
+    s->fuse_0x1D8        = 0x20;          // DRAM ID 4 (Samsung K4UBE3D4AA)
+    s->dram_vendor       = 1;             // Samsung
+    s->dram_rev_id1      = 2;
+    s->dram_rev_id2      = 0;
+    s->dram_density      = 0x18;          // 4 GB die
     s->backlight         = 100;
     s->rotation_override = -1;
 }
@@ -384,6 +389,69 @@ void build_ui(EmuState *state) {
         atomic_hex_input("FUSE 0x118 (ID)",  state->fuse_0x118);
         atomic_hex_input("FUSE 0x148",       state->fuse_0x148);
         atomic_hex_input("FUSE 0x1A0",       state->fuse_0x1A0);
+        atomic_hex_input("FUSE 0x1D8 (ODM4)", state->fuse_0x1D8);
+        ImGui::TextDisabled("DRAM ID = (ODM4 >> 3) & 0x1F (T210B01 also OR's bits 14:12 << 5)");
+    }
+
+    if (ImGui::CollapsingHeader("DRAM modules")) {
+        // MR5 vendor codes per Hekate gui_info.c.
+        static const VendorEntry kDramVendors[] = {
+            {0,   "Unknown"},
+            {1,   "Samsung"},
+            {6,   "Hynix"},
+            {255, "Micron"},
+        };
+        vendor_preset_combo("Vendor (MR5)", state->dram_vendor,
+                            kDramVendors, IM_ARRAYSIZE(kDramVendors));
+        uint8_t v = state->dram_vendor.load();
+        if (ImGui::InputScalar("Vendor raw", ImGuiDataType_U8, &v, nullptr, nullptr, "%u"))
+            state->dram_vendor.store(v);
+
+        // Hekate prints the rev as "%X.%02X" with MR6 to the left of the dot
+        // and MR7 to the right (e.g. MR6=2, MR7=0 -> "2.00"; MR6=1, MR7=0x0C
+        // -> "1.0C"). Surface both bytes as decimal nibbles so the mapping is
+        // obvious in the UI.
+        int r1 = (int)state->dram_rev_id1.load();
+        if (ImGui::SliderInt("Rev major (MR6)", &r1, 0, 15, "%d"))
+            state->dram_rev_id1.store((uint8_t)r1);
+        int r2 = (int)state->dram_rev_id2.load();
+        if (ImGui::SliderInt("Rev minor (MR7)", &r2, 0, 255, "0x%02X"))
+            state->dram_rev_id2.store((uint8_t)r2);
+        ImGui::TextDisabled("Hekate displays \"<major>.<minor as 2 hex>\" (e.g. 2.00).");
+
+        // Density lives in MR8 bits 5:2. Hekate's gui_info.c only decodes
+        // codes 2-6; anything higher (3-8 GB dies, JEDEC codes 8-11) is shown
+        // as "Unk (N)". Restrict the combo to what Hekate prints; the MR8 raw
+        // input below covers custom codes if you want to exercise that branch.
+        struct DensityEntry { uint8_t code; const char *name; };
+        static const DensityEntry kDensities[] = {
+            {2, "512 MB / die"},
+            {3, "768 MB / die"},
+            {4, "1 GB / die"},
+            {5, "1.5 GB / die"},
+            {6, "2 GB / die"},
+        };
+        uint8_t d   = state->dram_density.load();
+        uint8_t cur = (d & 0x3C) >> 2;
+        const char *cur_name = "Custom";
+        for (const auto &e : kDensities) if (e.code == cur) { cur_name = e.name; break; }
+        char preview[40];
+        snprintf(preview, sizeof(preview), "%s (code %u)", cur_name, cur);
+        if (ImGui::BeginCombo("Density (MR8)", preview)) {
+            for (const auto &e : kDensities) {
+                char item[40];
+                snprintf(item, sizeof(item), "%s (code %u)", e.name, e.code);
+                bool sel = (e.code == cur);
+                if (ImGui::Selectable(item, sel))
+                    state->dram_density.store((uint8_t)((d & ~0x3C) | (e.code << 2)));
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::InputScalar("MR8 raw", ImGuiDataType_U8, &d, nullptr, nullptr, "0x%02X",
+                               ImGuiInputTextFlags_CharsHexadecimal))
+            state->dram_density.store(d);
+        ImGui::TextDisabled("Total = die size x ranks x channels (Hekate prints \"<n> x <die>\").");
     }
 
     if (ImGui::CollapsingHeader("Emulation")) {

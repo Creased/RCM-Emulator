@@ -1283,6 +1283,9 @@ uint32_t fuse_read(EmuState *state, uint64_t addr) {
   case 0x1A0: return state->fuse_0x1A0.load();
   case 0x148: return state->fuse_0x148.load();
   case 0x118: return state->fuse_0x118.load();
+  // FUSE_RESERVED_ODM4 - bits 7:3 carry the DRAM ID on T210, with bits 14:12
+  // appended on T210B01 to extend the range past 7.
+  case 0x1D8: return state->fuse_0x1D8.load();
   default:    return 0;
   }
 }
@@ -1291,6 +1294,63 @@ void fuse_write(EmuState *state, uint64_t addr, uint32_t val) {
   (void)state;
   (void)addr;
   (void)val;
+}
+
+// ==================== EMC (DRAM mode register reads) ====================
+//
+// Hekate's HW-info screen calls sdram_read_mrx(MRx), which:
+//   1. writes EMC(EMC_MRR) with (rank << 30) | (mrx << 16) on the broadcast
+//      bank at EMC_BASE,
+//   2. polls EMC(EMC_EMC_STATUS) bit 20 (MRR_DIVLD) until set,
+//   3. reads EMC_CH0(EMC_MRR) and EMC_CH1(EMC_MRR) from the per-channel
+//      banks at EMC0_BASE / EMC1_BASE.
+//
+// We capture the requested mode register on the EMC_MRR write and route the
+// per-channel reads back to the matching EmuState atomic.
+
+static constexpr uint32_t EMC_ADR_CFG       = 0x010;
+static constexpr uint32_t EMC_MRR           = 0x0EC;
+static constexpr uint32_t EMC_EMC_STATUS    = 0x2B4;
+static constexpr uint32_t EMC_FBIO_CFG7     = 0x584;
+static constexpr uint32_t EMC_STATUS_MRR_DIVLD = 1u << 20;
+
+static uint32_t g_last_mrr_mrx = 5;
+
+static uint8_t emc_mrx_value(EmuState *state, uint32_t mrx) {
+  switch (mrx) {
+  case 5: return state->dram_vendor.load();
+  case 6: return state->dram_rev_id1.load();
+  case 7: return state->dram_rev_id2.load();
+  case 8: return state->dram_density.load();
+  default: return 0;
+  }
+}
+
+uint32_t emc_read(EmuState *state, uint64_t addr) {
+  uint32_t offset = (uint32_t)(addr & 0xFFF);
+  bool per_channel = (addr >= EMC0_BASE);
+
+  if (per_channel) {
+    if (offset == EMC_MRR)
+      return emc_mrx_value(state, g_last_mrr_mrx);
+    return 0;
+  }
+
+  switch (offset) {
+  case EMC_ADR_CFG:    return 0;                          // single rank
+  case EMC_FBIO_CFG7:  return (1u << 1) | (1u << 2);      // ch0 + ch1 enabled
+  case EMC_EMC_STATUS: return EMC_STATUS_MRR_DIVLD;       // MRR data always valid
+  case EMC_MRR:        return emc_mrx_value(state, g_last_mrr_mrx);
+  default:             return 0;
+  }
+}
+
+void emc_write(EmuState *state, uint64_t addr, uint32_t val) {
+  (void)state;
+  uint32_t offset = (uint32_t)(addr & 0xFFF);
+  if (offset == EMC_MRR && addr < EMC0_BASE) {
+    g_last_mrr_mrx = (val >> 16) & 0xFF;
+  }
 }
 
 // ==================== SE (Security Engine) ====================
@@ -1491,6 +1551,10 @@ static void hook_mmio_read(uc_engine *uc, uc_mem_type type, uint64_t address,
       result = clk_rst_read(state, address);
     } else if (address >= FUSE_BASE && address < FUSE_BASE + FUSE_SIZE) {
       result = fuse_read(state, address);
+    } else if ((address >= EMC_BASE  && address < EMC_BASE  + EMC_SIZE) ||
+               (address >= EMC0_BASE && address < EMC0_BASE + EMC_SIZE) ||
+               (address >= EMC1_BASE && address < EMC1_BASE + EMC_SIZE)) {
+      result = emc_read(state, address);
     } else if (address >= SE_BASE && address < SE_BASE + SE_SIZE) {
       result = se_read(state, address);
     } else {
@@ -1578,6 +1642,10 @@ static void hook_mmio_write(uc_engine *uc, uc_mem_type type, uint64_t address,
       clk_rst_write(state, address, val);
     } else if (address >= FUSE_BASE && address < FUSE_BASE + FUSE_SIZE) {
       fuse_write(state, address, val);
+    } else if ((address >= EMC_BASE  && address < EMC_BASE  + EMC_SIZE) ||
+               (address >= EMC0_BASE && address < EMC0_BASE + EMC_SIZE) ||
+               (address >= EMC1_BASE && address < EMC1_BASE + EMC_SIZE)) {
+      emc_write(state, address, val);
     } else if (address >= SE_BASE && address < SE_BASE + SE_SIZE) {
       se_write(state, address, val);
     } else {
@@ -1822,6 +1890,8 @@ void mmio_init(uc_engine *uc, EmuState *state) {
       {FUSE_BASE, FUSE_SIZE},
       {0x60007000, 0x1000}, // FLOW_CTLR
       {EMC_BASE, EMC_SIZE},
+      {EMC0_BASE, EMC_SIZE},
+      {EMC1_BASE, EMC_SIZE},
       {MC_BASE, MC_SIZE},
       {DISPLAY_A_BASE, DISPLAY_SIZE},
       {DSI_BASE, DSI_SIZE},

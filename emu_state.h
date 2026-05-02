@@ -209,6 +209,16 @@ struct EmuState {
     std::atomic<uint32_t> fuse_0x118{1785};         // FUSE_CPU_IDDQ_CALIB
     std::atomic<uint32_t> fuse_0x148{0x83000001};   // FUSE_OPT_FT_REV / mixed
     std::atomic<uint32_t> fuse_0x1A0{0x06};         // FUSE_OPT_VENDOR_CODE
+    std::atomic<uint32_t> fuse_0x1D8{0x20};         // FUSE_RESERVED_ODM4    (bits 7:3 = dram_id, 0x20 = id 4)
+
+    // DRAM mode register responses. Hekate reads these via the EMC controller
+    // (sdram_read_mrx) to populate the "Vendor / Rev / Density" columns on
+    // the HW & Fuses Info screen. Defaults match a Samsung K4F6E304HB-MGCH
+    // 4 GB module on both channels.
+    std::atomic<uint8_t>  dram_vendor{1};           // MR5 MAN_ID  (1=Samsung, 6=Hynix, 255=Micron)
+    std::atomic<uint8_t>  dram_rev_id1{2};          // MR6 REV_ID1
+    std::atomic<uint8_t>  dram_rev_id2{0};          // MR7 REV_ID2
+    std::atomic<uint8_t>  dram_density{0x18};       // MR8 DENSITY (bits 5:2 = density code)
 };
 
 #endif // EMU_STATE_H

@@ -79,9 +79,13 @@ constexpr uint64_t PMC_SIZE = 0x0C00;
 constexpr uint64_t FUSE_BASE = 0x7000F800;
 constexpr uint64_t FUSE_SIZE = 0x0400;
 
-// EMC (External Memory Controller)
-constexpr uint64_t EMC_BASE = 0x7001B000;
-constexpr uint64_t EMC_SIZE = 0x1000;
+// EMC (External Memory Controller). EMC_BASE is the broadcast/control bank;
+// EMC0/EMC1 are the per-channel banks used to read mode-register responses
+// (sdram_read_mrx splits the 16-bit MRR into low byte = ch0, high byte = ch1).
+constexpr uint64_t EMC_BASE  = 0x7001B000;
+constexpr uint64_t EMC_SIZE  = 0x1000;
+constexpr uint64_t EMC0_BASE = 0x7001E000;
+constexpr uint64_t EMC1_BASE = 0x7001F000;
 
 // MC (Memory Controller)
 constexpr uint64_t MC_BASE = 0x70019000;
