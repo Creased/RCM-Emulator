@@ -170,8 +170,9 @@ is in [t210/mmio.cpp](t210/mmio.cpp). Each encoder mirrors a corresponding
 | `Enter`        | POWER                           |
 | Mouse click    | Touch (Nyx, TE menus)           |
 | `M`            | Open / close hardware-config window (see [Live hardware tweaks](#live-hardware-tweaks)) |
-| `R` / `Shift+R`| Cycle display rotation CW / CCW |
+| `R`            | Soft reboot                     |
 | `P`            | Pause or resume emulation       |
+| `Ctrl+R` / `Ctrl+Shift+R` | Cycle display rotation CW / CCW |
 | `S`            | Cycle swizzle override          |
 | `Esc`          | Quit                            |
 

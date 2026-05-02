@@ -451,6 +451,7 @@ bool sdl_display_poll_events(EmuState *state, uc_engine *uc) {
     }
     if (event.type == SDL_KEYDOWN) {
       bool shift = (SDL_GetModState() & KMOD_SHIFT);
+      bool ctrl  = (SDL_GetModState() & KMOD_CTRL);
       uint32_t step = shift ? 4096 : 128;
       switch (event.key.keysym.sym) {
       case SDLK_UP:
@@ -473,23 +474,26 @@ bool sdl_display_poll_events(EmuState *state, uc_engine *uc) {
         printf("[diag] Emulation %s\n", state->paused ? "PAUSED" : "RESUMED");
         break;
       case SDLK_r: {
-        // R         : step rotation 90° clockwise   (Auto → 0 → 90 → 180 → 270 → Auto)
-        // Shift+R   : step rotation 90° counter-CW  (Auto → 270 → 180 → 90 → 0 → Auto)
-        int r = state->rotation_override;
-        if (shift) {
-          // CCW: -1 → 3 → 2 → 1 → 0 → -1
-          r = (r == -1) ? 3 : (r == 0) ? -1 : r - 1;
+        if (!ctrl) {
+          // Plain R: soft reboot. Same path as the config window's "Reboot"
+          // button — re-prime IRAM payload + WDT cookie, wipe DRAM, reset PC.
+          state->reboot_requested = true;
+          printf("[diag] Reboot requested (R)\n");
         } else {
-          // CW:  -1 → 0 → 1 → 2 → 3 → -1
-          r = (r == 3) ? -1 : r + 1;
+          // Ctrl+R / Ctrl+Shift+R: cycle display rotation
+          //   Ctrl+R       : 90° clockwise   (Auto → 0 → 90 → 180 → 270 → Auto)
+          //   Ctrl+Shift+R : 90° counter-CW  (Auto → 270 → 180 → 90 → 0 → Auto)
+          int r = state->rotation_override;
+          if (shift) r = (r == -1) ? 3 : (r ==  0) ? -1 : r - 1;
+          else       r = (r ==  3) ? -1 : r + 1;
+          state->rotation_override = r;
+          const char *label =
+              r == -1 ? "Auto" : r == 0 ? "0\xC2\xB0" :
+              r ==  1 ? "90\xC2\xB0 CW" :
+              r ==  2 ? "180\xC2\xB0" :
+                        "270\xC2\xB0 CW";
+          printf("[diag] Rotation Override: %d (%s)\n", r, label);
         }
-        state->rotation_override = r;
-        const char *label =
-            r == -1 ? "Auto" : r == 0 ? "0\xC2\xB0" :
-            r == 1 ? "90\xC2\xB0 CW" :
-            r == 2 ? "180\xC2\xB0" :
-                     "270\xC2\xB0 CW";
-        printf("[diag] Rotation Override: %d (%s)\n", r, label);
         break;
       }
       case SDLK_i:
