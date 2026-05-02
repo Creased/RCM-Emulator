@@ -29,15 +29,17 @@ for auto-script timing.
 ## Boot flow (Hekate as the example)
 
 1. The payload is loaded into IRAM (Internal RAM) at `0x40010000` via
-   `uc_mem_write`.
+   `uc_mem_write`. We also pre-write the 4-byte cookie `0x544457` ("WDT") at
+   IRAM offset `0x4003FF18`. Hekate reads that location during early boot.
+   When the cookie is present, it takes the `goto skip_lp0_minerva_config`
+   branch and skips loading both `libsys_lp0.bso` and the Minerva
+   DRAM-training module. Real DRAM training would touch the EMC (External
+   Memory Controller) and MC (Memory Controller), neither of which the
+   emulator models. The matching exception-enable cookie at `0x4003FF1C`
+   stays zero, so the "hang detected" warning is suppressed.
 2. PC is set to `0x40010000`, SP to `IPL_STACK_ADDR`. CPSR enters ARM mode.
 3. The IPL (Initial Program Loader) initialises clocks, fuses and the display,
-   then blocks at a `btn_wait` site. In Hekate 6.5.2 this PC is `0x4000D14E`.
-   Depending on build it may be a "press any key" prompt, the Nyx fallback
-   warning, or a similar one-tap gate. `main.cpp` watches for that PC and
-   spoofs a POWER press for ~100 ticks so the run advances without manual
-   input. If you load a different Hekate version and boot stalls forever,
-   capture the PC where it loops and update the constant.
+   then continues straight into the boot menu without loading LP0 or Minerva.
 4. Hekate self-relocates into DRAM (`0xC0000000+`) and continues. The display
    pipeline resamples its DRAM-side framebuffer parameters.
 5. Nyx (the LVGL graphics stack) initialises and draws into a separate FB. The

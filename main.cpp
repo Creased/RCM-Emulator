@@ -147,7 +147,18 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
            (unsigned)(IRAM_SIZE / 1024));
 
     uc_mem_write(uc, IPL_LOAD_ADDR, payload, payload_size);
-    
+
+    // Pre-set Hekate's "watchdog fired" magic at IRAM 0x4003FF18 (cookie "WDT")
+    // so its early boot does `goto skip_lp0_minerva_config`, skipping both
+    // libsys_lp0.bso and the Minerva DRAM-training path. EXCP_EN_ADDR
+    // (0x4003FF1C) stays zeroed so ERR_EXCEPTION is *not* set and no warning
+    // screen appears. EMC/MC training touches hardware we don't model; this is
+    // the same path Hekate takes on real silicon after a legitimate WDT reset.
+    {
+        uint32_t wdt_magic = 0x544457; // "WDT"
+        uc_mem_write(uc, 0x4003FF18, &wdt_magic, sizeof(wdt_magic));
+    }
+
     // Setup instruction tracing
     uc_hook_add(uc, &trace_h, UC_HOOK_CODE, (void*)trace_callback, nullptr, 1, 0);
 
@@ -356,23 +367,6 @@ int main(int argc, char *argv[]) {
             uint32_t pc, cpsr;
             uc_reg_read(uc, UC_ARM_REG_PC, &pc);
             uc_reg_read(uc, UC_ARM_REG_CPSR, &cpsr);
-
-            // PC of an IPL btn_wait site in Hekate 6.5.2 — depending on build
-            // this is "press any key", the Nyx fallback prompt, or similar.
-            // We hold POWER for ~100 ticks to advance past it without manual
-            // input. If a different Hekate stalls forever, capture the new PC
-            // and update this constant.
-            static int auto_enter_timer = 0;
-            if (pc == 0x4000D14E || auto_enter_timer > 0) {
-                if (auto_enter_timer < 100) {
-                    state.btn_power = true;
-                    auto_enter_timer++;
-                    if (auto_enter_timer == 100) {
-                        state.btn_power = false;
-                        printf("[emu] Auto-advanced past IPL btn_wait at PC=0x4000D14E\n");
-                    }
-                }
-            }
 
             // ---- PIN recovery scripted navigation (Lockpick patch menu) ----
             // With EmuNAND grayed out (no emummc.ini), Lockpick's main menu
