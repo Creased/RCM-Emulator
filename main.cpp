@@ -283,6 +283,11 @@ int main(int argc, char *argv[]) {
     // Initialize emulator state
     EmuState state = {};
     state.init_fuse_defaults();
+    // Overlay any saved hardware tweaks from rcm_emu.ini (cwd-relative).
+    // The load is additive — missing keys keep the defaults set above.
+    if (config_window_load_ini(&state, "rcm_emu.ini")) {
+        printf("[config] Loaded rcm_emu.ini\n");
+    }
 
     // Load payload binary
     size_t payload_size = 0;

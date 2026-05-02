@@ -22,3 +22,4 @@ __pycache__/
 *.pyc
 backup/
 imgui.ini
+rcm_emu.ini

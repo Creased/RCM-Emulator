@@ -9,6 +9,7 @@
 #include "backends/imgui_impl_sdlrenderer2.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -81,6 +82,201 @@ void reset_to_defaults(EmuState *s) {
     s->touch_fw_rev      = 0x4567;
     s->backlight         = 100;
     s->rotation_override = -1;
+}
+
+// ============================================================================
+// INI persistence
+//
+// On startup main.cpp tries to load rcm_emu.ini from cwd; the load is
+// additive, so any field absent from the file keeps whatever EmuState held
+// (typically the constructor default or init_fuse_defaults() value). The
+// "Save configuration" button writes the current values back to the same
+// file. Fuses are written as `0xNNN=HHHHHHHH` rows, all 256 words; the rest
+// of the state is grouped into [section] blocks matching the M-window
+// layout.
+// ============================================================================
+
+// Schema. Every saveable field appears here exactly once. The macro is
+// expanded by save and load into matching write / parse code, so adding a
+// new tweakable means appending one line and nothing else.
+//
+// Args: (atomic_field, section, key, signed)  — `signed` picks decimal vs
+// unsigned-decimal formatting on save and signed-vs-unsigned strtoll on load.
+#define EMU_STATE_INI_FIELDS(X)                                              \
+    /* Battery (MAX17050) */                                                 \
+    X(bat_soc_pct,         "battery", "soc_pct",         0)                  \
+    X(bat_vcell_mv,        "battery", "vcell_mv",        0)                  \
+    X(bat_temp_c10,        "battery", "temp_c10",        1)                  \
+    X(bat_current_ma,      "battery", "current_ma",      1)                  \
+    X(bat_capacity_mah,    "battery", "capacity_mah",    0)                  \
+    X(bat_full_cap_mah,    "battery", "full_cap_mah",    0)                  \
+    X(bat_design_cap_mah,  "battery", "design_cap_mah",  0)                  \
+    X(bat_ocv_mv,          "battery", "ocv_mv",          0)                  \
+    X(bat_v_empty_mv,      "battery", "v_empty_mv",      0)                  \
+    X(bat_min_volt_mv,     "battery", "min_volt_mv",     0)                  \
+    X(bat_max_volt_mv,     "battery", "max_volt_mv",     0)                  \
+    X(bat_age_pct,         "battery", "age_pct",         0)                  \
+    X(bat_cycles,          "battery", "cycles",          0)                  \
+    /* Thermal (TMP451) */                                                   \
+    X(soc_temp_c10,        "thermal", "soc_temp_c10",    1)                  \
+    X(pcb_temp_c10,        "thermal", "pcb_temp_c10",    1)                  \
+    /* Charger (BQ24193) */                                                  \
+    X(chg_vbus_stat,       "charger", "vbus_stat",       0)                  \
+    X(chg_chrg_stat,       "charger", "chrg_stat",       0)                  \
+    X(chg_power_good,      "charger", "power_good",      0)                  \
+    X(chg_input_current_ma,"charger", "input_current_ma",0)                  \
+    X(chg_input_voltage_mv,"charger", "input_voltage_mv",0)                  \
+    X(chg_system_min_mv,   "charger", "system_min_mv",   0)                  \
+    X(chg_fast_current_ma, "charger", "fast_current_ma", 0)                  \
+    X(chg_charge_voltage_mv,"charger","charge_voltage_mv",0)                 \
+    X(chg_thermal_c,       "charger", "thermal_c",       0)                  \
+    /* USB-PD (BM92T36) */                                                   \
+    X(usb_pd_inserted,     "usb_pd",  "inserted",        0)                  \
+    X(usb_pd_voltage_mv,   "usb_pd",  "voltage_mv",      0)                  \
+    X(usb_pd_amperage_ma,  "usb_pd",  "amperage_ma",     0)                  \
+    /* SoC / PMIC */                                                         \
+    X(pmic_otp,            "soc",     "pmic_otp",        0)                  \
+    X(is_mariko,           "soc",     "is_mariko",       0)                  \
+    X(pmic_silicon_rev,    "soc",     "pmic_silicon_rev",0)                  \
+    X(cpu_pmic_version,    "soc",     "cpu_pmic_version",0)                  \
+    /* Storage — SD (SDMMC1 CMD2) */                                         \
+    X(sd_inserted,         "sd",      "inserted",        0)                  \
+    X(sd_cid_manfid,       "sd",      "cid_manfid",      0)                  \
+    X(sd_cid_oemid,        "sd",      "cid_oemid",       0)                  \
+    X(sd_cid_prod_name,    "sd",      "cid_prod_name",   0)                  \
+    X(sd_cid_hwrev,        "sd",      "cid_hwrev",       0)                  \
+    X(sd_cid_fwrev,        "sd",      "cid_fwrev",       0)                  \
+    X(sd_cid_serial,       "sd",      "cid_serial",      0)                  \
+    X(sd_cid_month,        "sd",      "cid_month",       0)                  \
+    X(sd_cid_year,         "sd",      "cid_year",        0)                  \
+    /* Storage — eMMC (SDMMC4 CMD2) */                                       \
+    X(emmc_cid_manfid,     "emmc",    "cid_manfid",      0)                  \
+    X(emmc_cid_oemid,      "emmc",    "cid_oemid",       0)                  \
+    X(emmc_cid_prod_name,  "emmc",    "cid_prod_name",   0)                  \
+    X(emmc_cid_prv,        "emmc",    "cid_prv",         0)                  \
+    X(emmc_cid_serial,     "emmc",    "cid_serial",      0)                  \
+    X(emmc_cid_month,      "emmc",    "cid_month",       0)                  \
+    X(emmc_cid_year,       "emmc",    "cid_year",        0)                  \
+    /* Display panel (DSI MIPI_DCS_GET_DISPLAY_ID) */                        \
+    X(panel_id_raw,        "display", "panel_id_raw",    0)                  \
+    /* Touch panel (FTS4) */                                                 \
+    X(touch_panel_idx,     "touch",   "panel_idx",       0)                  \
+    X(touch_fw_id,         "touch",   "fw_id",           0)                  \
+    X(touch_ftb_ver,       "touch",   "ftb_ver",         0)                  \
+    X(touch_fw_rev,        "touch",   "fw_rev",          0)                  \
+    /* DRAM modules (EMC mode-register stubs) */                             \
+    X(dram_vendor,         "dram",    "vendor",          0)                  \
+    X(dram_rev_id1,        "dram",    "rev_id1",         0)                  \
+    X(dram_rev_id2,        "dram",    "rev_id2",         0)                  \
+    X(dram_density,        "dram",    "density",         0)
+
+bool config_window_save_ini_impl(const EmuState *s, const char *path) {
+    FILE *f = fopen(path, "w");
+    if (!f) return false;
+    fprintf(f,
+        "# rcm_emu hardware config\n"
+        "# Auto-loaded on startup. Edit by hand or via the M-window\n"
+        "# 'Save configuration' button.\n");
+
+    const char *cur_section = "";
+    auto write_header = [&](const char *section) {
+        if (strcmp(section, cur_section) != 0) {
+            fprintf(f, "\n[%s]\n", section);
+            cur_section = section;
+        }
+    };
+#define X(field, section, key, is_signed)                                    \
+    write_header(section);                                                   \
+    if (is_signed) fprintf(f, "%s=%lld\n", key, (long long)s->field.load()); \
+    else           fprintf(f, "%s=%llu\n", key, (unsigned long long)s->field.load());
+    EMU_STATE_INI_FIELDS(X)
+#undef X
+
+    // Plain (non-atomic) fields.
+    write_header("display");
+    fprintf(f, "backlight=%u\n", (unsigned)s->backlight);
+    fprintf(f, "rotation_override=%d\n", (int)s->rotation_override);
+
+    // Fuses are dumped wholesale — small enough (256 × 4 bytes) and keeps the
+    // load path branch-free.
+    fprintf(f, "\n[fuses]\n");
+    for (size_t i = 0; i < EmuState::FUSE_WORDS; i++) {
+        uint32_t v = s->fuse_word[i].load();
+        if (v) fprintf(f, "0x%03X=0x%08X\n", (unsigned)(i * 4), v);
+    }
+
+    fclose(f);
+    return true;
+}
+
+// In-place trim. Returns the new start (skips leading whitespace) and writes
+// a NUL where trailing whitespace begins.
+char *trim(char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    size_t n = strlen(s);
+    while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\t' || s[n-1] == '\n' || s[n-1] == '\r')) {
+        s[--n] = 0;
+    }
+    return s;
+}
+
+bool config_window_load_ini_impl(EmuState *s, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+
+    char line[256];
+    char section[64] = "";
+    while (fgets(line, sizeof(line), f)) {
+        char *p = trim(line);
+        if (*p == 0 || *p == '#' || *p == ';') continue;
+
+        if (*p == '[') {
+            char *end = strchr(p + 1, ']');
+            if (!end) continue;
+            size_t n = (size_t)(end - p - 1);
+            if (n >= sizeof(section)) n = sizeof(section) - 1;
+            memcpy(section, p + 1, n);
+            section[n] = 0;
+            continue;
+        }
+
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char *key = trim(p);
+        char *val = trim(eq + 1);
+
+        // Schema-driven dispatch.
+#define X(field, sec, k, is_signed)                                          \
+        if (strcmp(section, sec) == 0 && strcmp(key, k) == 0) {              \
+            if (is_signed) s->field.store((decltype(s->field.load()))strtoll(val, nullptr, 0)); \
+            else           s->field.store((decltype(s->field.load()))strtoull(val, nullptr, 0)); \
+            continue;                                                        \
+        }
+        EMU_STATE_INI_FIELDS(X)
+#undef X
+
+        // Plain fields and the fuse range.
+        if (strcmp(section, "display") == 0) {
+            if (strcmp(key, "backlight") == 0) {
+                s->backlight = (uint32_t)strtoul(val, nullptr, 0);
+                continue;
+            }
+            if (strcmp(key, "rotation_override") == 0) {
+                s->rotation_override = (int32_t)strtol(val, nullptr, 0);
+                continue;
+            }
+        }
+        if (strcmp(section, "fuses") == 0) {
+            uint32_t off = (uint32_t)strtoul(key, nullptr, 0);
+            if (off < EmuState::FUSE_WORDS * 4 && (off & 3) == 0) {
+                s->fuse_at(off).store((uint32_t)strtoul(val, nullptr, 0));
+            }
+            continue;
+        }
+    }
+    fclose(f);
+    return true;
 }
 
 // Helper: int slider that reads/writes an atomic.
@@ -616,11 +812,30 @@ void build_ui(EmuState *state) {
     if (ImGui::Button("Reset to defaults")) {
         reset_to_defaults(state);
     }
+    ImGui::SameLine();
+    static double g_save_msg_until = 0.0;
+    static bool   g_save_ok        = true;
+    if (ImGui::Button("Save configuration")) {
+        g_save_ok = config_window_save_ini_impl(state, "rcm_emu.ini");
+        g_save_msg_until = ImGui::GetTime() + 2.5;
+    }
+    if (ImGui::GetTime() < g_save_msg_until) {
+        ImGui::SameLine();
+        if (g_save_ok) ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Saved to rcm_emu.ini");
+        else           ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "Save failed (check cwd is writable)");
+    }
 
     ImGui::End();
 }
 
 } // namespace
+
+bool config_window_save_ini(const EmuState *state, const char *path) {
+    return config_window_save_ini_impl(state, path);
+}
+bool config_window_load_ini(EmuState *state, const char *path) {
+    return config_window_load_ini_impl(state, path);
+}
 
 bool config_window_init() {
     g_window = SDL_CreateWindow("rcm_emu - Hardware Config",

@@ -27,4 +27,12 @@ void config_window_render(EmuState *state);
 // Returns the SDL_WindowID of the config window (0 if not yet created).
 Uint32 config_window_id();
 
+// Persist / restore tweakable hardware values to / from a flat INI file.
+// `path` is opened relative to the current working directory. Save returns
+// false on I/O error; load returns false if the file doesn't exist (defaults
+// stay in place). Loading is additive — keys missing from the file keep
+// whatever EmuState already held, so old INIs still work as new fields land.
+bool config_window_save_ini(const EmuState *state, const char *path);
+bool config_window_load_ini(EmuState *state, const char *path);
+
 #endif // CONFIG_WINDOW_H
