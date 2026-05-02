@@ -166,7 +166,10 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
     uc_hook_add(uc, &trace_h, UC_HOOK_CODE, (void*)trace_callback, nullptr, 1, 0);
 
     // ---- Map DRAM Low (256MB @ 0x80000000) ----
-    err = uc_mem_map(uc, DRAM_BASE, 256 * 1024 * 1024, UC_PROT_ALL);
+    // Allocated host-side so soft reboot can memset() it (Nyx loads here and
+    // its file-static SD/eMMC caches would otherwise survive across reboots).
+    state->dram_low_ptr = (uint8_t *)calloc(1, 256 * 1024 * 1024);
+    err = uc_mem_map_ptr(uc, DRAM_BASE, 256 * 1024 * 1024, UC_PROT_ALL, state->dram_low_ptr);
     if (err != UC_ERR_OK) {
         fprintf(stderr, "[error] Failed to map low DRAM: %s\n", uc_strerror(err));
         uc_close(uc);
@@ -338,10 +341,13 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Setup ARM emulation
+    // Setup ARM emulation. Hold on to the payload buffer in EmuState so the
+    // soft-reboot path (config window "Reboot" button) can re-write it into
+    // IRAM without re-reading from disk.
     uc_engine *uc = setup_emulation(&state, payload, payload_size);
-    free(payload);
-    if (!uc) return 1;
+    state.payload_ptr = payload;
+    state.payload_len = payload_size;
+    if (!uc) { free(payload); return 1; }
 
     // Initialize SDL2 display
     if (!sdl_display_init()) {
@@ -370,6 +376,30 @@ int main(int argc, char *argv[]) {
     while (state.running) {
         // Process SDL events (keyboard input, window close)
         if (!sdl_display_poll_events(&state, uc)) break;
+
+        // Soft reboot: re-write the payload to IRAM, wipe DRAM (so Nyx and
+        // the bootloader's file-static caches reset), reset PC/SP/clock and
+        // re-prime the WDT cookie so Hekate's early boot skips Minerva again.
+        if (state.reboot_requested.exchange(false)) {
+            uc_emu_stop(uc);
+            memset(state.dram_low_ptr, 0, 256 * 1024 * 1024);
+            memset(state.dram_ptr,     0, 1024 * 1024 * 1024);
+            uc_mem_write(uc, IPL_LOAD_ADDR, state.payload_ptr, state.payload_len);
+            uint32_t wdt_magic = 0x544457;
+            uc_mem_write(uc, 0x4003FF18, &wdt_magic, sizeof(wdt_magic));
+            uint32_t reset_pc = IPL_LOAD_ADDR;
+            uint32_t reset_sp = IPL_STACK_ADDR;
+            uint32_t reset_cpsr = 0; // ARM mode, all flags clear
+            uc_reg_write(uc, UC_ARM_REG_PC,   &reset_pc);
+            uc_reg_write(uc, UC_ARM_REG_SP,   &reset_sp);
+            uc_reg_write(uc, UC_ARM_REG_CPSR, &reset_cpsr);
+            state.fb_addr = FB_BASE; // re-point display at the FB base
+            state.emu_usec   = 0;
+            state.insn_count = 0;
+            state.touch_phase = 0;
+            state.paused = false;
+            printf("[emu] Soft reboot complete (DRAM wiped)\n");
+        }
 
         if (!state.paused) {
             uint32_t pc, cpsr;
@@ -548,6 +578,8 @@ int main(int argc, char *argv[]) {
 
     free(state.iram_ptr);
     free(state.dram_ptr);
+    free(state.dram_low_ptr);
+    free(state.payload_ptr);
     // fb_ptr points inside dram_ptr; do not free separately.
 
     printf("[emu] Done.\n");

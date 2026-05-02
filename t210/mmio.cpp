@@ -622,9 +622,14 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
       result = (uint32_t)(((base == SDMMC4_BASE) ? state->sdmmc4_adma_addr
                                                  : state->sdmmc_adma_addr) >>
                           32);
-    else if (offset == 0x24)
-      result = 0x01F70000; // CARD_PRESENT | CD_STABLE | CD_LVL | DAT_LINE_LEVEL
-                           // (Ready)
+    else if (offset == 0x24) {
+      // PRESENT_STATE. SDMMC1 honours the SD-insert toggle; SDMMC4 (eMMC)
+      // is always present.
+      if (base == SDMMC1_BASE && !state->sd_inserted.load())
+        result = 0; // no card present
+      else
+        result = 0x01F70000; // CARD_PRESENT | CD_STABLE | CD_LVL | DAT_LINE_LEVEL
+    }
     else if (offset == 0x2C)
       result = 0x0003; // SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_INT_STABLE
     else if (offset == 0x40)
@@ -751,6 +756,16 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
       if (base == SDMMC4_BASE && state->last_cmd4_was_55)
         r1_base |= 0x0100;
 
+      // SDMMC1 with no SD card: signal CMD_TIMEOUT_ERROR for every command.
+      // Hekate's sd_init_retry sees the timeout, falls back to checking
+      // gpio_read(PORT_Z, 1), and bails with "Failed to init SD card".
+      if (base == SDMMC1_BASE && !state->sd_inserted.load()) {
+        norintsts |= 0x0001;
+        errintsts |= (1 << 0);
+        rsp[0] = rsp[1] = rsp[2] = rsp[3] = 0;
+        return;
+      }
+
       // Set Command Complete for all commands
       norintsts |= 0x0001;
 
@@ -781,33 +796,76 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
           ext_csd[215] = (sec_cnt >> 24) & 0xFF;
 
           uint64_t dma_addr = 0;
-          if (trnmod & 0x0001) {            // DMA enabled
-            if ((hostctl & 0x18) == 0x10) { // ADMA2
-              uint8_t desc[12];
-              if (uc_mem_read(uc, adma_addr, desc, 12) == UC_ERR_OK) {
-                uint32_t low = *(uint32_t *)(desc + 4);
-                uint32_t high = *(uint32_t *)(desc + 8);
-                dma_addr = ((uint64_t)high << 32) | low;
-              }
-            } else { // SDMA
-              dma_addr = sysad;
-            }
-            if (dma_addr) uc_mem_write(uc, dma_addr, ext_csd, 512);
-          } else {
-            uc_mem_write(uc, sysad, ext_csd, 512);
-          }
+          // Tegra's SDMMC uses register 0x58 as the SDMA system-address
+          // register (Hekate writes the destination buffer pointer directly
+          // there in sdmmc_driver.c::_sdmmc_dma_init). adma_addr in our state
+          // captures that write, so it IS the destination, not a descriptor
+          // pointer. Fall back to sysad (SDHCI standard 0x00) if 0x58 wasn't
+          // programmed.
+          dma_addr = adma_addr ? adma_addr : sysad;
+          if (dma_addr) uc_mem_write(uc, dma_addr, ext_csd, 512);
           norintsts |= 0x0002; // TRANSFER_COMPLETE
         }
         break;
       case 1:
         rsp[0] = 0xC0FF8000;
         break;
-      case 2: // SEND_CID
-        rsp[0] = 0x12345678;
-        rsp[1] = 0xABCDEF01;
-        rsp[2] = 0x23456789;
-        rsp[3] = 0xBCDEF012;
+      case 2: { // SEND_CID
+        // Build the 16-byte CID from EmuState atomics, then pack into the
+        // 4 R2 response registers. Hekate's _get_rsp shifts the 4 registers
+        // left 8 bits (CRC strip) when assembling raw_cid, so we put the
+        // CID bytes into rspreg pre-shifted right by 8.
+        uint8_t cid[16] = {0};
+        if (base == SDMMC1_BASE) {
+          // SD CID per _sd_storage_parse_cid (bdk/storage/sdmmc.c).
+          uint64_t pn = state->sd_cid_prod_name.load();
+          cid[0]  = state->sd_cid_manfid.load();
+          cid[1]  = (state->sd_cid_oemid.load() >> 8) & 0xFF;
+          cid[2]  =  state->sd_cid_oemid.load()       & 0xFF;
+          cid[3]  =  pn        & 0xFF;
+          cid[4]  = (pn >> 8)  & 0xFF;
+          cid[5]  = (pn >> 16) & 0xFF;
+          cid[6]  = (pn >> 24) & 0xFF;
+          cid[7]  = (pn >> 32) & 0xFF;
+          cid[8]  = ((state->sd_cid_hwrev.load() & 0xF) << 4)
+                  |  (state->sd_cid_fwrev.load() & 0xF);
+          uint32_t sn = state->sd_cid_serial.load();
+          cid[9]  = (sn >> 24) & 0xFF;
+          cid[10] = (sn >> 16) & 0xFF;
+          cid[11] = (sn >> 8)  & 0xFF;
+          cid[12] =  sn        & 0xFF;
+          uint8_t  yr = (uint8_t)(state->sd_cid_year.load() - 2000);
+          cid[13] = (yr >> 4) & 0x0F;
+          cid[14] = ((yr & 0x0F) << 4) | (state->sd_cid_month.load() & 0x0F);
+        } else {
+          // eMMC CID per _mmc_storage_parse_cid (MMC v4: 8-bit oemid + 6-byte
+          // prod_name + prv + 32-bit serial + 4-bit month + 4-bit year offset
+          // from 2013 because we report ext_csd.rev >= 5).
+          uint64_t pn = state->emmc_cid_prod_name.load();
+          cid[0]  = state->emmc_cid_manfid.load();
+          cid[1]  = 0;
+          cid[2]  = state->emmc_cid_oemid.load();
+          cid[3]  =  pn        & 0xFF;
+          cid[4]  = (pn >> 8)  & 0xFF;
+          cid[5]  = (pn >> 16) & 0xFF;
+          cid[6]  = (pn >> 24) & 0xFF;
+          cid[7]  = (pn >> 32) & 0xFF;
+          cid[8]  = (pn >> 40) & 0xFF;
+          cid[9]  = state->emmc_cid_prv.load();
+          uint32_t sn = state->emmc_cid_serial.load();
+          cid[10] = (sn >> 24) & 0xFF;
+          cid[11] = (sn >> 16) & 0xFF;
+          cid[12] = (sn >> 8)  & 0xFF;
+          cid[13] =  sn        & 0xFF;
+          uint8_t  yr = (uint8_t)(state->emmc_cid_year.load() - 2013);
+          cid[14] = ((state->emmc_cid_month.load() & 0x0F) << 4) | (yr & 0x0F);
+        }
+        rsp[3] = (cid[0]  << 16) | (cid[1]  << 8) |  cid[2];
+        rsp[2] = (cid[3]  << 24) | (cid[4]  << 16) | (cid[5]  << 8) | cid[6];
+        rsp[1] = (cid[7]  << 24) | (cid[8]  << 16) | (cid[9]  << 8) | cid[10];
+        rsp[0] = (cid[11] << 24) | (cid[12] << 16) | (cid[13] << 8) | cid[14];
         break;
+      }
       case 3: // SEND_RELATIVE_ADDR
         if (base == SDMMC1_BASE) {
           // SD: R6 response — RCA in upper 16 bits, status in lower 16.

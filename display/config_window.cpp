@@ -53,6 +53,21 @@ void reset_to_defaults(EmuState *s) {
     s->pmic_silicon_rev  = 0;
     s->cpu_pmic_version  = 0;
     s->sd_inserted       = true;
+    s->sd_cid_manfid     = 0x03;
+    s->sd_cid_oemid      = 0x5344;        // "SD"
+    s->sd_cid_prod_name  = 0x3155445355ULL; // "USDU1"
+    s->sd_cid_hwrev      = 1;
+    s->sd_cid_fwrev      = 0;
+    s->sd_cid_serial     = 0xC0FFEE42;
+    s->sd_cid_month      = 10;
+    s->sd_cid_year       = 2024;
+    s->emmc_cid_manfid   = 0x90;
+    s->emmc_cid_oemid    = 0x01;
+    s->emmc_cid_prod_name = 0x326134474248ULL; // "HBG4a2"
+    s->emmc_cid_prv      = 0x07;
+    s->emmc_cid_serial   = 0x12345678;
+    s->emmc_cid_month    = 6;
+    s->emmc_cid_year     = 2017;
     s->fuse_0x100        = 1;
     s->fuse_0x110        = 0x83;
     s->fuse_0x1A0        = 0x06;
@@ -84,6 +99,51 @@ bool atomic_slider_temp(const char *label, std::atomic<T> &a, float lo_c, float 
         return true;
     }
     return false;
+}
+
+// Vendor name + hex tuple. Hex is what gets written; the name is just a UI
+// label for known IDs. List mirrors Hekate's gui_info.c switch statements
+// for SD (sd_storage.cid.manfid) and eMMC (emmc_storage.cid.manfid).
+struct VendorEntry { uint8_t id; const char *name; };
+
+static const VendorEntry kSdVendors[] = {
+    {0x00,"Fake"},        {0x01,"Panasonic"},  {0x02,"Toshiba"},   {0x03,"SanDisk"},
+    {0x06,"Ritek"},       {0x09,"ATP"},        {0x13,"Kingmax"},   {0x19,"Dynacard"},
+    {0x1A,"Power Quotient"}, {0x1B,"Samsung"}, {0x1D,"AData"},     {0x27,"Phison"},
+    {0x28,"Barun Electronics"}, {0x31,"Silicon Power"}, {0x41,"Kingston"},
+    {0x51,"STEC"},        {0x5D,"SwissBit"},   {0x61,"Netlist"},   {0x63,"Cactus"},
+    {0x73,"Bongiovi"},    {0x74,"Jiaelec"},    {0x76,"Patriot"},   {0x82,"Jiang Tay"},
+    {0x83,"Netcom"},      {0x84,"Strontium"},  {0x9C,"Barun / Sony"}, {0x9F,"Taishin"},
+    {0xAD,"Longsys"},
+};
+static const VendorEntry kEmmcVendors[] = {
+    {0x11,"Toshiba"}, {0x15,"Samsung"}, {0x45,"SanDisk"},
+    {0x89,"Silicon Motion"}, {0x90,"SK Hynix"},
+};
+
+// Combo populated with `entries`; selecting one writes its hex to `target`.
+// If the current value doesn't match any entry, the combo's preview shows
+// "Custom (0xNN)". The hex is editable via the matching InputScalar above
+// or below this widget.
+static void vendor_preset_combo(const char *label,
+                                std::atomic<uint8_t> &target,
+                                const VendorEntry *entries, size_t n) {
+    uint8_t cur = target.load();
+    char preview[40];
+    const char *match = nullptr;
+    for (size_t i = 0; i < n; i++) if (entries[i].id == cur) { match = entries[i].name; break; }
+    if (match) snprintf(preview, sizeof(preview), "%s (0x%02X)", match, cur);
+    else       snprintf(preview, sizeof(preview), "Custom (0x%02X)", cur);
+    if (ImGui::BeginCombo(label, preview)) {
+        for (size_t i = 0; i < n; i++) {
+            char item[40];
+            snprintf(item, sizeof(item), "%s (0x%02X)", entries[i].name, entries[i].id);
+            bool sel = (entries[i].id == cur);
+            if (ImGui::Selectable(item, sel)) target.store(entries[i].id);
+            if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
 }
 
 // Helper: hex input that reads/writes a uint32 atomic.
@@ -189,6 +249,102 @@ void build_ui(EmuState *state) {
         if (ImGui::Checkbox("SD card inserted", &ins)) {
             state->sd_inserted.store(ins);
         }
+
+        ImGui::TextDisabled("SD CID (read by Hekate at SD init -- press 'Reboot' to apply):");
+
+        // manfid: vendor preset + free hex entry
+        vendor_preset_combo("Vendor preset", state->sd_cid_manfid,
+                            kSdVendors, IM_ARRAYSIZE(kSdVendors));
+        {
+            uint32_t v = state->sd_cid_manfid.load();
+            if (ImGui::InputScalar("Manfid (hex)", ImGuiDataType_U32, &v, nullptr, nullptr, "%02X",
+                                   ImGuiInputTextFlags_CharsHexadecimal)) {
+                state->sd_cid_manfid.store((uint8_t)(v & 0xFF));
+            }
+        }
+        // OEM ID (2 ASCII chars)
+        {
+            uint16_t raw = state->sd_cid_oemid.load();
+            char buf[3] = { (char)(raw >> 8), (char)(raw & 0xFF), 0 };
+            if (ImGui::InputText("OEM ID (2 ASCII)", buf, sizeof(buf))) {
+                uint16_t packed = ((uint16_t)(uint8_t)buf[0] << 8) | (uint16_t)(uint8_t)buf[1];
+                state->sd_cid_oemid.store(packed);
+            }
+        }
+        // Product name (5 ASCII chars, packed in low 5 bytes of uint64)
+        {
+            uint64_t raw = state->sd_cid_prod_name.load();
+            char buf[6];
+            for (int i = 0; i < 5; i++) buf[i] = (char)((raw >> (i * 8)) & 0xFF);
+            buf[5] = 0;
+            if (ImGui::InputText("Product (5 ASCII)", buf, sizeof(buf))) {
+                uint64_t packed = 0;
+                for (int i = 0; i < 5; i++) packed |= (uint64_t)(uint8_t)buf[i] << (i * 8);
+                state->sd_cid_prod_name.store(packed);
+            }
+        }
+        atomic_slider_int<uint8_t> ("HW rev",  state->sd_cid_hwrev, 0, 15);
+        atomic_slider_int<uint8_t> ("FW rev",  state->sd_cid_fwrev, 0, 15);
+        // Serial as 8-digit hex
+        {
+            uint32_t sn = state->sd_cid_serial.load();
+            if (ImGui::InputScalar("Serial", ImGuiDataType_U32, &sn, nullptr, nullptr, "%08X",
+                                   ImGuiInputTextFlags_CharsHexadecimal)) {
+                state->sd_cid_serial.store(sn);
+            }
+        }
+        atomic_slider_int<uint8_t>  ("Month",   state->sd_cid_month, 1, 12);
+        atomic_slider_int<uint16_t> ("Year",    state->sd_cid_year,  2000, 2099);
+
+        ImGui::Spacing();
+        ImGui::TextDisabled("eMMC CID (SDMMC4 -- press 'Reboot' to apply):");
+
+        vendor_preset_combo("eMMC vendor preset", state->emmc_cid_manfid,
+                            kEmmcVendors, IM_ARRAYSIZE(kEmmcVendors));
+        {
+            uint32_t v = state->emmc_cid_manfid.load();
+            if (ImGui::InputScalar("eMMC Manfid (hex)", ImGuiDataType_U32, &v, nullptr, nullptr, "%02X",
+                                   ImGuiInputTextFlags_CharsHexadecimal)) {
+                state->emmc_cid_manfid.store((uint8_t)(v & 0xFF));
+            }
+        }
+        {
+            uint32_t v = state->emmc_cid_oemid.load();
+            if (ImGui::InputScalar("eMMC OEM ID", ImGuiDataType_U32, &v, nullptr, nullptr, "%02X",
+                                   ImGuiInputTextFlags_CharsHexadecimal)) {
+                state->emmc_cid_oemid.store((uint8_t)(v & 0xFF));
+            }
+        }
+        {
+            uint64_t raw = state->emmc_cid_prod_name.load();
+            char buf[7];
+            for (int i = 0; i < 6; i++) buf[i] = (char)((raw >> (i * 8)) & 0xFF);
+            buf[6] = 0;
+            if (ImGui::InputText("eMMC Product (6 ASCII)", buf, sizeof(buf))) {
+                uint64_t packed = 0;
+                for (int i = 0; i < 6; i++) packed |= (uint64_t)(uint8_t)buf[i] << (i * 8);
+                state->emmc_cid_prod_name.store(packed);
+            }
+        }
+        {
+            uint32_t v = state->emmc_cid_prv.load();
+            if (ImGui::InputScalar("eMMC Prod Rev", ImGuiDataType_U32, &v, nullptr, nullptr, "%02X",
+                                   ImGuiInputTextFlags_CharsHexadecimal)) {
+                state->emmc_cid_prv.store((uint8_t)(v & 0xFF));
+            }
+        }
+        {
+            uint32_t sn = state->emmc_cid_serial.load();
+            if (ImGui::InputScalar("eMMC Serial", ImGuiDataType_U32, &sn, nullptr, nullptr, "%08X",
+                                   ImGuiInputTextFlags_CharsHexadecimal)) {
+                state->emmc_cid_serial.store(sn);
+            }
+        }
+        atomic_slider_int<uint8_t>  ("eMMC Month", state->emmc_cid_month, 1, 12);
+        // 2025 is the upper bound: Hekate adds +16 to the parsed year only
+        // when it's strictly < 2010, so raw offsets 13..15 (2010..2012) never
+        // get bumped and eMMC years 2026..2028 are unreachable.
+        atomic_slider_int<uint16_t> ("eMMC Year",  state->emmc_cid_year,  2013, 2025);
     }
 
     if (ImGui::CollapsingHeader("USB-PD (BM92T36)", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -224,6 +380,10 @@ void build_ui(EmuState *state) {
         bool paused = state->paused.load();
         if (ImGui::Checkbox("Paused", &paused)) {
             state->paused.store(paused);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reboot")) {
+            state->reboot_requested.store(true);
         }
         ImGui::Text("emu_usec:    %llu", (unsigned long long)state->emu_usec);
         ImGui::Text("insn_count:  %llu", (unsigned long long)state->insn_count);

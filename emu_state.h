@@ -63,6 +63,11 @@ struct EmuState {
     // Emulation control.
     std::atomic<bool> running{true};
     std::atomic<bool> paused{false};
+    std::atomic<bool> reboot_requested{false};
+
+    // Payload kept around for soft reboot (re-write to IRAM and reset PC).
+    uint8_t *payload_ptr = nullptr;
+    size_t   payload_len = 0;
 
     // Backlight brightness (0-255).
     uint32_t backlight = 100;
@@ -72,7 +77,8 @@ struct EmuState {
     uint64_t insn_count = 0;
 
     // DRAM pointer (host memory backing the emulated DRAM).
-    uint8_t *dram_ptr = nullptr;
+    uint8_t *dram_ptr = nullptr;     // High DRAM (0xC0000000+, 1 GB, includes FB)
+    uint8_t *dram_low_ptr = nullptr; // Low DRAM (0x80000000+, 256 MB, holds Nyx)
     uint8_t *iram_ptr = nullptr;
     uint8_t *fb_ptr   = nullptr;
 
@@ -142,6 +148,31 @@ struct EmuState {
 
     // SD card insertion (GPIO Port Z bit 1 = 0 means inserted).
     std::atomic<bool>     sd_inserted{true};
+
+    // SD card identity (returned for SDMMC1 CMD2 ALL_SEND_CID).
+    // Hekate parses these out of the R2 response per bdk/storage/sdmmc.c
+    // _sd_storage_parse_cid; the I2C handler builds the 16-byte CID payload
+    // from these atomics each time CMD2 fires.
+    std::atomic<uint8_t>  sd_cid_manfid{0x03};      // 0x03 = SanDisk
+    std::atomic<uint16_t> sd_cid_oemid{0x5344};     // "SD"
+    std::atomic<uint64_t> sd_cid_prod_name{0x3155445355ULL}; // "USDU1" (low byte first)
+    std::atomic<uint8_t>  sd_cid_hwrev{1};          // 0-15
+    std::atomic<uint8_t>  sd_cid_fwrev{0};          // 0-15
+    std::atomic<uint32_t> sd_cid_serial{0xC0FFEE42};
+    std::atomic<uint8_t>  sd_cid_month{10};         // 1-12
+    std::atomic<uint16_t> sd_cid_year{2024};        // 2000-2255
+
+    // eMMC identity (SDMMC4 CMD2). Layout per _mmc_storage_parse_cid (MMC v4):
+    // 8-bit manfid, 8-bit oemid, 6-byte prod_name, 8-bit prv (BCD nibble.nibble),
+    // 32-bit serial, 4-bit month, 4-bit year offset (year base = 2013 when
+    // ext_csd.rev >= 5, which is what our EXT_CSD reports).
+    std::atomic<uint8_t>  emmc_cid_manfid{0x90};         // 0x90 = SK Hynix
+    std::atomic<uint8_t>  emmc_cid_oemid{0x01};
+    std::atomic<uint64_t> emmc_cid_prod_name{0x326134474248ULL}; // "HBG4a2" (low byte first)
+    std::atomic<uint8_t>  emmc_cid_prv{0x07};            // displayed as "0.7" (low.high)
+    std::atomic<uint32_t> emmc_cid_serial{0x12345678};
+    std::atomic<uint8_t>  emmc_cid_month{6};             // 1-12
+    std::atomic<uint16_t> emmc_cid_year{2017};           // 2013-2025 (Hekate caps at 2025: see config_window.cpp)
 
     // SoC thermal sensor (TMP451, I2C5 @ 0x4C).
     std::atomic<int16_t>  soc_temp_c10{420};        // remote channel (SoC die): °C * 10
