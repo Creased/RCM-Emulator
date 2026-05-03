@@ -8,6 +8,7 @@ last_fb.rgba
 last_fb.meta
 last_fb*.png
 out.log
+out*.txt
 emu_run*.log
 
 # User data — never commit dumps or keys
