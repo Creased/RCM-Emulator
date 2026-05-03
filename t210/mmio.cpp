@@ -383,6 +383,22 @@ void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
     break;
   case I2C_CMD_DATA1:
     i2c_reg_addr = val & 0xFF;
+    // Hekate's i2c_send_byte goes through _i2c_send_normal which packs
+    // [reg, value, ...] into CMD_DATA1 (low byte = reg, next byte = value).
+    // Catch ONOFFCNFG1 writes to MAX77620 here so the emulator reacts to
+    // the payload's POWER_OFF / SFT_RST same as real hardware.
+    if (on_i2c5 && i2c_slave_addr == MAX77620_I2C_ADDR && i2c_reg_addr == 0x41) {
+      uint8_t v = (val >> 8) & 0xFF;
+      if (v & 0x02) {                         // ONOFFCNFG1_PWR_OFF
+        printf("[emu] MAX77620 PWR_OFF received - exiting\n");
+        fflush(stdout);
+        state->running = false;
+      } else if (v & 0x80) {                  // ONOFFCNFG1_SFT_RST
+        printf("[emu] MAX77620 SFT_RST received - rebooting payload\n");
+        fflush(stdout);
+        state->reboot_requested = true;
+      }
+    }
     break;
   case 0x50: {        // I2C_TX_FIFO  (packet-mode dispatch)
     // Each packet starts with the PROT magic word; subsequent words follow a
@@ -406,6 +422,22 @@ void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
     } else if (!pkt.is_read && idx == 3) {
       // First (and for our slaves, only) payload byte = register address.
       pkt.reg_addr = val & 0xFF;
+    } else if (!pkt.is_read && idx == 4) {
+      // Second payload byte = value being written. Watch for PMIC commands
+      // that mean "shut the SoC down" or "reset" so the emulator can react
+      // the same way real hardware would.
+      if (on_i2c5 && pkt.dev_addr == 0x3C && pkt.reg_addr == 0x41) {
+        uint8_t v = val & 0xFF;
+        if (v & 0x02) {                         // ONOFFCNFG1_PWR_OFF
+          printf("[emu] MAX77620 PWR_OFF received - exiting\n");
+          fflush(stdout);
+          state->running = false;
+        } else if (v & 0x80) {                  // ONOFFCNFG1_SFT_RST
+          printf("[emu] MAX77620 SFT_RST received - rebooting payload\n");
+          fflush(stdout);
+          state->reboot_requested = true;
+        }
+      }
     }
     break;
   }
@@ -1230,6 +1262,16 @@ uint32_t pmc_read(EmuState *state, uint64_t addr) {
 void pmc_write(EmuState *state, uint64_t addr, uint32_t val) {
   uint32_t offset = (uint32_t)(addr - PMC_BASE);
   switch (offset) {
+  case 0x00:
+    // APBDEV_PMC_CNTRL — bit 4 = MAIN_RST. Hekate writes this from
+    // power_set_state(REBOOT_RCM); we mirror it as a soft reboot of the
+    // emulated payload so the user can iterate without restarting rcm_emu.
+    if (val & (1u << 4)) {
+      printf("[emu] PMC MAIN_RST written - rebooting payload\n");
+      fflush(stdout);
+      state->reboot_requested = true;
+    }
+    break;
   case 0x50:
     pmc_scratch0 = val;
     break;
