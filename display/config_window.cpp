@@ -695,7 +695,29 @@ void build_ui(EmuState *state) {
         atomic_hex_input("0x190 OPT_CP_REV",       state->fuse_at(0x190));
         atomic_hex_input("0x1A0 SECURITY_MODE",    state->fuse_at(0x1A0));
         atomic_hex_input("0x1C0 RESERVED_SW",      state->fuse_at(0x1C0));
-        atomic_hex_input("0x1D8 RESERVED_ODM4",    state->fuse_at(0x1D8));
+        ImGui::Separator();
+        ImGui::TextDisabled("Reserved ODM (anti-downgrade + keygen rev)");
+        ImGui::TextDisabled("ODM7 popcount = burnt anti-downgrade fuse count.");
+        ImGui::TextDisabled("HOS 1.0.0=1, 7.0.0=9, 8.1.0=10, 13.2.1=16, 22.0.0=23");
+        atomic_hex_input("0x1C8 RESERVED_ODM0",    state->fuse_at(0x1C8));
+        atomic_hex_input("0x1CC RESERVED_ODM1",    state->fuse_at(0x1CC));
+        atomic_hex_input("0x1D0 RESERVED_ODM2 (Mariko keygen rev: low 5 bits)", state->fuse_at(0x1D0));
+        atomic_hex_input("0x1D4 RESERVED_ODM3",    state->fuse_at(0x1D4));
+        atomic_hex_input("0x1D8 RESERVED_ODM4 (DRAM ID in bits 7:3)", state->fuse_at(0x1D8));
+        atomic_hex_input("0x1DC RESERVED_ODM5",    state->fuse_at(0x1DC));
+        atomic_hex_input("0x1E0 RESERVED_ODM6",    state->fuse_at(0x1E0));
+        atomic_hex_input("0x1E4 RESERVED_ODM7 (anti-downgrade)", state->fuse_at(0x1E4));
+        if (ImGui::Button("Seed ODM7 for HOS 13.2.1 (16 fuses, 0x0000FFFF)")) {
+            state->fuse_at(0x1E4).store(0x0000FFFFu);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Seed ODM7 for HOS 22.0.0 (23 fuses, 0x007FFFFF)")) {
+            state->fuse_at(0x1E4).store(0x007FFFFFu);
+        }
+        if (ImGui::Button("Clear ODM7 (0 fuses, fresh console)")) {
+            state->fuse_at(0x1E4).store(0u);
+        }
+        ImGui::Separator();
         atomic_hex_input("0x200 OPT_VENDOR_CODE",  state->fuse_at(0x200));
         atomic_hex_input("0x204 OPT_FAB_CODE",     state->fuse_at(0x204));
         atomic_hex_input("0x208 OPT_LOT_CODE_0",   state->fuse_at(0x208));
@@ -879,8 +901,16 @@ bool config_window_init() {
 
 void config_window_shutdown() {
     if (g_imgui) {
-        ImGui_ImplSDLRenderer2_Shutdown();
-        ImGui_ImplSDL2_Shutdown();
+        // Critical: explicitly switch to *our* context first. After
+        // console_window_shutdown destroys its context, ImGui's "current"
+        // pointer can be NULL or stale, and ImGui_ImplSDLRenderer2_Shutdown
+        // pulls BackendRendererUserData off the current context's IO. Skip
+        // this and the assert at imgui_impl_sdlrenderer2.cpp:292 fires
+        // because bd resolves to null.
+        ImGui::SetCurrentContext(g_imgui);
+        ImGuiIO &io = ImGui::GetIO();
+        if (io.BackendRendererUserData) ImGui_ImplSDLRenderer2_Shutdown();
+        if (io.BackendPlatformUserData) ImGui_ImplSDL2_Shutdown();
         ImGui::DestroyContext(g_imgui);
         g_imgui = nullptr;
     }
