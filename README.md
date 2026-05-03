@@ -26,6 +26,8 @@ slow or destructive.
   one-shot script.
 - Tweak emulated hardware live (battery, charger, thermal, USB-PD, PMIC,
   fuses, SD insertion) from a side window. See [Live hardware tweaks](#live-hardware-tweaks).
+- Inspect each Tegra UART port (TX history) and inject keystrokes into the
+  payload's RX FIFO from a separate console window. See [UART console](#uart-console).
 - Read real eMMC (embedded MMC) dumps (`BOOT0`, multi-part `rawnand.bin.NN`)
   and decrypt them with XTS-AES-128 (XEX-based Tweaked-codebook with ciphertext
   stealing) against keys from `prod.keys`.
@@ -138,7 +140,7 @@ What's tweakable, grouped by chip:
 | **BM92T36** USB-PD      | I2C\_1 @ 0x18   | Cable-inserted, PDO voltage, PDO amperage                                                       |
 | **MAX77620** main PMIC  | I2C\_5 @ 0x3C   | OTP (Erista / Mariko), silicon revision                                                         |
 | **MAX77621** CPU/GPU PMIC | I2C\_5 @ 0x1B | Chip ID                                                                                         |
-| **Tegra fuses**         | FUSE 0x7000F800 | 6 fuse offsets read by Hekate (SKU info, fuse ID, ODM4, etc.)                                   |
+| **Tegra fuses**         | FUSE 0x7000F800 | 30+ fuse offsets: PRODUCTION/SKU/IDDQ/SPEEDO, OPT_FT/CP_REV, RESERVED_SW, RESERVED_ODM0..ODM7 (incl. anti-downgrade presets for HOS 13.2.1 / 22.0.0), VENDOR/FAB/LOT/WAFER, GPU_IDDQ, PK0..7, SBK + DK |
 | **DRAM modules**        | EMC 0xEC (MR5-8)| Vendor (MR5), Rev ID 1/2 (MR6/MR7), per-die density (MR8 5:2)                                   |
 | **GPIO**                | Port Z bit 1    | SD card insert / eject                                                                          |
 | **Display**             | EmuState        | Backlight, rotation override                                                                    |
@@ -163,6 +165,26 @@ maps each user-facing decoded value back to the chip's raw register format
 is in [t210/mmio.cpp](t210/mmio.cpp). Each encoder mirrors a corresponding
 `*_get_property()` formula in the Hekate `bdk/power/` tree.
 
+## UART console
+
+Press `C` in the main window to open a third SDL window that exposes the
+Tegra UART block. It lets you:
+
+- Pick which port (UART_A..UART_E) to inspect from a combo box. The TX
+  history pane shows every byte the payload has written to that port's
+  THR (Transmit Holding Register), auto-scrolled.
+- Type bytes into the input line and "Send" them; they land in the
+  emulator's RX FIFO so the next CPU-side `uart_recv()` returns them.
+  Useful for paged probes that ask the user for input over UART (e.g.
+  hwtest's pager keys `n` / `p` / `r` / `s` / `q` and the CR / LF
+  shortcut buttons next to the input field).
+
+Implementation in [display/console_window.cpp](display/console_window.cpp).
+Per-port TX log + RX FIFO storage lives in
+[emu_state.h](emu_state.h)::EmuState. Both the CPU emulation and ImGui
+rendering run on the main thread between SDL polls, so no locking is
+needed.
+
 ## Controls
 
 | Key            | Switch button / action          |
@@ -171,6 +193,7 @@ is in [t210/mmio.cpp](t210/mmio.cpp). Each encoder mirrors a corresponding
 | `Enter`        | POWER                           |
 | Mouse click    | Touch (Nyx, TE menus)           |
 | `M`            | Open / close hardware-config window (see [Live hardware tweaks](#live-hardware-tweaks)) |
+| `C`            | Open / close UART console window (see [UART console](#uart-console)) |
 | `R`            | Soft reboot                     |
 | `P`            | Pause or resume emulation       |
 | `Ctrl+R` / `Ctrl+Shift+R` | Cycle display rotation CW / CCW |

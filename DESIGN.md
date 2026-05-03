@@ -13,6 +13,7 @@ flowchart TB
     main -->|uc_emu_start| uc["<b>Unicorn Engine</b><br/>ARM32, T210<br/>IRAM / DRAM / MMIO"]
     main -->|sdl_display_*| sdl["<b>display/sdl_display</b><br/>block-linear de-swizzle<br/>rotate, blit"]
     main -->|config_window_*| cfg["<b>display/config_window</b><br/>2nd SDL window + ImGui<br/>live hardware tweaks"]
+    main -->|console_window_*| con["<b>display/console_window</b><br/>3rd SDL window + ImGui<br/>per-port UART TX log + RX inject"]
 
     uc -->|MMIO trap| mmio["<b>t210/mmio.cpp</b><br/>central read/write dispatch<br/>by address range"]
 
@@ -24,6 +25,7 @@ flowchart TB
     mmio --> stubs["<b>inline stubs</b><br/>GPIO, PMC, TSEC, KFUSE,<br/>PWM, DC, CLK, TMR, FUSE, UART"]
 
     cfg -.->|writes atomics| state["<b>EmuState</b><br/>(emu_state.h)"]
+    con -.->|RX inject / TX log| state
     i2c1 -.->|reads atomics| state
     i2c5 -.->|reads atomics| state
 ```
@@ -144,6 +146,24 @@ SDL keyboard handler. The MMIO read handlers map them onto:
 - GPIO Port Z bit 1 reflects `state->sd_inserted` (active-low). Toggle it from
   the config window to simulate SD eject mid-boot.
 
+GPIO IN registers for every other port (offsets `bank+0x30..0x3F`) mirror back
+the OUT register the payload last wrote (`mmio_regs[addr - 0x10]`). That gives
+correct round-trip semantics for ports the payload drives itself (PV0/PV1 LCD
+backlight enable, PV2 panel reset, PK3 Joy-Con charge enable, etc.) without
+having to model external drivers.
+
+The reverse direction is also wired: payload writes that ask the SoC to power
+down or reset are caught by `t210/mmio.cpp`:
+
+- `MAX77620_REG_ONOFFCNFG1` (`0x41`) write with `PWR_OFF` (bit 1) set --
+  caught on both the small CMD\_DATA1 path and the packet-mode TX_FIFO path
+  -- stops emulation and exits cleanly.
+- Same register with `SFT_RST` (bit 7) set requests a payload soft-reboot
+  via `state->reboot_requested`.
+- `APBDEV_PMC_CNTRL` (`0x00`) bit 4 (MAIN_RST) -- written by Hekate's
+  `power_set_state(REBOOT_RCM)` -- also requests a soft-reboot, so the user
+  can iterate on a payload without restarting `rcm_emu`.
+
 ### I²C-attached chips (battery, charger, thermal, USB-PD, PMIC ID)
 
 Modelled inline in `t210/mmio.cpp::i2c_read`. The bus is disambiguated by
@@ -237,19 +257,68 @@ frames don't re-touch the surface.
 
 ### UART
 
-`UART_A` at `0x70006000`. Writes to `THR` (Transmit Holding Register) are
-buffered into a 512-byte line and flushed on `\n`, `\r`, or buffer overflow as
-a single `[uart] …` host stdout line. Bytes outside the printable range
-`0x20..0x7E` (typically Joy-Con HID frames Hekate also drives over UART) are
-dropped to keep the log readable.
+All five Tegra UART ports (UART_A..UART_E) share the same handler at
+`0x70006000 + idx * 0x40`. The dispatcher derives `idx` from the address and
+keeps a separate state per port:
+
+- TX (`THR` writes at offset `0x00`) is appended byte-by-byte to
+  `EmuState::uart_tx_log[idx]`, capped at ~64 KB with a "drop the front when
+  too big" trim so ImGui rendering of the UART console window stays snappy.
+  The same byte is also pushed through the legacy line-buffered stdout
+  printer, which now uses a per-port `[uart{A..E}] …` prefix so ports stay
+  distinguishable when grepped (`grep '[uartB]'` for hwtest's debug port,
+  for example). Bytes outside the printable range `0x20..0x7E` (Joy-Con HID
+  frames Hekate also drives over UART) are still dropped from stdout but
+  kept in the per-port log so the console window can render them.
+- RX is sourced from `EmuState::uart_rx_fifo[idx]`, populated by the UART
+  console window's "Send" button. The LSR at offset `0x14` returns
+  `THRE | TMTY (0x60)` plus `RDR (0x01)` when the FIFO is non-empty, and
+  reads of the THR/RBR alias at offset `0x00` pop one byte. Polling loops
+  in the payload (`uart_recv` etc.) terminate naturally without needing
+  any IRQ wiring.
 
 For TE, `gfx_putc` was patched in TE source to mirror each FB-bound character
-to `UART_A`, so script `print` and `println` calls show up directly in
+to its UART port, so script `print` and `println` calls show up directly in
 `out.log` without needing to OCR the framebuffer. That patch lives in the
 TegraExplorer tree, not this repo.
 
+### Live UART console (`display/console_window.cpp`)
+
+A third SDL window (`SDL_WINDOW_HIDDEN` until the user presses `C`) hosting
+its own ImGui context. Mirrors the shape of the config window:
+
+- Window dispatch. `display/sdl_display.cpp::sdl_display_poll_events` uses a
+  generic `event_targets_window(ev, wid)` helper for both auxiliary windows
+  (M config, C console). Events targeting either are forwarded to that
+  window's ImGui backend; main-window button handlers are skipped so typing
+  in a hex input or the console line doesn't bleed through to POWER /
+  volume keys.
+- Lifecycle. `main.cpp` pairs `console_window_init` / `console_window_render`
+  / `console_window_shutdown` against the existing `config_window_*` calls.
+
+The window itself shows:
+
+- A combo box to pick which port (UART_A..UART_E) to inspect. Default is
+  UART_B (hwtest's debug port).
+- A scrolling pane of `EmuState::uart_tx_log[idx]`, auto-scrolled unless the
+  user has manually scrolled up. "Clear" wipes the buffer.
+- A text input + "Send" / "Send + LF" buttons that push bytes into
+  `uart_rx_fifo[idx]`. Shortcut buttons next to it cover the keys hwtest's
+  pager listens for (`n`, `p`, `r`, `s`, `q`) plus standalone CR / LF.
+
+All TX append / RX pop is single-threaded -- both the CPU emulation and ImGui
+rendering run on the main thread between SDL polls -- so no locking is
+needed. The 64 KB TX log trim happens in-place during the write hook.
+
 ### Other peripherals (mostly stubs)
 
+- **PINMUX (`APB_MISC` pad config) and PWM controller (`0x7000A000`).**
+  No active behaviour, but reads return whatever the payload last wrote
+  via the global `mmio_regs` cache. Hwtest's "Display backlight & PWM"
+  probe needs this to read back `PWM_CSR_0` and the `LCD_BL_PWM` mux
+  function nibble after `display_init`. The previous behaviour
+  (hardcoded `return 0`) silently dropped the muxed function bits and
+  made any read-back-style probe see all zeros.
 - **PLLs.** Reads on `PLL_BASE` registers return `ENABLE | LOCK` for any of
   the PLLs Minerva polls during DRAM training.
 - **KFUSE.** `STATE` returns `DONE | CRCPASS` immediately so the BDK function
@@ -315,6 +384,19 @@ don't repeat the diagnosis:
   Now `fstat`-derived from `rawnand.bin.00`.
 - **Save header SHA-256** rejected by TE because the SE only modelled AES.
   Hence the SHA-256 path in `se_engine.cpp`.
+- **PINMUX / PWM read-back** silently returned 0, so any probe that read
+  back its own pad-mux setting (e.g. hwtest checking `LCD_BL_PWM` is in
+  PWM0 mode) saw an unconfigured pin even after a successful write. Fix:
+  hand the cached value from `mmio_regs` back on read.
+- **GPIO IN read-back** for non-button ports always returned 0. Fix:
+  mirror back the OUT register the payload last wrote (offset
+  `bank+0x30..0x3F` IN -> `bank+0x20..0x2F` OUT).
+- **Payload-driven shutdown / reboot** (long power-button hold,
+  `power_set_state(REBOOT_RCM)`) reached real silicon and did nothing
+  under emulation, leaving `rcm_emu` idling on a CPU loop. Fix: catch
+  `MAX77620.ONOFFCNFG1.PWR_OFF` / `SFT_RST` over both I²C paths and
+  `APBDEV_PMC_CNTRL.MAIN_RST`, then exit or flip
+  `state->reboot_requested`.
 
 See `git log` for the commit-by-commit diagnosis trail if you want more
 detail on any of them.
