@@ -295,7 +295,15 @@ int main(int argc, char *argv[]) {
     uint8_t *payload = load_payload(argv[1], &payload_size);
     if (!payload) return 1;
 
-    // Parse additional arguments for storage
+    // Parse additional arguments for storage. Configuration state
+    // (is_mariko, fuses, panel ID, battery values, ...) lives in
+    // rcm_emu.ini and is loaded by config_window_load_ini() above.
+    // CLI flags only point at on-disk images and one explicit override
+    // (--oem) that lets you re-run the same payload+ini with a different
+    // SoC family without editing the ini.  Any auto-derivation from
+    // BOOT0 was deliberately removed: the emulator must not silently
+    // contradict the ini, otherwise "patch the ini and re-run" stops
+    // being a deterministic loop.
     const char *sd_path = nullptr;
     const char *boot0_path = nullptr;
     const char *rawnand_prefix = nullptr;
@@ -315,11 +323,11 @@ int main(int argc, char *argv[]) {
             if (strcmp(oem, "mariko") == 0 || strcmp(oem, "t210b01") == 0) {
                 state.is_mariko = true;
                 state.pmic_otp  = 0x53;
-                printf("[emu] OEM: Mariko (T210B01)\n");
+                printf("[emu] OEM: Mariko (T210B01) [overrides ini]\n");
             } else if (strcmp(oem, "erista") == 0 || strcmp(oem, "t210") == 0) {
                 state.is_mariko = false;
                 state.pmic_otp  = 0x35;
-                printf("[emu] OEM: Erista (T210)\n");
+                printf("[emu] OEM: Erista (T210) [overrides ini]\n");
             } else {
                 fprintf(stderr, "[emu] Unknown --oem value '%s'; expected 'erista' or 'mariko'\n", oem);
             }
