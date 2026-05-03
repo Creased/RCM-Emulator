@@ -53,23 +53,36 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
     return val;
   }
 
-  // Generic IN-register read: Tegra X1 GPIO is organized as 8 banks of
-  // 256 bytes; within each bank the IN registers for the 4 ports occupy
-  // bank-offsets 0x30..0x3F (one 32-bit register per port at +0x30,
-  // +0x34, +0x38, +0x3C). The matching OUT register sits 0x10 bytes
-  // earlier (at +0x20..+0x2F). We don't model external drivers, so we
-  // mirror back the latched OUT value the payload last wrote — that
-  // makes
+  // Tegra X1 GPIO is organized as 8 banks of 256 bytes; within each
+  // bank a port occupies a 4-byte slot at offsets:
+  //   CNF  +0x00..0x0F    (GPIO vs SPIO mode select per pin)
+  //   OE   +0x10..0x1F    (output enable per pin)
+  //   OUT  +0x20..0x2F    (driven value per pin)
+  //   IN   +0x30..0x3F    (sampled value per pin)
+  // The write hook stores every word into mmio_regs already, so reads
+  // for CNF / OE / OUT just hand back what the payload last wrote.
+  // For IN we don't model external drivers, so we mirror the latched
+  // OUT value (one slot earlier, i.e. addr - 0x10) -- that makes
   //   gpio_write(PORT, PIN, HIGH); gpio_read(PORT, PIN);
   // round-trip for ports the payload drives itself (PV0/PV1 backlight
-  // enable, PV2 panel reset, PK3 Joy-Con charge enable, etc.).
+  // enable, PV2 panel reset, PK3 Joy-Con charge enable, PA5 5V rail
+  // enable, etc.).
   uint32_t bank_off = offset & 0xFF;
-  if (bank_off >= 0x30 && bank_off < 0x40 && offset < 0x800) {
-    uint64_t out_addr = addr - 0x10;  // IN -> OUT
-    uint32_t v = mmio_regs.count(out_addr) ? mmio_regs[out_addr] : 0;
-    printf("[gpio] R: offset 0x%X (IN, mirror of OUT @ 0x%X) = 0x%08X\n",
-           offset, (uint32_t)(offset - 0x10), v);
-    return v;
+  if (offset < 0x800) {
+    if (bank_off < 0x30) {
+      // CNF / OE / OUT: hand back the cached write.
+      uint32_t v = mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+      printf("[gpio] R: offset 0x%X (CNF/OE/OUT cache) = 0x%08X\n", offset, v);
+      return v;
+    }
+    if (bank_off < 0x40) {
+      // IN: mirror of the matching OUT one slot earlier.
+      uint64_t out_addr = addr - 0x10;
+      uint32_t v = mmio_regs.count(out_addr) ? mmio_regs[out_addr] : 0;
+      printf("[gpio] R: offset 0x%X (IN, mirror of OUT @ 0x%X) = 0x%08X\n",
+             offset, (uint32_t)(offset - 0x10), v);
+      return v;
+    }
   }
 
   printf("[gpio] R: offset 0x%X = 0\n", offset);
