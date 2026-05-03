@@ -26,6 +26,7 @@
 #include "t210/mmio.h"
 #include "display/sdl_display.h"
 #include "display/config_window.h"
+#include "display/console_window.h"
 
 // ==================== Payload Loading ====================
 
@@ -387,9 +388,13 @@ int main(int argc, char *argv[]) {
     if (!config_window_init()) {
         fprintf(stderr, "[warn] Config window init failed; M-key menu disabled\n");
     }
+    // Initialize the UART console window (hidden until 'C' is pressed).
+    if (!console_window_init()) {
+        fprintf(stderr, "[warn] Console window init failed; C-key console disabled\n");
+    }
 
     printf("\n[emu] Starting emulation...\n");
-    printf("[emu] Press Escape to quit, M to toggle hardware config\n\n");
+    printf("[emu] Esc quit | M hardware config | C UART console\n\n");
 
     // ---- Emulation loop ----
     // We run emulation in batches, interleaving with SDL event handling
@@ -580,6 +585,7 @@ int main(int argc, char *argv[]) {
         if (elapsed.count() >= DISPLAY_UPDATE_MS) {
             sdl_display_update(&state, uc);
             config_window_render(&state);
+            console_window_render(&state);
             last_display_update = now;
         }
     }
@@ -599,6 +605,7 @@ int main(int argc, char *argv[]) {
             final_insn[4], final_insn[5], final_insn[6], final_insn[7]);
     }
 
+    console_window_shutdown();
     config_window_shutdown();
     sdl_display_shutdown();
     uc_close(uc);

@@ -1,5 +1,6 @@
 #include "sdl_display.h"
 #include "config_window.h"
+#include "console_window.h"
 #include "../emu_state.h"
 #include "../t210/memory_map.h"
 
@@ -8,20 +9,20 @@
 #include <cstring>
 #include <vector>
 
-// Some SDL events are not window-targeted (e.g. SDL_QUIT). Returns true only
-// for events that carry a windowID matching the config window.
-static bool event_targets_config_window(const SDL_Event &ev) {
-    Uint32 cfg_id = config_window_id();
-    if (cfg_id == 0) return false;
+// Returns true only for events that carry a windowID matching the given
+// auxiliary window's id. Generic so the event router can use it for both
+// the config window (M key) and the UART console (C key).
+static bool event_targets_window(const SDL_Event &ev, Uint32 wid) {
+    if (wid == 0) return false;
     switch (ev.type) {
-    case SDL_WINDOWEVENT:      return ev.window.windowID    == cfg_id;
+    case SDL_WINDOWEVENT:      return ev.window.windowID    == wid;
     case SDL_KEYDOWN:
-    case SDL_KEYUP:            return ev.key.windowID       == cfg_id;
-    case SDL_TEXTINPUT:        return ev.text.windowID      == cfg_id;
+    case SDL_KEYUP:            return ev.key.windowID       == wid;
+    case SDL_TEXTINPUT:        return ev.text.windowID      == wid;
     case SDL_MOUSEBUTTONDOWN:
-    case SDL_MOUSEBUTTONUP:    return ev.button.windowID    == cfg_id;
-    case SDL_MOUSEMOTION:      return ev.motion.windowID    == cfg_id;
-    case SDL_MOUSEWHEEL:       return ev.wheel.windowID     == cfg_id;
+    case SDL_MOUSEBUTTONUP:    return ev.button.windowID    == wid;
+    case SDL_MOUSEMOTION:      return ev.motion.windowID    == wid;
+    case SDL_MOUSEWHEEL:       return ev.wheel.windowID     == wid;
     default:                   return false;
     }
 }
@@ -404,15 +405,20 @@ bool sdl_display_poll_events(EmuState *state, uc_engine *uc) {
     // close be handled by its own handler below (which just hides it).
     if (event.type == SDL_WINDOWEVENT &&
         event.window.event == SDL_WINDOWEVENT_CLOSE &&
-        event.window.windowID != config_window_id()) {
+        event.window.windowID != config_window_id() &&
+        event.window.windowID != console_window_id()) {
       state->running = false;
       return false;
     }
-    // Route events targeting the hardware config window to ImGui and skip
-    // the main-window handlers below (so e.g. typing into a hex input doesn't
-    // also press POWER).
-    if (event_targets_config_window(event)) {
+    // Route events targeting an auxiliary ImGui window to its own handler
+    // and skip the main-window handlers below (so typing into a hex input
+    // doesn't also press POWER, etc.).
+    if (event_targets_window(event, config_window_id())) {
       config_window_handle_event(event);
+      continue;
+    }
+    if (event_targets_window(event, console_window_id())) {
+      console_window_handle_event(event);
       continue;
     }
     // ---- Mouse → FTS4 touchscreen events ----
@@ -509,6 +515,12 @@ bool sdl_display_poll_events(EmuState *state, uc_engine *uc) {
             (g_swizzle_override == -1) ? 0 : (g_swizzle_override == 0 ? 2 : -1);
         printf("[diag] Swizzle Override: %d (-1=Auto, 0=Pitch, 2=Block)\n",
                g_swizzle_override);
+        break;
+      case SDLK_c:
+        console_window_toggle();
+        printf("[ui] UART console %s\n",
+               console_window_is_visible() ? "OPEN" : "CLOSED");
+        fflush(stdout);
         break;
       case SDLK_m:
         config_window_toggle();
