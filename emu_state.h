@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <vector>
 #include <string>
 
@@ -289,6 +290,26 @@ struct EmuState {
     std::atomic<uint32_t> touch_fw_id{0x32000001};  // displayed as 4CD60D/<n>
     std::atomic<uint16_t> touch_ftb_ver{0x0123};
     std::atomic<uint16_t> touch_fw_rev{0x4567};     // Hekate byte-swaps before printing
+
+    // ============================================================
+    // Per-UART scratch state used by the in-emulator UART console.
+    // ============================================================
+    // Tegra X1 has UART_A..UART_E (5 ports). The mmio dispatcher for the
+    // 0x70006000 region uses (addr & 0x1FF) / 0x40 to derive the port idx.
+    //
+    // - uart_tx_log[idx] mirrors every byte the payload writes to that
+    //   port's TX register, so the console window can render scrolling
+    //   history without having to re-parse stdout. Capped at ~64 KB by a
+    //   simple "drop the front when too big" trim.
+    // - uart_rx_fifo[idx] is bytes the host has typed in the console
+    //   window awaiting consumption by the next UART read (RBR via
+    //   offset 0x00, with bit 0 of LSR at offset 0x14 set when non-empty).
+    //
+    // The CPU-emulation hooks and the ImGui console both run on the main
+    // thread between SDL polls, so no locking is required.
+    static constexpr size_t N_UARTS = 5;
+    std::string             uart_tx_log[N_UARTS];
+    std::deque<uint8_t>     uart_rx_fifo[N_UARTS];
 };
 
 #endif // EMU_STATE_H

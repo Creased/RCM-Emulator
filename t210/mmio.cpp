@@ -554,9 +554,26 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
 
   // UART
   if (addr >= 0x70006000 && addr < 0x70006500) {
+    uint32_t port   = (addr - 0x70006000) / 0x40;
     uint32_t offset = (addr - 0x70006000) % 0x40;
-    if (offset == 0x14)
-      return 0x60; // LSR: THRE | TMTY always ready
+    if (offset == 0x14) {
+      // LSR: THRE | TMTY (0x60) always ready, plus RDR (bit 0) when our
+      // host-side RX FIFO has bytes queued by the console window.
+      uint32_t lsr = 0x60;
+      if (port < EmuState::N_UARTS && !state->uart_rx_fifo[port].empty())
+        lsr |= 0x01;
+      return lsr;
+    }
+    if (offset == 0x00) {
+      // RBR (read alias of THR/DLL when DLAB=0). Pop the next host-injected
+      // byte; if the FIFO is empty return 0 (the payload should have
+      // checked LSR.RDR first).
+      if (port < EmuState::N_UARTS && !state->uart_rx_fifo[port].empty()) {
+        uint8_t b = state->uart_rx_fifo[port].front();
+        state->uart_rx_fifo[port].pop_front();
+        return b;
+      }
+    }
     return 0;
   }
   // DSI
@@ -1673,30 +1690,38 @@ static void hook_mmio_write(uc_engine *uc, uc_mem_type type, uint64_t address,
     } else if (address >= SDMMC4_BASE && address < SDMMC4_BASE + 0x200) {
       misc_write(uc, state, address, value, size);
     } else if (address >= 0x70006000 && address < 0x70006500) {
+      uint32_t port   = (address - 0x70006000) / 0x40;
       uint32_t offset = (address - 0x70006000) % 0x40;
-      if (offset == 0) {
-        // UART_THR. Hekate's UART carries Joy-Con HID protocol bytes (binary)
-        // in addition to occasional debug text. We buffer printable ASCII into
-        // a per-line buffer and flush on \n / \r / overflow so that a
-        // gfx_putc-mirrored println shows up as a single [uart] line.
-        static char uart_line[512];
-        static size_t uart_len = 0;
-        auto flush_uart_line = []() {
-          if (uart_len > 0) {
-            uart_line[uart_len] = 0;
-            printf("[uart] %s\n", uart_line);
+      if (offset == 0 && port < EmuState::N_UARTS) {
+        uint8_t b = (uint8_t)val;
+
+        // Append every byte to the per-port TX log — the console window
+        // renders this as scrolling text. Trim from the front if it grows
+        // past 64 KB so ImGui rendering stays responsive.
+        std::string &log = state->uart_tx_log[port];
+        if (b == '\n' || (b >= 0x20 && b < 0x7F))
+          log.push_back((char)b);
+        if (log.size() > 64 * 1024)
+          log.erase(0, log.size() - 48 * 1024);
+
+        // Mirror to host stdout in line-buffered form so existing
+        // `grep '[uart]'` workflows still work.
+        static char uart_line[5][512];
+        static size_t uart_len[5] = {0};
+        auto flush_uart_line = [&](uint32_t p) {
+          if (uart_len[p] > 0) {
+            uart_line[p][uart_len[p]] = 0;
+            printf("[uart%c] %s\n", 'A' + (char)p, uart_line[p]);
             fflush(stdout);
-            uart_len = 0;
+            uart_len[p] = 0;
           }
         };
-        uint8_t b = (uint8_t)val;
         if (b == '\n' || b == '\r') {
-          flush_uart_line();
+          flush_uart_line(port);
         } else if (b >= 0x20 && b < 0x7F) {
-          if (uart_len + 1 >= sizeof(uart_line)) flush_uart_line();
-          uart_line[uart_len++] = (char)b;
+          if (uart_len[port] + 1 >= sizeof(uart_line[port])) flush_uart_line(port);
+          uart_line[port][uart_len[port]++] = (char)b;
         }
-        // Non-printables (Joy-Con HID etc.) are dropped silently.
       }
     } else if (address >= VIC_BASE && address < VIC_BASE + VIC_SIZE) {
       vic_write(state, address, val);
