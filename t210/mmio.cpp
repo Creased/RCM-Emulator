@@ -53,6 +53,25 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
     return val;
   }
 
+  // Generic IN-register read: Tegra X1 GPIO is organized as 8 banks of
+  // 256 bytes; within each bank the IN registers for the 4 ports occupy
+  // bank-offsets 0x30..0x3F (one 32-bit register per port at +0x30,
+  // +0x34, +0x38, +0x3C). The matching OUT register sits 0x10 bytes
+  // earlier (at +0x20..+0x2F). We don't model external drivers, so we
+  // mirror back the latched OUT value the payload last wrote — that
+  // makes
+  //   gpio_write(PORT, PIN, HIGH); gpio_read(PORT, PIN);
+  // round-trip for ports the payload drives itself (PV0/PV1 backlight
+  // enable, PV2 panel reset, PK3 Joy-Con charge enable, etc.).
+  uint32_t bank_off = offset & 0xFF;
+  if (bank_off >= 0x30 && bank_off < 0x40 && offset < 0x800) {
+    uint64_t out_addr = addr - 0x10;  // IN -> OUT
+    uint32_t v = mmio_regs.count(out_addr) ? mmio_regs[out_addr] : 0;
+    printf("[gpio] R: offset 0x%X (IN, mirror of OUT @ 0x%X) = 0x%08X\n",
+           offset, (uint32_t)(offset - 0x10), v);
+    return v;
+  }
+
   printf("[gpio] R: offset 0x%X = 0\n", offset);
   return 0;
 }
@@ -563,17 +582,18 @@ void display_write(EmuState *state, uint64_t addr, uint32_t val) {
   }
 }
 
-// PINMUX read-back cache to satisfy polling
-static uint32_t pinmux_reg[0x1000 / 4] = {0};
-
 // Forward decls — these handlers live further down this file but are reached
 // from misc_read's catch-all routing for DSI accesses.
 uint32_t dsi_read(EmuState *state, uint64_t addr);
 void     dsi_write(EmuState *state, uint64_t addr, uint32_t val);
 
 uint32_t misc_read(EmuState *state, uint64_t addr) {
+  // PINMUX (APB_MISC pad config range) — every write lands in the global
+  // mmio_regs map at line 1726, so we just hand it back. Returning 0 here
+  // (the old behavior) silently dropped the muxed function bits, which
+  // broke any probe that read back PINMUX_AUX_* to confirm a pin's mode.
   if (addr >= PINMUX_BASE && addr < PINMUX_BASE + PINMUX_SIZE) {
-    return pinmux_reg[(addr - PINMUX_BASE) / 4];
+    return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
   }
   // APB_MISC_GP_HIDREV - hardware revision.
   // Bits 11:8 = chip ID (0x21 for both T210 / T210B01),
@@ -619,9 +639,12 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
       return 0x40000000; // MC_IRAM_BOM: set to bridge IRAM boundary
     return 0;
   }
-  // PWM (Backlight)
+  // PWM controller (LCD backlight on PWM0, optional fan on PWM1). Same
+  // story as PINMUX above — the writes are captured by the global cache
+  // already; return whatever was last written so the payload can read
+  // back its own duty cycle / enable bit.
   if (addr >= PWM_BASE && addr < PWM_BASE + 0x1000) {
-    return 0;
+    return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
   }
   // TSEC (Tegra Security Co-processor) — base 0x54500000 per Hekate bdk/soc/t210.h.
   // The TSEC microcontroller's firmware blob runs HDCP-based key derivation that
