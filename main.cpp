@@ -166,39 +166,44 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
     // Setup instruction tracing
     uc_hook_add(uc, &trace_h, UC_HOOK_CODE, (void*)trace_callback, nullptr, 1, 0);
 
-    // ---- Map DRAM Low (256MB @ 0x80000000) ----
-    // Allocated host-side so soft reboot can memset() it (Nyx loads here and
-    // its file-static SD/eMMC caches would otherwise survive across reboots).
-    state->dram_low_ptr = (uint8_t *)calloc(1, 256 * 1024 * 1024);
-    err = uc_mem_map_ptr(uc, DRAM_BASE, 256 * 1024 * 1024, UC_PROT_ALL, state->dram_low_ptr);
-    if (err != UC_ERR_OK) {
-        fprintf(stderr, "[error] Failed to map low DRAM: %s\n", uc_strerror(err));
+    // ---- Map DRAM as one contiguous region ----
+    // 0x80000000 .. 0x100000000, i.e. the whole 32-bit-addressable DRAM window
+    // the BPMP can reach. This used to be two islands (256 MB at 0x80000000
+    // plus 1 GB at 0xC0000000) with a 768 MB hole between them; a payload that
+    // walks RAM - a memory tester marching over the reported DRAM size - fell
+    // straight into that hole and took an unmapped-access fault partway
+    // through. One contiguous block removes the hole and matches what real
+    // hardware presents.
+    //
+    // Allocated host-side (calloc, so pages are lazily committed - the full
+    // 2 GB is only ever resident if a payload actually touches all of it) and
+    // kept as a host pointer so soft reboot can memset() it: Nyx loads here
+    // and its file-static SD/eMMC caches would otherwise survive a reboot.
+    err = uc_mem_map_ptr(uc, DRAM_BASE, DRAM_WINDOW_SIZE, UC_PROT_ALL,
+                         (state->dram_low_ptr = (uint8_t *)calloc(1, DRAM_WINDOW_SIZE)));
+    if (!state->dram_low_ptr) {
+        fprintf(stderr, "[error] Failed to allocate %zu MB DRAM host buffer\n",
+                (size_t)(DRAM_WINDOW_SIZE / (1024 * 1024)));
         uc_close(uc);
         return nullptr;
     }
-    printf("[emu] Mapped DRAM Low: 0x%08llX - 0x%08llX (256 MB)\n",
-           (unsigned long long)DRAM_BASE,
-           (unsigned long long)(DRAM_BASE + 256 * 1024 * 1024));
-
-    // ---- Map DRAM High + FB (1GB @ 0xC0000000) ----
-    // This covers 0xE5000000 and 0xF5A00000
-    size_t high_dram_size = 1024 * 1024 * 1024;
-    state->dram_ptr = (uint8_t *)calloc(1, high_dram_size);
-    if (!state->dram_ptr) {
-        fprintf(stderr, "[error] Failed to allocate high DRAM host buffer\n");
-        return nullptr;
-    }
-    err = uc_mem_map_ptr(uc, 0xC0000000, high_dram_size, UC_PROT_ALL, state->dram_ptr);
     if (err != UC_ERR_OK) {
-        fprintf(stderr, "[error] Failed to map high DRAM: %s\n", uc_strerror(err));
+        fprintf(stderr, "[error] Failed to map DRAM: %s\n", uc_strerror(err));
+        uc_close(uc);
         return nullptr;
     }
-    printf("[emu] Mapped DRAM High: 0xC0000000 - 0x%08llX (1024 MB)\n",
-           (unsigned long long)(0xC0000000 + high_dram_size));
+    printf("[emu] Mapped DRAM: 0x%08llX - 0x%09llX (%zu MB, contiguous)\n",
+           (unsigned long long)DRAM_BASE,
+           (unsigned long long)(DRAM_BASE + DRAM_WINDOW_SIZE),
+           (size_t)(DRAM_WINDOW_SIZE / (1024 * 1024)));
+
+    // dram_ptr keeps its historical meaning ("high DRAM at 0xC0000000") as a
+    // view into the same block, so existing 0xC0000000-relative code is
+    // unchanged.
+    state->dram_ptr = state->dram_low_ptr + (0xC0000000ULL - DRAM_BASE);
 
     // ---- Map Framebuffer pointer ----
-    // FB_BASE is 0xF5A00000. Offset in 1GB block starting at 0xC0000000 is 0x35A00000.
-    state->fb_ptr = state->dram_ptr + (FB_BASE - 0xC0000000);
+    state->fb_ptr = state->dram_low_ptr + (FB_BASE - DRAM_BASE);
     // Fill with hekate background color (0x1B1B1B)
     for (size_t i = 0; i < FB_SIZE; i += 4) {
         state->fb_ptr[i + 0] = 0x1B; // B
@@ -422,8 +427,8 @@ int main(int argc, char *argv[]) {
         // re-prime the WDT cookie so Hekate's early boot skips Minerva again.
         if (state.reboot_requested.exchange(false)) {
             uc_emu_stop(uc);
-            memset(state.dram_low_ptr, 0, 256 * 1024 * 1024);
-            memset(state.dram_ptr,     0, 1024 * 1024 * 1024);
+            // One contiguous block now; dram_ptr is a view into it.
+            memset(state.dram_low_ptr, 0, DRAM_WINDOW_SIZE);
             uc_mem_write(uc, IPL_LOAD_ADDR, state.payload_ptr, state.payload_len);
             uint32_t wdt_magic = 0x544457;
             uc_mem_write(uc, 0x4003FF18, &wdt_magic, sizeof(wdt_magic));
@@ -619,7 +624,7 @@ int main(int argc, char *argv[]) {
     uc_close(uc);
 
     free(state.iram_ptr);
-    free(state.dram_ptr);
+    // dram_ptr is a view into dram_low_ptr's block; only free the base once.
     free(state.dram_low_ptr);
     free(state.payload_ptr);
     // fb_ptr points inside dram_ptr; do not free separately.

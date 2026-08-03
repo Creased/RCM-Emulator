@@ -18,6 +18,11 @@ constexpr uint64_t IRAM_SIZE = (16 * 1024 * 1024); // 16 MB mapped (actual 512 K
 
 // DRAM - We allocate a modest amount for framebuffer + heap
 constexpr uint64_t DRAM_BASE = 0x80000000;
+// Size of the contiguous DRAM window we map. The BPMP is a 32-bit core, so
+// everything it can address above DRAM_BASE ends at 0x100000000 - that upper
+// bound, not the console's physical 4 GB, is what a BPMP-side payload can
+// actually walk. MC_EMEM_CFG still reports the true 4096 MB.
+constexpr uint64_t DRAM_WINDOW_SIZE = 0x80000000ULL; // 2 GB
 constexpr uint64_t DRAM_SIZE = 0x80000000; // 2GB (Full T210 DRAM space for FatFs buffers)
 
 // Payload load address within IRAM

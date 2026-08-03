@@ -84,8 +84,11 @@ struct EmuState {
     uint64_t bpmp_slept_us = 0;
 
     // DRAM pointer (host memory backing the emulated DRAM).
-    uint8_t *dram_ptr = nullptr;     // High DRAM (0xC0000000+, 1 GB, includes FB)
-    uint8_t *dram_low_ptr = nullptr; // Low DRAM (0x80000000+, 256 MB, holds Nyx)
+    // DRAM is one contiguous host allocation covering 0x80000000..0x100000000.
+    // dram_low_ptr owns it; dram_ptr is a view at the 0xC0000000 offset kept
+    // for the existing high-DRAM/framebuffer call sites. Free only dram_low_ptr.
+    uint8_t *dram_ptr = nullptr;     // view: high DRAM (0xC0000000+)
+    uint8_t *dram_low_ptr = nullptr; // owner: base of the whole DRAM window
     uint8_t *iram_ptr = nullptr;
     uint8_t *fb_ptr   = nullptr;
 
