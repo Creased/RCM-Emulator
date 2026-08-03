@@ -1536,8 +1536,30 @@ static constexpr uint32_t HALT_MSEC = 1u << 24;
 static constexpr uint32_t HALT_USEC = 1u << 25;
 static constexpr uint32_t HALT_TIMED = HALT_SEC | HALT_MSEC | HALT_USEC;
 
+// FLOW_CTLR_RAM_REPAIR (0x40): bit 0 = REQ, bit 1 = STS.
+// ccplex_boot_cpu0() requests RAM repair for the fast cluster and then spins
+// on STS with no timeout (bdk soc/ccplex.c). Reads used to fall through to 0,
+// so anything that brings up the CCPLEX - e.g. a payload running its memory
+// test on the A57s - hung there forever. Latch REQ and report the repair as
+// complete straight away.
+static constexpr uint32_t RAM_REPAIR_REQ = 1u << 0;
+static constexpr uint32_t RAM_REPAIR_STS = 1u << 1;
+static uint32_t flow_ram_repair = 0;
+
+static uint32_t flow_read(EmuState *state, uint64_t addr) {
+  (void)state;
+  uint32_t offset = (uint32_t)(addr - 0x60007000);
+  if (offset == 0x40)
+    return flow_ram_repair | (flow_ram_repair & RAM_REPAIR_REQ ? RAM_REPAIR_STS : 0);
+  return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+}
+
 static void flow_write(EmuState *state, uint64_t addr, uint32_t val) {
   uint32_t offset = (uint32_t)(addr - 0x60007000);
+  if (offset == 0x40) {
+    flow_ram_repair = val;
+    return;
+  }
   if (offset == 0x04) {
     // Two very different things get written here and they must not be
     // conflated:
@@ -2155,6 +2177,8 @@ static void hook_mmio_read(uc_engine *uc, uc_mem_type type, uint64_t address,
     } else if (address >= SOC_THERM_BASE &&
                address < SOC_THERM_BASE + SOC_THERM_SIZE) {
       result = soc_therm_read(state, address);
+    } else if (address >= 0x60007000 && address < 0x60007000 + 0x1000) {
+      result = flow_read(state, address);
     } else if (address >= I2S_BASE && address < I2S_BASE + I2S_SIZE) {
       result = i2s_read(state, address);
     } else if (address >= RTC_BASE && address < RTC_BASE + RTC_SIZE) {
