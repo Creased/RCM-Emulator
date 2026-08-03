@@ -116,12 +116,71 @@ void gpio_write(EmuState *state, uint64_t addr, uint32_t val) {
 
 static uint8_t i2c_slave_addr = 0;
 static uint8_t i2c_reg_addr = 0;
+// Last full CMD_DATA1 word, committed when I2C_CNFG starts the transfer.
+static uint32_t i2c_cmd_data1 = 0;
+// I2C_CNFG has to read back what was written: bdk sets NORMAL_MODE_GO with a
+// read-modify-write (`cnfg = (cnfg & ~GO) | GO`), so returning 0 would drop the
+// transfer size and direction bits before the transaction runs. [0]=I2C1, [1]=I2C5.
+static uint32_t i2c_cnfg_reg[2] = {0, 0};
 
 // (Touch controller is the STMFTS at I2C_3 / slave 0x49, handled separately
 // in t210/i2c3.cpp. Nothing else lives at I2C_1 / slave 0x4C besides TMP451.)
 
 #define MAX77620_REG_ONOFFSTAT 0x15
 #define MAX77620_ONOFFSTAT_EN0 BIT(2)
+
+// ---- MAX77620 register file ----
+//
+// Modelled as a real 256-byte register file rather than a handful of hardcoded
+// reads, so that:
+//   * rail voltages decode to the values max77620_config_default() programs
+//     (bdk power/max7762x.c _pmic_regulators, uv_default column) instead of
+//     everything reading back as the 0.600 V register-zero floor, and
+//   * writes stick, so a payload that steps a rail and reads it back sees its
+//     own value (the "voltage set/read" / "not settable" tests).
+//
+// Encoding: volt = (reg & mask) * step_uv + base_uv.
+//   SD0..SD3   regs 0x16..0x19, step 12.5 mV, base 600 mV
+//   LDO0..LDO8 regs 0x23,0x25,..,0x33, low 6 bits, step 25 mV (LDO0/1/4) or
+//              50 mV (rest), base 800 mV; bits 7:6 = power mode (3 = normal).
+// Rail-OK status: SD rails via STATSD (0x14, bit set = NOT ok), LDO rails via
+// each LDOx_CFG2 POK bit (BIT(3)).
+static uint8_t max77620_regs[256];
+static bool max77620_regs_ready = false;
+
+static void max77620_regs_init() {
+  if (max77620_regs_ready)
+    return;
+  max77620_regs_ready = true;
+
+  // SD rails: uv_default 625 / 1125 / 1325 / 1800 mV.
+  max77620_regs[0x16] = (uint8_t)((625000u - 600000u) / 12500u);   // SD0
+  max77620_regs[0x17] = (uint8_t)((1125000u - 600000u) / 12500u);  // SD1
+  max77620_regs[0x18] = (uint8_t)((1325000u - 600000u) / 12500u);  // SD2
+  max77620_regs[0x19] = (uint8_t)((1800000u - 600000u) / 12500u);  // SD3
+  max77620_regs[0x14] = 0x00; // STATSD: 0 = every SD rail in regulation
+
+  struct LdoDef { uint8_t volt_reg; uint32_t uv; uint32_t step; };
+  static const LdoDef ldos[] = {
+      {0x23, 1200000, 25000}, // LDO0 display
+      {0x25, 1050000, 25000}, // LDO1 XUSB/PCIE
+      {0x27, 1800000, 50000}, // LDO2 SDMMC1
+      {0x29, 3100000, 50000}, // LDO3 GC ASIC
+      {0x2B,  850000, 12500}, // LDO4 RTC
+      {0x2D, 1800000, 50000}, // LDO5 GC card
+      {0x2F, 2900000, 50000}, // LDO6 touch + ALS
+      {0x31, 1050000, 50000}, // LDO7 XUSB
+      {0x33, 1050000, 50000}, // LDO8 XUSB/DP
+  };
+  for (const LdoDef &l : ldos) {
+    uint8_t code = (uint8_t)(((l.uv - 800000u) / l.step) & 0x3F);
+    max77620_regs[l.volt_reg] = (uint8_t)(code | (3u << 6)); // POWER_MODE_NORMAL
+    max77620_regs[l.volt_reg + 1] = BIT(3) | BIT(2);         // CFG2: POK | MPOK
+  }
+  // SD CFG1 registers (0x1D..0x20): flag the rails as power-OK too.
+  for (uint8_t r = 0x1D; r <= 0x20; r++)
+    max77620_regs[r] = BIT(1); // MPOK
+}
 
 // ---- Packet-mode I2C (BM92T36 USB-PD on I2C_1 @ 0x18) ----
 // MAX17050/MAX77620/BQ24193 use the simple "normal" path (CMD_DATA1 reads).
@@ -182,14 +241,27 @@ static void bm92t36_fill_rx(EmuState *state, uint8_t reg, uint8_t *buf, uint32_t
     }
 }
 
+// Forward decl: the "normal" (CMD_DATA1) register model, reused below so both
+// I2C transfer styles see identical device state.
+static uint32_t i2c_device_reg_read(EmuState *state, bool on_i2c5, uint8_t slave,
+                                    uint8_t reg);
+
 static void packet_populate_rx(EmuState *state, bool on_i2c5, PacketState &p) {
     p.rx_pos  = 0;
     p.rx_size = std::min((uint32_t)sizeof(p.rx_buf), p.payload_size);
     memset(p.rx_buf, 0, sizeof(p.rx_buf));
     if (!on_i2c5 && p.dev_addr == 0x18) {
         bm92t36_fill_rx(state, p.reg_addr, p.rx_buf, p.rx_size);
+        return;
     }
-    // Add other packet-mode slaves here as needed.
+    // Every other slave: serve packet-mode reads from the same register models
+    // the normal path uses. BDK's i2c_recv_buf_small() goes through
+    // i2c_xfer_packet, so a payload that reads the PMIC/charger/gauge that way
+    // used to get all-zeros here while the identical i2c_recv_byte() read
+    // returned real data.
+    for (uint32_t i = 0; i < p.rx_size; i++)
+        p.rx_buf[i] = (uint8_t)i2c_device_reg_read(state, on_i2c5, p.dev_addr,
+                                                   (uint8_t)(p.reg_addr + i));
 }
 
 uint32_t i2c_read(EmuState *state, uint64_t addr) {
@@ -200,6 +272,8 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
   PacketState &pkt = on_i2c5 ? pkt_i2c5 : pkt_i2c1;
 
   switch (offset) {
+  case 0x00:          // I2C_CNFG — read back what was written (see note at decl)
+    return i2c_cnfg_reg[on_i2c5 ? 1 : 0];
   case 0x1C:          // I2C_STATUS
     return 0;         // Transaction complete, no error, not busy
   case 0x8C:          // I2C_CONFIG_LOAD
@@ -310,20 +384,85 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
     }
     // MAX77620 PMIC (slave 0x3C on I2C_5).
     if (on_i2c5 && i2c_slave_addr == 0x3C) {
+      max77620_regs_init();
       switch (i2c_reg_addr) {
       case 0x15: { // ONOFFSTAT — EN0 bit reflects power button
         return state->btn_power.load() ? (1 << 2) : 0;
       }
       case 0x5B: return state->pmic_silicon_rev.load() & 0xF; // CID3: low nibble shown as "v%d"
       case 0x5C: return state->pmic_otp.load();                // CID4: 0x35 Erista, 0x53 Mariko
-      case 0x5D: return 0; // CID5: ES version
+      case 0x5D: return 0x08; // CID5: ES version
+      // Everything else comes out of the modelled register file, which holds
+      // the values max77620_config_default() programs plus anything the
+      // payload has written since. Returning 0 here (the old behaviour) made
+      // every rail decode as 0.600 V and made writes look like they had no
+      // effect ("not settable").
+      default:   return max77620_regs[i2c_reg_addr];
+      }
+    }
+    // MAX77621 CPU/GPU regulator (slave 0x1B/0x1C on I2C_5, Erista only).
+    // Hekate reads CHIPID1 (reg 0x04) and prints the byte verbatim.
+    if (on_i2c5 && (i2c_slave_addr == 0x1B || i2c_slave_addr == 0x1C)) {
+      // Erista part: don't answer on a Mariko-configured console, otherwise a
+      // payload sees both the MAX77621 and the MAX77812 present at once.
+      if (state->pmic_otp.load() == 0x53) return 0;
+      if (i2c_reg_addr == 0x04) return state->cpu_pmic_version.load();
+      // VOUT (0x00) / VOUT_DVS (0x01): bit 7 = enable, bits 6:0 = 606.25 mV +
+      // N * 6.25 mV. Report the rails enabled at a sane 1.0 V idle point.
+      if (i2c_reg_addr == 0x00 || i2c_reg_addr == 0x01)
+        return 0x80 | (uint8_t)((1000000u - 606250u) / 6250u);
+      return 0;
+    }
+    // MAX77812 multi-phase buck (Mariko / Lite / OLED), I2C_5 @ 0x33 for the
+    // PHASE211 retail variant (0x31 is the PHASE31 dev-kit part, left NAK'd).
+    // Replaces the dual MAX77621 on Erista. Rails: M1 = GPU, M3 = DRAM,
+    // M4 = CPU; vout_mv = 250 + N * 5.
+    if (on_i2c5 && i2c_slave_addr == 0x33) {
+      if (state->pmic_otp.load() != 0x53) return 0; // Mariko-family only
+      auto vout = [](uint32_t mv) -> uint8_t {
+        return (uint8_t)(((mv - 250u) / 5u) & 0xFF);
+      };
+      switch (i2c_reg_addr) {
+      case 0x14: return 0x05; // VERSION: QS silicon (ES2 = 0x04)
+      case 0x05: return 0x00; // TOPSYS_STAT: no thermal / OV / UV fault
+      case 0x22: return 0x00; // BUCK_STAT: no per-rail fault latch
+      // EN_CTRL: in RCM the CPU/GPU rails are still dormant (HOS brings them
+      // up), so report all phases disabled - that is the true cold state.
+      case 0x06: return 0x00;
+      case 0x23: return vout(1000); // M1 GPU
+      case 0x25: return vout(1100); // M3 DRAM (VDD2)
+      case 0x26: return vout(1000); // M4 CPU
       default:   return 0;
       }
     }
-    // MAX77621 CPU/GPU regulator (slave 0x1B on I2C_5). Hekate reads CHIPID1
-    // (reg 0x04) and prints the byte verbatim as the version number.
-    if (on_i2c5 && i2c_slave_addr == 0x1B) {
-      if (i2c_reg_addr == 0x04) return state->cpu_pmic_version.load();
+    // MAX77620 RTC (slave 0x68 on I2C_5). Separate slave address from the PMIC
+    // core. Registers 0x07..0x0D hold SEC/MIN/HOUR/WEEKDAY/MONTH/YEAR/DAY.
+    //
+    // Values are BCD unless CONTROL.BCD_MODE is clear, and the WEEKDAY
+    // register is a *bitmask* (bit N set = day N), not an ordinal - returning
+    // 0 there is what produced the "weekday 8" / "2000-00-00" nonsense.
+    // YEAR counts from 2000. We serve a fixed, deterministic wall time and
+    // advance the seconds from the emulated clock so repeated reads move
+    // forward (an RTC that never ticks is itself a fault a payload may flag).
+    if (on_i2c5 && i2c_slave_addr == 0x68) {
+      if (i2c_reg_addr == 0x03) return 0x00; // CONTROL: binary mode, 24h
+      if (i2c_reg_addr == 0x04 || i2c_reg_addr == 0x05) return 0x00; // UPDATE0/1: idle
+      if (i2c_reg_addr >= 0x07 && i2c_reg_addr <= 0x0D) {
+        // 2026-01-15 12:34:00 + emulated uptime, in binary (BCD_MODE off).
+        uint32_t secs = 0u + (uint32_t)(state->emu_usec / 1000000ULL);
+        uint32_t sec = (0 + secs) % 60;
+        uint32_t min = (34 + ((0 + secs) / 60)) % 60;
+        uint32_t hour = (12 + ((34 * 60 + secs) / 3600)) % 24;
+        switch (i2c_reg_addr) {
+        case 0x07: return sec;
+        case 0x08: return min;
+        case 0x09: return hour;        // bit 6 would be PM in 12h mode
+        case 0x0A: return 1u << 4;     // WEEKDAY bitmask: Thursday
+        case 0x0B: return 1;           // MONTH  (1-12)
+        case 0x0C: return 26;          // YEAR   (offset from 2000)
+        case 0x0D: return 15;          // DAY    (1-31)
+        }
+      }
       return 0;
     }
     // BQ24193 charger (slave 0x6B on I2C_1).
@@ -402,6 +541,23 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
   }
 }
 
+// Read one slave register through the same model the normal (CMD_DATA1) path
+// uses. The device models key off the i2c_slave_addr / i2c_reg_addr globals,
+// so we borrow them for the call and put them back - that keeps a single
+// source of truth for device behaviour instead of a second copy for
+// packet-mode transfers.
+static uint32_t i2c_device_reg_read(EmuState *state, bool on_i2c5, uint8_t slave,
+                                    uint8_t reg) {
+  uint8_t saved_slave = i2c_slave_addr;
+  uint8_t saved_reg = i2c_reg_addr;
+  i2c_slave_addr = slave;
+  i2c_reg_addr = reg;
+  uint32_t v = i2c_read(state, (on_i2c5 ? I2C5_BASE : I2C1_BASE) + 0x0C);
+  i2c_slave_addr = saved_slave;
+  i2c_reg_addr = saved_reg;
+  return v;
+}
+
 void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
   bool on_i2c5 = (addr >= I2C5_BASE);
   uint32_t base = on_i2c5 ? I2C5_BASE : I2C1_BASE;
@@ -410,11 +566,28 @@ void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
   PacketState &pkt = on_i2c5 ? pkt_i2c5 : pkt_i2c1;
 
   switch (offset) {
+  case 0x00: { // I2C_CNFG — this is where a normal-mode transfer actually runs.
+    // Layout (bdk soc/i2c.c): bits 3:1 = size-1, bit 6 = 0 write / 1 read,
+    // bit 9 = NORMAL_MODE_GO. A register READ is set up by first *writing*
+    // one byte (the register address), so only a transfer of 2+ bytes in
+    // write direction is a genuine register write. Committing on CMD_DATA1
+    // instead would clobber every register with 0 on each read setup.
+    i2c_cnfg_reg[on_i2c5 ? 1 : 0] = val;
+    bool is_write = (val & (1u << 6)) == 0;
+    uint32_t size = ((val >> 1) & 7) + 1;
+    if ((val & (1u << 9)) && is_write && size >= 2 && on_i2c5 &&
+        i2c_slave_addr == MAX77620_I2C_ADDR) {
+      max77620_regs_init();
+      max77620_regs[i2c_cmd_data1 & 0xFF] = (uint8_t)((i2c_cmd_data1 >> 8) & 0xFF);
+    }
+    break;
+  }
   case I2C_CMD_ADDR0:
     i2c_slave_addr = (val >> 1) & 0x7F;
     break;
   case I2C_CMD_DATA1:
     i2c_reg_addr = val & 0xFF;
+    i2c_cmd_data1 = val;
     // Hekate's i2c_send_byte goes through _i2c_send_normal which packs
     // [reg, value, ...] into CMD_DATA1 (low byte = reg, next byte = value).
     // Catch ONOFFCNFG1 writes to MAX77620 here so the emulator reacts to
