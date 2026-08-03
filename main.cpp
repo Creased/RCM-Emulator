@@ -27,6 +27,7 @@
 #include "display/sdl_display.h"
 #include "display/config_window.h"
 #include "display/console_window.h"
+#include "input_script.h"
 
 // ==================== Payload Loading ====================
 
@@ -352,6 +353,10 @@ int main(int argc, char *argv[]) {
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--auto-pin-recovery") == 0) auto_pin_recovery = true;
         else if (strcmp(argv[i], "--auto-te-script") == 0) auto_te_script = true;
+        // Generic scripted button input, for menu-driven payloads that can't
+        // be driven any other way from a headless / CI run.
+        else if (strcmp(argv[i], "--input-script") == 0 && i + 1 < argc)
+            input_script_load(argv[++i]);
     }
 
     if (sd_path) {
@@ -562,6 +567,9 @@ int main(int argc, char *argv[]) {
                         printf("[auto-te] sequence complete; idling for output\n");
                 }
             }
+
+            // Scripted button input (--input-script).
+            input_script_tick(state);
 
             // Touch injection for the Nyx GUI popup (eMMC Issues Warning).
             // Nyx initializes after the IPL stage; we inject a tap once enough
