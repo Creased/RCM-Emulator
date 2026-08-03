@@ -104,6 +104,13 @@ constexpr uint64_t DISPLAY_SIZE   = 0x40000;
 constexpr uint64_t DSI_BASE = 0x54300000;
 constexpr uint64_t DSI_SIZE = 0x1000;
 
+// SOC_THERM - on-die thermal sensors (tCPU0-3, tMEM0/1, tGPU, tPLLX).
+// Distinct from the TMP451 (I2C) board sensor: these are the Tegra's own
+// internal sensors, calibrated by fuses, that HOS/HW tests read to spot bad
+// factory thermal-cal fuses.
+constexpr uint64_t SOC_THERM_BASE = 0x700E2000;
+constexpr uint64_t SOC_THERM_SIZE = 0x1000;
+
 // MIPI CAL
 constexpr uint64_t MIPI_CAL_BASE = 0x700E3000;
 constexpr uint64_t MIPI_CAL_SIZE = 0x1000;

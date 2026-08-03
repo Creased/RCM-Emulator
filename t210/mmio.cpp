@@ -2029,6 +2029,79 @@ static void sysreg_write(EmuState *state, uint64_t addr, uint32_t val) {
   printf("[sysreg] W: 0x%08X = 0x%08X\n", offset, val);
 }
 
+// ==================== SOC_THERM (on-die thermal sensors) ====================
+//
+// The Tegra's internal thermal sensors, as opposed to the TMP451 board sensor
+// on I2C. Register layout follows the T210 TRM / Linux tegra-soctherm:
+//
+//   per-sensor block, 0x20 apart:
+//     +0x00 CONFIG0, +0x04 CONFIG1, +0x08 CONFIG2
+//     +0x0C STATUS0
+//     +0x10 STATUS1  -> bit 31 TEMP_VALID, bits 15:0 current temp
+//   sensor bases: CPU0 0xC0, CPU1 0xE0, CPU2 0x100, CPU3 0x120,
+//                 MEM0 0x140, MEM1 0x160, GPU 0x180, PLLX 0x1A0
+//
+//   aggregated readback:
+//     0x1C8 SENSOR_TEMP1 : CPU  bits 31:16 | GPU  bits 15:0
+//     0x1CC SENSOR_TEMP2 : MEM  bits 31:16 | PLLX bits 15:0
+//
+// Temperature encoding (both places): bits 15:8 = integer °C, bit 7 = +0.5 °C,
+// bit 0 = negate. We drive every sensor from the same emulated SoC die
+// temperature the TMP451 model uses, so the existing "SoC temp" slider in the
+// hardware-config window moves these too. Real silicon shows a few degrees of
+// spread between sensors; we add a small fixed per-sensor offset so a payload
+// that cross-checks them doesn't see suspiciously identical values.
+static uint16_t soctherm_encode_temp(int temp_c10) {
+  bool neg = temp_c10 < 0;
+  int a = neg ? -temp_c10 : temp_c10;
+  uint16_t v = (uint16_t)((a / 10) << 8);
+  if ((a % 10) >= 5)
+    v |= (1u << 7); // +0.5 °C
+  if (neg)
+    v |= 1u;
+  return v;
+}
+
+// Per-sensor offset in °C*10, indexed by sensor slot (CPU0..3, MEM0/1, GPU,
+// PLLX). Small and deterministic - just enough to look like real silicon.
+static const int kSocThermOffsets[8] = {0, 3, -2, 5, -5, -4, 8, 2};
+
+static int soctherm_sensor_c10(EmuState *state, int idx) {
+  return (int)state->soc_temp_c10.load() + kSocThermOffsets[idx & 7];
+}
+
+static uint32_t soc_therm_read(EmuState *state, uint64_t addr) {
+  uint32_t offset = (uint32_t)(addr - SOC_THERM_BASE);
+
+  // Per-sensor STATUS1 (current reading + valid bit).
+  if (offset >= 0xC0 && offset < 0x1C0 && ((offset - 0xC0) % 0x20) == 0x10) {
+    int idx = (int)((offset - 0xC0) / 0x20);
+    return (1u << 31) | soctherm_encode_temp(soctherm_sensor_c10(state, idx));
+  }
+
+  switch (offset) {
+  case 0x1C8: // SENSOR_TEMP1: CPU | GPU
+    return ((uint32_t)soctherm_encode_temp(soctherm_sensor_c10(state, 0)) << 16) |
+           soctherm_encode_temp(soctherm_sensor_c10(state, 6));
+  case 0x1CC: // SENSOR_TEMP2: MEM | PLLX
+    return ((uint32_t)soctherm_encode_temp(soctherm_sensor_c10(state, 4)) << 16) |
+           soctherm_encode_temp(soctherm_sensor_c10(state, 7));
+  default:
+    // CONFIG/STATUS0 and the THERMCTL/THROT blocks read back whatever was
+    // written; anything never written reads 0.
+    if (mmio_regs.count(addr))
+      return mmio_regs[addr];
+    return 0;
+  }
+}
+
+static void soc_therm_write(EmuState *state, uint64_t addr, uint32_t val) {
+  (void)state;
+  // Accept and remember configuration writes (sensor enables, THERMTRIP /
+  // THROT programming, CTMON setup) so read-back-after-write behaves.
+  mmio_regs[addr] = val;
+}
+
 // ==================== BPMP Cache ====================
 
 static uint32_t bpmp_cache_read(EmuState *state, uint64_t addr) {
@@ -2079,6 +2152,9 @@ static void hook_mmio_read(uc_engine *uc, uc_mem_type type, uint64_t address,
     } else if (address >= BPMP_CACHE_BASE &&
                address < BPMP_CACHE_BASE + BPMP_CACHE_SIZE) {
       result = bpmp_cache_read(state, address);
+    } else if (address >= SOC_THERM_BASE &&
+               address < SOC_THERM_BASE + SOC_THERM_SIZE) {
+      result = soc_therm_read(state, address);
     } else if (address >= I2S_BASE && address < I2S_BASE + I2S_SIZE) {
       result = i2s_read(state, address);
     } else if (address >= RTC_BASE && address < RTC_BASE + RTC_SIZE) {
@@ -2178,6 +2254,9 @@ static void hook_mmio_write(uc_engine *uc, uc_mem_type type, uint64_t address,
     } else if (address >= BPMP_CACHE_BASE &&
                address < BPMP_CACHE_BASE + BPMP_CACHE_SIZE) {
       bpmp_cache_write(state, address, val);
+    } else if (address >= SOC_THERM_BASE &&
+               address < SOC_THERM_BASE + SOC_THERM_SIZE) {
+      soc_therm_write(state, address, val);
     } else if (address >= I2S_BASE && address < I2S_BASE + I2S_SIZE) {
       i2s_write(state, address, val);
     } else if (address >= RTC_BASE && address < RTC_BASE + RTC_SIZE) {
@@ -2455,6 +2534,7 @@ void mmio_init(uc_engine *uc, EmuState *state) {
       {MC_BASE, MC_SIZE},
       {DISPLAY_A_BASE, DISPLAY_SIZE},
       {DSI_BASE, DSI_SIZE},
+      {SOC_THERM_BASE, SOC_THERM_SIZE},
       {MIPI_CAL_BASE, MIPI_CAL_SIZE},
       {SOR_BASE, SOR_SIZE},
       {SDMMC1_BASE, SDMMC_SIZE},
