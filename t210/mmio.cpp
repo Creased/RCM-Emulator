@@ -398,9 +398,11 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
       case 0x15: { // ONOFFSTAT — EN0 bit reflects power button
         return state->btn_power.load() ? (1 << 2) : 0;
       }
-      case 0x5B: return state->pmic_silicon_rev.load() & 0xF; // CID3: low nibble shown as "v%d"
+      // CID3 is a whole byte (0x5B on a real console); payloads print its low
+      // nibble as "max77620 v%d". Masking here would turn 0x5B into 0x0B.
+      case 0x5B: return state->pmic_silicon_rev.load();
       case 0x5C: return state->pmic_otp.load();                // CID4: 0x35 Erista, 0x53 Mariko
-      case 0x5D: return 0x08; // CID5: ES version
+      case 0x5D: return state->pmic_es_rev.load(); // CID5: ES version (0x81)
       // Everything else comes out of the modelled register file, which holds
       // the values max77620_config_default() programs plus anything the
       // payload has written since. Returning 0 here (the old behaviour) made

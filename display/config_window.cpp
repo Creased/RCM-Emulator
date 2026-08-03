@@ -52,8 +52,9 @@ void reset_to_defaults(EmuState *s) {
     s->usb_pd_amperage_ma = 1500;
     s->pmic_otp          = 0x35;
     s->is_mariko         = false;
-    s->pmic_silicon_rev  = 0;
-    s->cpu_pmic_version  = 0;
+    s->pmic_silicon_rev  = 0x5B;          // CID3, measured on a real console
+    s->pmic_es_rev       = 0x81;          // CID5
+    s->cpu_pmic_version  = 0x1C;
     s->sd_inserted       = true;
     s->sd_cid_manfid     = 0x03;
     s->sd_cid_oemid      = 0x5344;        // "SD"
@@ -138,6 +139,7 @@ void reset_to_defaults(EmuState *s) {
     X(pmic_otp,            "soc",     "pmic_otp",        0)                  \
     X(is_mariko,           "soc",     "is_mariko",       0)                  \
     X(pmic_silicon_rev,    "soc",     "pmic_silicon_rev",0)                  \
+    X(pmic_es_rev,         "soc",     "pmic_es_rev",     0)                  \
     X(cpu_pmic_version,    "soc",     "cpu_pmic_version",0)                  \
     /* Storage — SD (SDMMC1 CMD2) */                                         \
     X(sd_inserted,         "sd",      "inserted",        0)                  \
@@ -410,8 +412,11 @@ void build_ui(EmuState *state) {
         if (ImGui::Combo("PMIC OTP", &idx, otp_items, IM_ARRAYSIZE(otp_items))) {
             state->pmic_otp.store(idx == 1 ? 0x53 : 0x35);
         }
-        atomic_slider_int<uint8_t>("MAX77620 silicon rev", state->pmic_silicon_rev,    0, 15);
-        atomic_slider_int<uint8_t>("MAX77621 chipid",      state->cpu_pmic_version,    0, 15);
+        // Whole bytes (CID3 reads 0x5B on real silicon), so the range has to
+        // span 0..255 - a 0..15 slider silently clamped these to a nibble.
+        atomic_slider_int<uint8_t>("MAX77620 CID3 (Si rev)", state->pmic_silicon_rev, 0, 255);
+        atomic_slider_int<uint8_t>("MAX77620 CID5 (ES rev)", state->pmic_es_rev,      0, 255);
+        atomic_slider_int<uint8_t>("MAX77621 chipid",        state->cpu_pmic_version, 0, 255);
     }
 
     if (ImGui::CollapsingHeader("Charger (BQ24193)", ImGuiTreeNodeFlags_DefaultOpen)) {

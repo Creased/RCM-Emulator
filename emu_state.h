@@ -158,8 +158,16 @@ struct EmuState {
     // Erista, 2 = T210B01 Mariko). Hekate's h_cfg.t210b01 derives from this,
     // which controls the pkg1 OEM-header skip among other things.
     std::atomic<bool>     is_mariko{false};
-    std::atomic<uint8_t>  pmic_silicon_rev{0};       // MAX77620 CID3 low nibble: "max77620 v%d"
-    std::atomic<uint8_t>  cpu_pmic_version{0};       // MAX77621 CHIPID1: "max77621 v%d"
+    // Silicon revisions, as read off a real console (Mariko, HAC-001(-01)):
+    //   CID3 = 0x5B  -> payloads print the low nibble, "max77620 v11"
+    //   CID5 = 0x81  -> ES version (DIDM 8 / DIDO 1)
+    // These are whole bytes, not nibbles: masking CID3 to 4 bits (the old
+    // behaviour) made a genuine 0x5B read back as 0x0B. CID3/CID5 describe the
+    // silicon and are expected to be identical on Erista - only CID4 (the OTP
+    // version) differs by generation - but only Mariko is measured so far.
+    std::atomic<uint8_t>  pmic_silicon_rev{0x5B};    // MAX77620 CID3
+    std::atomic<uint8_t>  pmic_es_rev{0x81};         // MAX77620 CID5
+    std::atomic<uint8_t>  cpu_pmic_version{0x1C};    // MAX77621 CHIPID1 (unverified)
 
     // SD card insertion (GPIO Port Z bit 1 = 0 means inserted).
     std::atomic<bool>     sd_inserted{true};
