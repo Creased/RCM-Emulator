@@ -773,6 +773,11 @@ void display_write(EmuState *state, uint64_t addr, uint32_t val) {
 uint32_t dsi_read(EmuState *state, uint64_t addr);
 void     dsi_write(EmuState *state, uint64_t addr, uint32_t val);
 
+// KFUSE_KEYADDR (0x7000FC88): word index into the 144-word HDCP key block,
+// bit 16 = auto-increment on each KFUSE_KEYS read. File scope so both the read
+// and the write path share one cursor.
+static uint32_t g_kfuse_keyaddr = 0;
+
 uint32_t misc_read(EmuState *state, uint64_t addr) {
   // PINMUX (APB_MISC pad config range) — every write lands in the global
   // mmio_regs map at line 1726, so we just hand it back. Returning 0 here
@@ -823,6 +828,12 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
     uint32_t offset = (uint32_t)(addr - MC_BASE);
     if (offset == 0x65C)
       return 0x40000000; // MC_IRAM_BOM: set to bridge IRAM boundary
+    // MC_EMEM_CFG (0x50) holds the external memory size in MB. Payloads that
+    // report "RAM size" read it here; leaving it 0 makes a healthy console
+    // look like it has no DRAM at all. Switch ships 4 GB across all models
+    // (Erista/Mariko/Lite/OLED).
+    if (offset == 0x50)
+      return 4096;
     return 0;
   }
   // PWM controller (LCD backlight on PWM0, optional fan on PWM1). Same
@@ -848,15 +859,32 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
   }
   // KFUSE (Key Fuse / HDCP keys) — base 0x7000FC00 per Hekate bdk/soc/t210.h.
   // Hekate's kfuse_wait_ready() spins on KFUSE_STATE bit 16 (DONE) with no
-  // timeout (bdk/soc/kfuse.c). Return DONE|CRCPASS so the wait exits and the
-  // 144-word KFUSE_KEYS read produces zeros (fine for the boot path; HDCP
-  // is unused in the emulator).
+  // timeout (bdk/soc/kfuse.c), so DONE|CRCPASS has to come back.
+  //
+  // KFUSE_KEYS (0x8C) streams the 144-word HDCP key block, with KFUSE_KEYADDR
+  // (0x88) holding the word index and bit 16 requesting auto-increment. A
+  // diagnostic payload reads all 144 words and reports how many are blank, so
+  // returning zeros looks like a wholly unprogrammed (i.e. faulty) key block.
+  // Emit deterministic non-zero pseudo-data instead - real per-unit HDCP keys
+  // aren't something we can or should reproduce, but "programmed" is the
+  // honest state for a healthy emulated console.
   if (addr >= 0x7000FC00 && addr < 0x7000FD00) {
     uint32_t offset = (uint32_t)(addr - 0x7000FC00);
     if (offset == 0x80) // KFUSE_STATE
       return (1u << 16) | (1u << 17); // DONE | CRCPASS
-    if (offset == 0x8C) // KFUSE_KEYS (auto-incrementing zeros)
-      return 0;
+    if (offset == 0x88) // KFUSE_KEYADDR
+      return g_kfuse_keyaddr;
+    if (offset == 0x8C) { // KFUSE_KEYS
+      uint32_t idx = g_kfuse_keyaddr & 0xFF;
+      if (g_kfuse_keyaddr & (1u << 16))
+        g_kfuse_keyaddr = (g_kfuse_keyaddr & ~0xFFU) | ((idx + 1) & 0xFF);
+      // Cheap deterministic mix - stable across runs, never zero.
+      uint32_t w = idx * 0x9E3779B9u + 0xA5A5A5A5u;
+      w ^= w >> 15;
+      w *= 0x85EBCA6Bu;
+      w ^= w >> 13;
+      return w ? w : 0xDEADBEEFu;
+    }
     return 0;
   }
   // SDMMC Controllers
@@ -931,6 +959,11 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
 void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
                 int size) {
   uint32_t val = (uint32_t)value;
+  // KFUSE_KEYADDR - sets the read cursor into the HDCP key block.
+  if (addr == 0x7000FC88) {
+    g_kfuse_keyaddr = val;
+    return;
+  }
   // SDMMC Controllers
   if ((addr >= SDMMC1_BASE && addr < SDMMC1_BASE + 0x1000) ||
       (addr >= SDMMC4_BASE && addr < SDMMC4_BASE + 0x1000)) {
