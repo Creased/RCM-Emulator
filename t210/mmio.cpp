@@ -1525,15 +1525,45 @@ void pmc_write(EmuState *state, uint64_t addr, uint32_t val) {
 
 // ==================== Flow Controller ====================
 
+// FLOW_CTLR_HALT_COP_EVENTS bit layout (bdk soc/t210.h):
+//   bits 31:29  HALT_MODE  (2 = WAITEVENT)
+//   bit  28     HALT_JTAG
+//   bit  25     HALT_USEC  - timed wake-up sources; the low 8 bits carry
+//   bit  24     HALT_MSEC    the delay count (HALT_MAX_CNT = 0xFF)
+//   bit  23     HALT_SEC
+static constexpr uint32_t HALT_SEC = 1u << 23;
+static constexpr uint32_t HALT_MSEC = 1u << 24;
+static constexpr uint32_t HALT_USEC = 1u << 25;
+static constexpr uint32_t HALT_TIMED = HALT_SEC | HALT_MSEC | HALT_USEC;
+
 static void flow_write(EmuState *state, uint64_t addr, uint32_t val) {
   uint32_t offset = (uint32_t)(addr - 0x60007000);
   if (offset == 0x04) {
-    // HALT_COP_EVENTS. Bits 31:29 select HALT_MODE; val 0x50000000 is
-    // WAITEVENT | JTAG, written by bpmp_halt_cop() on power-off, reset and
-    // fatal paths. The Hekate caller typically follows it with a tight
-    // `while(true);`, so we see one halt write then the CPU spins forever.
-    // Treat it as "the payload is done" and exit cleanly so the SDL window
-    // closes (this is what "Power off" / "Reboot" expect).
+    // Two very different things get written here and they must not be
+    // conflated:
+    //
+    //  1. bpmp_usleep() / bpmp_msleep() park the BPMP with a TIMER event
+    //     source (HALT_USEC / HALT_MSEC / HALT_SEC) plus a delay count, to
+    //     sleep with the core clock-gated. The timer event wakes the core
+    //     and execution continues. This is a routine sleep and happens all
+    //     over the BDK - treating it as terminal killed any payload that
+    //     slept this way (e.g. a 200 ms bpmp_msleep = 0x410000C8).
+    //
+    //  2. bpmp_halt() writes WAITEVENT | JTAG with no timer source and is
+    //     followed by `while(true);`. That one really is "payload done"
+    //     (power-off / reboot / fatal), so we exit cleanly.
+    if (val & HALT_TIMED) {
+      // Advance the emulated microsecond counter by the requested delay so
+      // TIMERUS-based delta loops observe the time actually passing, then
+      // let the CPU run on.
+      uint32_t delay = val & 0xFF;
+      uint64_t us = (val & HALT_USEC)   ? (uint64_t)delay
+                    : (val & HALT_MSEC) ? (uint64_t)delay * 1000ULL
+                                        : (uint64_t)delay * 1000000ULL;
+      state->emu_usec += us;
+      state->bpmp_slept_us += us; // feeds the ACTMON BPMP-load model
+      return;
+    }
     printf("[flow] BPMP HALT/WaitEvent (val=0x%08X), shutting down emulator\n",
            val);
     state->running = false;

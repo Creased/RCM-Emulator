@@ -78,6 +78,11 @@ struct EmuState {
     uint64_t emu_usec = 0;
     uint64_t insn_count = 0;
 
+    // Total time the BPMP has spent parked in a FLOW_CTLR timed halt
+    // (bpmp_usleep / bpmp_msleep). The ACTMON model derives BPMP load from
+    // this: time not slept during a sample window counts as active.
+    uint64_t bpmp_slept_us = 0;
+
     // DRAM pointer (host memory backing the emulated DRAM).
     uint8_t *dram_ptr = nullptr;     // High DRAM (0xC0000000+, 1 GB, includes FB)
     uint8_t *dram_low_ptr = nullptr; // Low DRAM (0x80000000+, 256 MB, holds Nyx)
