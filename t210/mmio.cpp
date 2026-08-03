@@ -1883,15 +1883,149 @@ static void i2s_write(EmuState *state, uint64_t addr, uint32_t val) {
   (void)val;
 }
 
+// ==================== ACTMON (Activity Monitor) ====================
+//
+// ACTMON_BASE = 0x6000C800, i.e. inside the SYSREG page, so it is dispatched
+// from sysreg_read/sysreg_write below.
+//
+// Layout (bdk soc/actmon.c):
+//   0x00 GLB_STATUS, 0x04 GLB_PERIOD_CTRL
+//   device blocks at 0x80 + dev*0x40, fields:
+//     +0x00 ctrl   +0x04 upper_wmark  +0x08 lower_wmark  +0x0C init_avg
+//     +0x10 avg_upper +0x14 avg_lower +0x18 count_weight +0x1C count
+//     +0x20 avg_count +0x24 intr_status +0x28 ctrl2
+//
+// bdk derives load as count * 100 / (ACTMON_FREQ / (PERIOD_MS * WEIGHT)),
+// so a fully-busy sample period reads
+//   19200000/1000 * 20 * 5 = 1,920,000  ->  100.0 %
+//
+// We model the count from real emulated behaviour rather than a constant: the
+// BPMP is "active" whenever it is executing and "idle" while parked in a
+// FLOW_CTLR timed halt (bpmp_usleep / bpmp_msleep, tracked in bpmp_slept_us).
+// A payload that measures load while spinning therefore sees a high number,
+// and one that measures while sleeping sees a low one - which is exactly what
+// an ACTMON test is checking for.
+static constexpr uint32_t ACTMON_OFF_IN_SYSREG = 0x800;
+static constexpr uint32_t ACTMON_FULL_COUNT = 1920000; // 100.0 % for one period
+static constexpr int ACTMON_NDEV = 7;
+
+struct ActmonDev {
+  uint32_t ctrl = 0;
+  uint32_t init_avg = 0;
+  uint32_t count_weight = 0;
+  uint32_t regs[16] = {0};   // catch-all for the rest of the block
+  uint64_t last_us = 0;      // window start for the next count sample
+  uint64_t last_slept = 0;
+  uint32_t count = 0;
+  uint32_t avg_count = 0;
+  bool seeded = false;
+};
+static ActmonDev actmon_dev[ACTMON_NDEV];
+static uint32_t actmon_glb_period = 0;
+
+// Recompute count/avg_count for `d` from the activity in the window that has
+// elapsed since the last sample. Windows shorter than 200 us reuse the last
+// value so back-to-back reads stay coherent.
+static void actmon_sample(EmuState *state, ActmonDev &d) {
+  uint64_t now = state->emu_usec;
+  uint64_t slept = state->bpmp_slept_us;
+  if (!d.seeded) {
+    d.last_us = now;
+    d.last_slept = slept;
+    d.seeded = true;
+    return;
+  }
+  uint64_t window = now - d.last_us;
+  if (window < 200)
+    return;
+  uint64_t win_slept = slept - d.last_slept;
+  if (win_slept > window)
+    win_slept = window;
+  uint64_t active = window - win_slept;
+
+  uint32_t c = (uint32_t)((active * ACTMON_FULL_COUNT) / window);
+  d.count = c;
+  // avg_count trails count with a simple IIR (bdk asks for a 128-sample
+  // average via K_VAL; an exponential decay is a fair stand-in).
+  d.avg_count = d.avg_count ? (uint32_t)((d.avg_count * 3 + c) / 4) : c;
+  d.last_us = now;
+  d.last_slept = slept;
+}
+
+static uint32_t actmon_read(EmuState *state, uint32_t off) {
+  if (off == 0x00) { // GLB_STATUS - report the monitors that are enabled
+    uint32_t st = 0;
+    static const uint32_t act_bit[ACTMON_NDEV] = {
+        1u << 15, 1u << 14, 1u << 13, 1u << 12, 1u << 10, 1u << 9, 1u << 8};
+    for (int i = 0; i < ACTMON_NDEV; i++)
+      if (actmon_dev[i].ctrl & (1u << 31))
+        st |= act_bit[i];
+    return st;
+  }
+  if (off == 0x04)
+    return actmon_glb_period;
+
+  if (off >= 0x80 && off < 0x80 + ACTMON_NDEV * 0x40) {
+    int dev = (int)((off - 0x80) / 0x40);
+    uint32_t f = (off - 0x80) % 0x40;
+    ActmonDev &d = actmon_dev[dev];
+    switch (f) {
+    case 0x00: return d.ctrl;
+    case 0x0C: return d.init_avg;
+    case 0x18: return d.count_weight;
+    case 0x1C:
+      if (d.ctrl & (1u << 31)) actmon_sample(state, d);
+      return d.count;
+    case 0x20:
+      if (d.ctrl & (1u << 31)) actmon_sample(state, d);
+      return d.avg_count;
+    default: return d.regs[(f / 4) & 15];
+    }
+  }
+  return 0;
+}
+
+static void actmon_write(EmuState *state, uint32_t off, uint32_t val) {
+  if (off == 0x04) {
+    actmon_glb_period = val;
+    return;
+  }
+  if (off >= 0x80 && off < 0x80 + ACTMON_NDEV * 0x40) {
+    int dev = (int)((off - 0x80) / 0x40);
+    uint32_t f = (off - 0x80) % 0x40;
+    ActmonDev &d = actmon_dev[dev];
+    switch (f) {
+    case 0x00:
+      d.ctrl = val;
+      if (val & (1u << 31)) {
+        // Enabling the monitor starts a fresh sample window.
+        d.seeded = false;
+        d.count = 0;
+        d.avg_count = 0;
+        actmon_sample(state, d);
+      }
+      break;
+    case 0x0C: d.init_avg = val; break;
+    case 0x18: d.count_weight = val; break;
+    default: d.regs[(f / 4) & 15] = val; break;
+    }
+    return;
+  }
+}
+
 static uint32_t sysreg_read(EmuState *state, uint64_t addr) {
-  (void)state;
-  (void)addr;
+  uint32_t offset = (uint32_t)(addr - SYSREG_BASE);
+  if (offset >= ACTMON_OFF_IN_SYSREG)
+    return actmon_read(state, offset - ACTMON_OFF_IN_SYSREG);
   return 0;
 }
 
 static void sysreg_write(EmuState *state, uint64_t addr, uint32_t val) {
   uint32_t offset = (uint32_t)(addr - SYSREG_BASE);
-  (void)state;
+  if (offset >= ACTMON_OFF_IN_SYSREG) {
+    actmon_write(state, offset - ACTMON_OFF_IN_SYSREG, val);
+    return;
+  }
   printf("[sysreg] W: 0x%08X = 0x%08X\n", offset, val);
 }
 
