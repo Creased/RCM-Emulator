@@ -1062,6 +1062,15 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
       else
         result = 0x01F70000; // CARD_PRESENT | CD_STABLE | CD_LVL | DAT_LINE_LEVEL
     }
+    else if (offset == 0x28) {
+      // HOSTCTL. sdmmc_get_bus_width() reads this register directly to decide
+      // 1 / 4 / 8-bit (SDHCI_CTRL_4BITBUS = BIT(1), SDHCI_CTRL_8BITBUS =
+      // BIT(5)). It had no read handler at all, so every payload saw a 1-bit
+      // bus even after a successful 4-bit SD / 8-bit eMMC negotiation - and an
+      // eMMC HS400-vs-bus-width cross-check would call that a fault.
+      result = (base == SDMMC4_BASE) ? state->sdmmc4_hostctl
+                                     : state->sdmmc_hostctl;
+    }
     else if (offset == 0x2C)
       result = 0x0003; // SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_INT_STABLE
     else if (offset == 0x40)
@@ -1133,7 +1142,9 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
     if (offset == 0x00)
       sysad = val;
     if (offset == 0x28)
-      hostctl = val & 0x1E;
+      // 0x3E, not 0x1E: the old mask dropped SDHCI_CTRL_8BITBUS (BIT(5)), so
+      // an eMMC 8-bit bus could never be represented.
+      hostctl = val & 0x3E;
     if (offset == 0x2F) {
       // Software Reset. Clear immediately to signify completion.
       mmio_regs[base + 0x2C] &= ~(val << 24);
@@ -1231,6 +1242,18 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
           ext_csd[213] = (sec_cnt >> 8) & 0xFF;
           ext_csd[214] = (sec_cnt >> 16) & 0xFF;
           ext_csd[215] = (sec_cnt >> 24) & 0xFF;
+          // Capability/health bytes a diagnostic payload reports on. Values
+          // measured from the eMMC in a real Mariko; left at 0 these read as
+          // "feature not supported", which looks like a reduced-firmware
+          // replacement part.
+          ext_csd[503] = 0x01; // HPI_FEATURES: supported, CMD13 variant
+          ext_csd[231] = 0x55; // SEC_FEATURE_SUPPORT: secure erase/trim/sanitize
+          ext_csd[232] = 0x02; // TRIM_MULT
+          ext_csd[229] = 0x11; // SEC_TRIM_MULT (measured)
+          ext_csd[162] = 0x01; // RST_N_FUNCTION: permanently enabled
+          ext_csd[267] = 0x01; // PRE_EOL_INFO: normal
+          ext_csd[268] = 0x01; // DEVICE_LIFE_TIME_EST_TYP_A: 0-10%
+          ext_csd[269] = 0x01; // DEVICE_LIFE_TIME_EST_TYP_B: 0-10%
 
           uint64_t dma_addr = 0;
           // Tegra's SDMMC uses register 0x58 as the SDMA system-address
