@@ -276,6 +276,13 @@ struct EmuState {
         // RESERVED_SW bit 7 selects USB controller string in Hekate. Off = "USB2".
         fuse_at(0x1C0).store(0x00);
         fuse_at(0x1D8).store(0x20);         // FUSE_RESERVED_ODM4 (DRAM ID 4)
+        // FUSE_RESERVED_ODM7: burnt anti-downgrade fuses. A payload compares
+        // the popcount here against the HOS version of the pkg1 in BOOT0 and
+        // flags a mismatch as "pkg1 too new/old for this console". Left at 0
+        // it always looked like a downgraded console. 16 bits matches the
+        // HOS 13.2.1 pkg1 in the bundled BOOT0 dump; change it alongside the
+        // dump (real consoles measured: 23 burnt on HOS 22.0.0).
+        fuse_at(0x1E4).store(0x0000FFFF);   // FUSE_RESERVED_ODM7 (16 burnt)
         fuse_at(0x200).store(0x06);         // FUSE_OPT_VENDOR_CODE
         fuse_at(0x204).store(0x12);         // FUSE_OPT_FAB_CODE      ('I' = base36[18])
         // LOT_CODE_0 holds five base36 chars in 6-bit fields at bits 29:24,
