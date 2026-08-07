@@ -196,8 +196,8 @@ static void max77620_regs_init(EmuState *state) {
   uint32_t sd1_uv = mariko ? 1100000u : 1125000u;
   uint32_t sd2_uv = mariko ? 1325000u : 1350000u;
 
-  // SD0 idles at 1.050 V on a Mariko in RCM (measured).
-  max77620_regs[0x16] = (uint8_t)(((mariko ? 1050000u : 625000u) - 600000u) / 12500u);
+  // SD0 idle, measured: 1.050 V Mariko, 1.125 V Erista.
+  max77620_regs[0x16] = (uint8_t)(((mariko ? 1050000u : 1125000u) - 600000u) / 12500u);
   max77620_regs[0x17] = (uint8_t)((sd1_uv - 600000u) / 12500u);    // SD1
   max77620_regs[0x18] = (uint8_t)((sd2_uv - 600000u) / 12500u);    // SD2
   max77620_regs[0x19] = (uint8_t)((1800000u - 600000u) / 12500u);  // SD3
@@ -212,8 +212,8 @@ static void max77620_regs_init(EmuState *state) {
   // presents at that point, e.g. LDO6 (touch/ALS) only comes up when a probe
   // calls touch_power_on().
   //
-  // Voltages and states below are measured; the Erista column is not yet, so
-  // it keeps the previous defaults and stays all-on.
+  // Both columns are measured on real consoles now. Mariko brings up
+  // LDO0/2/4; Erista also has LDO7 (XUSB) up.
   struct LdoDef { uint8_t volt_reg; uint32_t uv; uint32_t step; bool on; };
   static const LdoDef ldos_mariko[] = {
       {0x23, 1200000, 25000, true },  // LDO0 display
@@ -227,15 +227,15 @@ static void max77620_regs_init(EmuState *state) {
       {0x33, 1000000, 50000, false},  // LDO8 XUSB/DP
   };
   static const LdoDef ldos_erista[] = {
-      {0x23, 1200000, 25000, true},   // LDO0 display
-      {0x25, 1050000, 25000, true},   // LDO1 XUSB/PCIE
-      {0x27, 1800000, 50000, true},   // LDO2 SDMMC1
-      {0x29, 3100000, 50000, true},   // LDO3 GC ASIC
-      {0x2B,  850000, 12500, true},   // LDO4 RTC
-      {0x2D, 1800000, 50000, true},   // LDO5 GC card
-      {0x2F, 2900000, 50000, true},   // LDO6 touch + ALS
-      {0x31, 1050000, 50000, true},   // LDO7 XUSB
-      {0x33, 1050000, 50000, true},   // LDO8 XUSB/DP
+      {0x23, 1200000, 25000, true },  // LDO0 display
+      {0x25, 1050000, 25000, false},  // LDO1 XUSB/PCIE
+      {0x27, 1800000, 50000, true },  // LDO2 SDMMC1
+      {0x29, 3100000, 50000, false},  // LDO3 GC ASIC
+      {0x2B, 1000000, 12500, true },  // LDO4 RTC (1.000 V here, 0.800 on Mariko)
+      {0x2D, 3100000, 50000, false},  // LDO5 GC card
+      {0x2F, 2800000, 50000, false},  // LDO6 touch + ALS
+      {0x31, 1050000, 50000, true },  // LDO7 XUSB - up on Erista, down on Mariko
+      {0x33, 1050000, 50000, false},  // LDO8 XUSB/DP
   };
   const LdoDef *ldos = mariko ? ldos_mariko : ldos_erista;
   for (int i = 0; i < 9; i++) {
@@ -252,15 +252,20 @@ static void max77620_regs_init(EmuState *state) {
   // PMIC GPIO config (0x36..0x3D) and the FPS masters (0x43..0x45), measured
   // on a real Mariko. These read back as 0 otherwise, which makes every pin
   // look like a low open-drain output and every FPS slot like 40 us.
-  if (mariko) {
-    static const uint8_t gpio_cfg[8] = {0x06, 0x00, 0x00, 0x00,
-                                        0x01, 0x02, 0x02, 0x02};
+  {
+    // GPIO1 idles high on Erista and low on Mariko; everything else matches.
+    static const uint8_t gpio_mariko[8] = {0x06, 0x00, 0x00, 0x00,
+                                           0x01, 0x02, 0x02, 0x02};
+    static const uint8_t gpio_erista[8] = {0x06, 0x06, 0x00, 0x00,
+                                           0x01, 0x02, 0x02, 0x02};
+    const uint8_t *gpio_cfg = mariko ? gpio_mariko : gpio_erista;
     for (int i = 0; i < 8; i++)
       max77620_regs[0x36 + i] = gpio_cfg[i];
-    max77620_regs[0x43] = 0x28;   // FPS0: 1280 us slot
-    max77620_regs[0x44] = 0x2A;   // FPS1: 1280 us slot, EN_SRC 1
-    max77620_regs[0x45] = 0x28;   // FPS2: 1280 us slot
-    // ONOFFCNFG2 wake-source mask, measured: POWER | ACOK | MBATT | ALARM1/2.
+    // FPS master config. TIME_PERIOD is 5 (1280 us) on Mariko and 7 on Erista.
+    max77620_regs[0x43] = mariko ? 0x28 : 0x38;   // FPS0
+    max77620_regs[0x44] = mariko ? 0x2A : 0x3A;   // FPS1, EN_SRC 1
+    max77620_regs[0x45] = mariko ? 0x28 : 0x38;   // FPS2
+    // ONOFFCNFG2 wake-source mask: POWER | ACOK | MBATT | ALARM1/2.
     max77620_regs[0x42] = 0x1F;
   }
 }
@@ -945,10 +950,10 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
   // Measured on a real Mariko: 0x00012127 (chip 0x21, major 2, minor 1).
   // The old 0x20 / 0x10 carried only the major nibble, so the chip-ID byte
   // read back as 0x00 and payloads printed "Chip ID : 0x00".
-  // The Erista value keeps the same shape with major 1; its minor rev is not
-  // measured yet.
+  // Both measured on real consoles: Mariko 0x00012127 (major 2, minor 1),
+  // Erista 0x00022117 (major 1, minor 2).
   if (addr == APB_MISC_BASE + 0x804)
-    return state->is_mariko.load() ? 0x00012127u : 0x00012117u;
+    return state->is_mariko.load() ? 0x00012127u : 0x00022117u;
 
   // UART
   if (addr >= 0x70006000 && addr < 0x70006500) {
@@ -1807,28 +1812,49 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
   // The lock bit still has to follow an ENABLE the payload writes itself,
   // otherwise a clock_enable_pll* poll loop would spin forever - so a written
   // ENABLE always comes back with LOCK set.
+  //   PLL       Mariko            Erista
+  //   PLLC 0x80  down              down
+  //   PLLM 0x90  down              ENABLED, not locked (DRAM runs off PLLP)
+  //   PLLP 0xA0  enabled + locked  enabled + locked
+  //   PLLA 0xB0  down              down
+  //   PLLU 0xC0  down              enabled + locked
+  //   PLLD 0xD0  enabled + locked  enabled + locked
+  //   PLLX/D2/DP/RE               down on both
   switch (offset) {
-  case 0x80: case 0x90: case 0xB0: case 0xC0:
-  case 0xE0: case 0xE8: case 0x4B8: case 0x4C4: {
+  case 0x80: case 0xB0: case 0xE0: case 0xE8:
+  case 0x4B8: case 0x4C4: {
     uint32_t w = mmio_regs.count(addr) ? mmio_regs[addr] : 0;
     if (w & (1u << 30))
       return w | (1u << 27);          // payload brought it up -> locked
-    return mariko ? w                 // measured: down
-                  : ((1u << 30) | (1u << 27)); // Erista: not measured yet
+    return w;                          // measured: down on both
   }
-  case 0xA0: // PLLP_BASE
-    return mariko ? 0x48115408u : ((1u << 30) | (1u << 27));
-  case 0xD0: // PLLD_BASE - up on a real console
+  case 0x90: { // PLLM
+    uint32_t w = mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+    if (w & (1u << 30))
+      return w | (1u << 27);
+    // Erista leaves PLLM enabled but unlocked at this point; Mariko has it off.
+    return mariko ? 0u : (1u << 30);
+  }
+  case 0xC0: { // PLLU
+    uint32_t w = mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+    if (w & (1u << 30))
+      return w | (1u << 27);
+    return mariko ? 0u : ((1u << 30) | (1u << 27));
+  }
+  case 0xA0: // PLLP_BASE - same value on both
+    return 0x48115408u;
+  case 0xD0: // PLLD_BASE - up on both
     return (1u << 30) | (1u << 27);
   }
 
   // Informational clock registers, measured on a real Mariko. These read back
   // as 0 otherwise, which makes the whole clock page look dead.
-  if (mariko) {
+  {
     switch (offset) {
     case 0xA4:  return 0x00000003; // PLLP_OUTA
     case 0x68:  return 0x00005C00; // PLLP_OUTB
-    case 0x28:  return 0x20003333; // SCLK_BURST_POLICY
+    // SCLK_BURST differs slightly by generation (measured).
+    case 0x28:  return mariko ? 0x20003333u : 0x20003330u;
     case 0x2C:  return 0x80000000; // SUPER_SCLK_DIVIDER
     case 0x30:  return 0x00000002; // CLK_SYSTEM_RATE
     case 0x14:  return 0x030180C1; // CLK_OUT_ENB_H
@@ -1859,16 +1885,14 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
                         ? mmio_regs[CLK_RST_BASE + 0x60] : 0;
     uint32_t src = (cntl >> 14) & 0x1FF;   // PTO_SRC_SEL
     uint32_t khz = 0;
-    if (mariko) {
-      switch (src) {
-      case 0x1C: khz = 407971; break;  // SCLK / BPMP
-      case 0x24: khz = 203991; break;  // EMC (DRAM)
-      case 0x23: khz = 199673; break;  // SDMMC4 (eMMC)
-      case 0x20: khz = 199671; break;  // SDMMC1 (SD)
-      case 0x12: khz = 0;      break;  // CCLK_G - A57 cluster is off in RCM
-      case 0x43: khz = 0;      break;  // PLLP_OBS - not routed
-      default:   khz = 0;      break;
-      }
+    switch (src) {
+    case 0x1C: khz = mariko ? 407971 : 407980; break; // SCLK / BPMP
+    case 0x24: khz = mariko ? 203991 : 204001; break; // EMC (DRAM)
+    case 0x23: khz = mariko ? 199673 : 199677; break; // SDMMC4 (eMMC)
+    case 0x20: khz = mariko ? 199671 : 199694; break; // SDMMC1 (SD)
+    case 0x12: khz = 0; break;   // CCLK_G - A57 cluster is off in RCM
+    case 0x43: khz = 0; break;   // PLLP_OBS - not routed
+    default:   khz = 0; break;
     }
     // Invert bdk's maths; BUSY is always clear because we answer instantly.
     return (uint32_t)(((uint64_t)khz * 1000ull * 16ull) / 32768ull) & 0xFFFFFF;

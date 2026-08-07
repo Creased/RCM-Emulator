@@ -167,7 +167,7 @@ struct EmuState {
     // version) differs by generation - but only Mariko is measured so far.
     std::atomic<uint8_t>  pmic_silicon_rev{0x5B};    // MAX77620 CID3
     std::atomic<uint8_t>  pmic_es_rev{0x81};         // MAX77620 CID5
-    std::atomic<uint8_t>  cpu_pmic_version{0x1C};    // MAX77621 CHIPID1 (unverified)
+    std::atomic<uint8_t>  cpu_pmic_version{0x12};    // MAX77621 CHIPID1 (measured, Erista)
 
     // SD card insertion (GPIO Port Z bit 1 = 0 means inserted).
     std::atomic<bool>     sd_inserted{true};
