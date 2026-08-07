@@ -2329,7 +2329,7 @@ static void hook_mmio_write(uc_engine *uc, uc_mem_type type, uint64_t address,
             (address >= I2C1_BASE && address < I2C1_BASE + 0x1000) ||
             (address >= I2C5_BASE && address < I2C5_BASE + 0x1000) ||
             (address >= SE_BASE && address < SE_BASE + SE_SIZE) ||
-            (address >= RTC_BASE && address < RTC_BASE + 0x1000))) {
+            (address >= RTC_BASE && address < RTC_BASE + RTC_SIZE))) {
         printf("[mmio] W: 0x%08llX = 0x%08X (PC=0x%08X)\n",
                (unsigned long long)address, val, pc);
         fflush(stdout);

@@ -74,7 +74,12 @@ constexpr uint64_t PWM_SIZE = 0x1000;
 
 // RTC
 constexpr uint64_t RTC_BASE = 0x7000E000;
-constexpr uint64_t RTC_SIZE = 0x1000;
+// 0x400, NOT 0x1000: the PMC block starts at 0x7000E400, immediately after the
+// RTC. A 0x1000-long RTC window swallowed the whole PMC range, and because the
+// RTC branch is tested first in the MMIO dispatch, every PMC access (reset
+// status, scratch registers, and the MAIN_RST reboot write) silently went to
+// the RTC handler instead.
+constexpr uint64_t RTC_SIZE = 0x400;
 
 // PMC (Power Management Controller)
 constexpr uint64_t PMC_BASE = 0x7000E400;
