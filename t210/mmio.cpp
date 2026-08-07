@@ -163,32 +163,71 @@ static void max77620_regs_init(EmuState *state) {
   uint32_t sd1_uv = mariko ? 1100000u : 1125000u;
   uint32_t sd2_uv = mariko ? 1325000u : 1350000u;
 
-  max77620_regs[0x16] = (uint8_t)((625000u - 600000u) / 12500u);   // SD0
+  // SD0 idles at 1.050 V on a Mariko in RCM (measured).
+  max77620_regs[0x16] = (uint8_t)(((mariko ? 1050000u : 625000u) - 600000u) / 12500u);
   max77620_regs[0x17] = (uint8_t)((sd1_uv - 600000u) / 12500u);    // SD1
   max77620_regs[0x18] = (uint8_t)((sd2_uv - 600000u) / 12500u);    // SD2
   max77620_regs[0x19] = (uint8_t)((1800000u - 600000u) / 12500u);  // SD3
   max77620_regs[0x14] = 0x00; // STATSD: 0 = every SD rail in regulation
 
-  struct LdoDef { uint8_t volt_reg; uint32_t uv; uint32_t step; };
-  static const LdoDef ldos[] = {
-      {0x23, 1200000, 25000}, // LDO0 display
-      {0x25, 1050000, 25000}, // LDO1 XUSB/PCIE
-      {0x27, 1800000, 50000}, // LDO2 SDMMC1
-      {0x29, 3100000, 50000}, // LDO3 GC ASIC
-      {0x2B,  850000, 12500}, // LDO4 RTC
-      {0x2D, 1800000, 50000}, // LDO5 GC card
-      {0x2F, 2900000, 50000}, // LDO6 touch + ALS
-      {0x31, 1050000, 50000}, // LDO7 XUSB
-      {0x33, 1050000, 50000}, // LDO8 XUSB/DP
+  // Per-rail configured voltage and whether the rail is actually UP in RCM.
+  //
+  // The `on` column matters: a real Mariko boots with most LDOs DOWN - only
+  // the display (LDO0), SDMMC1 (LDO2) and RTC (LDO4) rails are up before HOS
+  // or a payload enables the rest. Modelling every LDO as on (the old
+  // behaviour) meant the emulator judged rail voltages a real console never
+  // presents at that point, e.g. LDO6 (touch/ALS) only comes up when a probe
+  // calls touch_power_on().
+  //
+  // Voltages and states below are measured; the Erista column is not yet, so
+  // it keeps the previous defaults and stays all-on.
+  struct LdoDef { uint8_t volt_reg; uint32_t uv; uint32_t step; bool on; };
+  static const LdoDef ldos_mariko[] = {
+      {0x23, 1200000, 25000, true },  // LDO0 display
+      {0x25, 1050000, 25000, false},  // LDO1 XUSB/PCIE
+      {0x27, 1800000, 50000, true },  // LDO2 SDMMC1
+      {0x29, 3100000, 50000, false},  // LDO3 GC ASIC
+      {0x2B,  800000, 12500, true },  // LDO4 RTC
+      {0x2D, 3100000, 50000, false},  // LDO5 GC card
+      {0x2F, 2800000, 50000, false},  // LDO6 touch + ALS
+      {0x31, 1000000, 50000, false},  // LDO7 XUSB
+      {0x33, 1000000, 50000, false},  // LDO8 XUSB/DP
   };
-  for (const LdoDef &l : ldos) {
+  static const LdoDef ldos_erista[] = {
+      {0x23, 1200000, 25000, true},   // LDO0 display
+      {0x25, 1050000, 25000, true},   // LDO1 XUSB/PCIE
+      {0x27, 1800000, 50000, true},   // LDO2 SDMMC1
+      {0x29, 3100000, 50000, true},   // LDO3 GC ASIC
+      {0x2B,  850000, 12500, true},   // LDO4 RTC
+      {0x2D, 1800000, 50000, true},   // LDO5 GC card
+      {0x2F, 2900000, 50000, true},   // LDO6 touch + ALS
+      {0x31, 1050000, 50000, true},   // LDO7 XUSB
+      {0x33, 1050000, 50000, true},   // LDO8 XUSB/DP
+  };
+  const LdoDef *ldos = mariko ? ldos_mariko : ldos_erista;
+  for (int i = 0; i < 9; i++) {
+    const LdoDef &l = ldos[i];
     uint8_t code = (uint8_t)(((l.uv - 800000u) / l.step) & 0x3F);
     max77620_regs[l.volt_reg] = (uint8_t)(code | (3u << 6)); // POWER_MODE_NORMAL
-    max77620_regs[l.volt_reg + 1] = BIT(3) | BIT(2);         // CFG2: POK | MPOK
+    // CFG2 POK is what max77620_regulator_get_status() reads for an LDO.
+    max77620_regs[l.volt_reg + 1] = l.on ? (BIT(3) | BIT(2)) : 0x00;
   }
   // SD CFG1 registers (0x1D..0x20): flag the rails as power-OK too.
   for (uint8_t r = 0x1D; r <= 0x20; r++)
     max77620_regs[r] = BIT(1); // MPOK
+
+  // PMIC GPIO config (0x36..0x3D) and the FPS masters (0x43..0x45), measured
+  // on a real Mariko. These read back as 0 otherwise, which makes every pin
+  // look like a low open-drain output and every FPS slot like 40 us.
+  if (mariko) {
+    static const uint8_t gpio_cfg[8] = {0x06, 0x00, 0x00, 0x00,
+                                        0x01, 0x02, 0x02, 0x02};
+    for (int i = 0; i < 8; i++)
+      max77620_regs[0x36 + i] = gpio_cfg[i];
+    max77620_regs[0x43] = 0x28;   // FPS0: 1280 us slot
+    max77620_regs[0x44] = 0x2A;   // FPS1: 1280 us slot, EN_SRC 1
+    max77620_regs[0x45] = 0x28;   // FPS2: 1280 us slot
+  }
 }
 
 // ---- Packet-mode I2C (BM92T36 USB-PD on I2C_1 @ 0x18) ----
@@ -440,9 +479,10 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
       // EN_CTRL: in RCM the CPU/GPU rails are still dormant (HOS brings them
       // up), so report all phases disabled - that is the true cold state.
       case 0x06: return 0x00;
-      case 0x23: return vout(1000); // M1 GPU
-      case 0x25: return vout(1100); // M3 DRAM (VDD2)
-      case 0x26: return vout(1000); // M4 CPU
+      // Measured on a real Mariko while dormant in RCM.
+      case 0x23: return vout(650);  // M1 GPU
+      case 0x25: return vout(600);  // M3 DRAM (VDD2)
+      case 0x26: return vout(600);  // M4 CPU
       default:   return 0;
       }
     }
@@ -803,8 +843,13 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
   // Bits  3:0 = minor.
   // Hekate's hw_get_chip_id() does `(HIDREV >> 4) & 0xF` and compares against
   // GP_HIDREV_MAJOR_T210B01 (=2) to decide h_cfg.t210b01.
+  // Measured on a real Mariko: 0x00012127 (chip 0x21, major 2, minor 1).
+  // The old 0x20 / 0x10 carried only the major nibble, so the chip-ID byte
+  // read back as 0x00 and payloads printed "Chip ID : 0x00".
+  // The Erista value keeps the same shape with major 1; its minor rev is not
+  // measured yet.
   if (addr == APB_MISC_BASE + 0x804)
-    return state->is_mariko.load() ? 0x20 : 0x10;
+    return state->is_mariko.load() ? 0x00012127u : 0x00012117u;
 
   // UART
   if (addr >= 0x70006000 && addr < 0x70006500) {
@@ -882,7 +927,8 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
   if (addr >= 0x7000FC00 && addr < 0x7000FD00) {
     uint32_t offset = (uint32_t)(addr - 0x7000FC00);
     if (offset == 0x80) // KFUSE_STATE
-      return (1u << 16) | (1u << 17); // DONE | CRCPASS
+      // DONE | CRCPASS | CURBLOCK=48, as measured on real silicon (0x00030030).
+      return (1u << 16) | (1u << 17) | 48u;
     if (offset == 0x88) // KFUSE_KEYADDR
       return g_kfuse_keyaddr;
     if (offset == 0x8C) { // KFUSE_KEYS
