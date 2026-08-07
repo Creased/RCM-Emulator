@@ -148,15 +148,24 @@ static uint32_t i2c_cnfg_reg[2] = {0, 0};
 static uint8_t max77620_regs[256];
 static bool max77620_regs_ready = false;
 
-static void max77620_regs_init() {
+static void max77620_regs_init(EmuState *state) {
   if (max77620_regs_ready)
     return;
   max77620_regs_ready = true;
 
-  // SD rails: uv_default 625 / 1125 / 1325 / 1800 mV.
+  // Two SD rails differ per SoC generation, measured on real consoles:
+  //   SD1 (DRAM)    1.125 V Erista (LPDDR4)  vs 1.100 V Mariko (LPDDR4X)
+  //   SD2 (LDO src) 1.350 V Erista           vs 1.325 V Mariko
+  // bdk's _pmic_regulators lists 1.125/1.325 as uv_default for both, which is
+  // not what either console actually runs; model the measured values so the
+  // emulator can't "confirm" a wrong expectation.
+  bool mariko = state && state->pmic_otp.load() == 0x53;
+  uint32_t sd1_uv = mariko ? 1100000u : 1125000u;
+  uint32_t sd2_uv = mariko ? 1325000u : 1350000u;
+
   max77620_regs[0x16] = (uint8_t)((625000u - 600000u) / 12500u);   // SD0
-  max77620_regs[0x17] = (uint8_t)((1125000u - 600000u) / 12500u);  // SD1
-  max77620_regs[0x18] = (uint8_t)((1325000u - 600000u) / 12500u);  // SD2
+  max77620_regs[0x17] = (uint8_t)((sd1_uv - 600000u) / 12500u);    // SD1
+  max77620_regs[0x18] = (uint8_t)((sd2_uv - 600000u) / 12500u);    // SD2
   max77620_regs[0x19] = (uint8_t)((1800000u - 600000u) / 12500u);  // SD3
   max77620_regs[0x14] = 0x00; // STATSD: 0 = every SD rail in regulation
 
@@ -384,7 +393,7 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
     }
     // MAX77620 PMIC (slave 0x3C on I2C_5).
     if (on_i2c5 && i2c_slave_addr == 0x3C) {
-      max77620_regs_init();
+      max77620_regs_init(state);
       switch (i2c_reg_addr) {
       case 0x15: { // ONOFFSTAT — EN0 bit reflects power button
         return state->btn_power.load() ? (1 << 2) : 0;
@@ -577,7 +586,7 @@ void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
     uint32_t size = ((val >> 1) & 7) + 1;
     if ((val & (1u << 9)) && is_write && size >= 2 && on_i2c5 &&
         i2c_slave_addr == MAX77620_I2C_ADDR) {
-      max77620_regs_init();
+      max77620_regs_init(state);
       max77620_regs[i2c_cmd_data1 & 0xFF] = (uint8_t)((i2c_cmd_data1 >> 8) & 0xFF);
     }
     break;
