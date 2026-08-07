@@ -36,7 +36,7 @@
 
 namespace {
 
-enum class Key { Power, VolUp, VolDown };
+enum class Key { Power, VolUp, VolDown, Uart, UartFile };
 
 struct Event {
   uint64_t at_us = 0;   // press time
@@ -44,6 +44,7 @@ struct Event {
   Key key = Key::Power;
   bool pressed = false;
   bool released = false;
+  std::string data;      // UART / UARTFILE payload
 };
 
 std::vector<Event> g_events;
@@ -57,6 +58,8 @@ const char *key_name(Key k) {
   switch (k) {
   case Key::Power: return "POWER";
   case Key::VolUp: return "VOL+";
+  case Key::Uart: return "UART";
+  case Key::UartFile: return "UARTFILE";
   default: return "VOL-";
   }
 }
@@ -72,7 +75,30 @@ bool parse_key(const std::string &tok, Key *out) {
   if (s == "VOL_UP" || s == "VOLUP" || s == "UP" || s == "U") {
     *out = Key::VolUp; return true;
   }
+  // Feed bytes into the UART_B receive FIFO rather than pressing a button.
+  // UART pushes the rest of the line literally (with \n / \r escapes);
+  // UARTFILE pushes a file's raw contents, for binary protocol work.
+  if (s == "UART") { *out = Key::Uart; return true; }
+  if (s == "UARTFILE") { *out = Key::UartFile; return true; }
   return false;
+}
+
+// Expand the small escape set we accept in a literal UART payload.
+std::string unescape(const std::string &in) {
+  std::string out;
+  for (size_t i = 0; i < in.size(); i++) {
+    if (in[i] == '\\' && i + 1 < in.size()) {
+      char c = in[++i];
+      if (c == 'n') { out.push_back('\n'); continue; }
+      if (c == 'r') { out.push_back('\r'); continue; }
+      if (c == 't') { out.push_back('\t'); continue; }
+      if (c == '0') { out.push_back('\0'); continue; }
+      out.push_back(c);
+      continue;
+    }
+    out.push_back(in[i]);
+  }
+  return out;
 }
 
 // Split on newlines, ',' and ';'. Strip '#' comments.
@@ -140,6 +166,24 @@ bool parse_text(const std::string &text) {
       return false;
     }
 
+    if (ev.key == Key::Uart || ev.key == Key::UartFile) {
+      // Everything after the keyword is the payload; keep interior spacing.
+      size_t kpos = raw.find(tok[1]);
+      std::string rest = (kpos == std::string::npos)
+                             ? std::string()
+                             : raw.substr(kpos + tok[1].size());
+      size_t b = rest.find_first_not_of(" \t");
+      rest = (b == std::string::npos) ? std::string() : rest.substr(b);
+      while (!rest.empty() && (rest.back() == ' ' || rest.back() == '\t' ||
+                               rest.back() == '\r'))
+        rest.pop_back();
+      ev.data = (ev.key == Key::Uart) ? unescape(rest) : rest;
+      ev.until_us = ev.at_us;   // instantaneous, nothing to release
+      prev_release_us = ev.at_us;
+      g_events.push_back(ev);
+      continue;
+    }
+
     uint64_t hold_ms = (tok.size() >= 3) ? strtoull(tok[2].c_str(), nullptr, 10)
                                          : kDefaultHoldMs;
     if (hold_ms == 0) hold_ms = kDefaultHoldMs;
@@ -191,6 +235,41 @@ void input_script_tick(EmuState &state) {
     Event &ev = g_events[i];
     // Events are ordered by press time; stop at the first future one.
     if (!ev.pressed && now < ev.at_us) break;
+
+    // UART events are one-shot: push the bytes into UART_B's receive FIFO
+    // (index 1 = UART_B, the port payloads use for their debug console) and
+    // retire the event immediately.
+    if (ev.key == Key::Uart || ev.key == Key::UartFile) {
+      if (now >= ev.at_us && !ev.pressed) {
+        std::string bytes = ev.data;
+        if (ev.key == Key::UartFile) {
+          bytes.clear();
+          if (FILE *f = fopen(ev.data.c_str(), "rb")) {
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+              bytes.append(buf, n);
+            fclose(f);
+          } else {
+            fprintf(stderr, "[input-script] cannot open UARTFILE '%s'\n",
+                    ev.data.c_str());
+          }
+        }
+        for (unsigned char ch : bytes)
+          state.uart_rx_fifo[1].push_back(ch);
+        ev.pressed = ev.released = true;
+        printf("[input-script] UART_B <- %zu byte(s) @%llu us (%zu/%zu)\n",
+               bytes.size(), (unsigned long long)now, i + 1, g_events.size());
+        fflush(stdout);
+        if (i == g_done) {
+          g_done++;
+          if (g_done == g_events.size())
+            printf("[input-script] sequence complete\n");
+        }
+        continue;
+      }
+      break;
+    }
 
     std::atomic<bool> *btn = (ev.key == Key::Power)   ? &state.btn_power
                              : (ev.key == Key::VolUp) ? &state.btn_vol_up
