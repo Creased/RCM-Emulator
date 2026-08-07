@@ -291,6 +291,62 @@ static void bm92t36_fill_rx(EmuState *state, uint8_t reg, uint8_t *buf, uint32_t
     }
 }
 
+// ==================== I2C_2: Rohm BH1730 ambient light sensor ============
+//
+// Slave 0x29 on GEN2_I2C. bdk's als.c powers LDO6, brings up I2C_2 and reads
+// the part/revision byte at register 0x12; the visible and IR ADC results come
+// from the DATA0/DATA1 register pairs (little-endian, low byte first).
+//
+// Every BH1730 register access carries the command magic (0x80) in the address
+// byte - BH1730_ADDR(reg) = 0x80 | reg - so the low 7 bits select the register.
+//
+// Without this bus modelled the ALS read back 0x00, and a payload correctly
+// concluded "no chip / I2C fault" on a console that has a perfectly good
+// sensor. Defaults are what a real Mariko reported in a lit room.
+#define BH1730_I2C_ADDR   0x29
+#define BH1730_ID_REG     0x12
+#define BH1730_DATA0LOW   0x14   // visible
+#define BH1730_DATA1LOW   0x16   // IR
+
+static uint8_t  i2c2_slave = 0;
+static uint8_t  i2c2_reg   = 0;
+static uint32_t i2c2_cnfg  = 0;
+
+uint32_t i2c2_read(EmuState *state, uint64_t addr) {
+  uint32_t offset = (uint32_t)(addr - I2C2_BASE);
+  switch (offset) {
+  case 0x00: return i2c2_cnfg;   // CNFG reads back (bdk RMWs it to set GO)
+  case 0x1C: return 0;           // STATUS: transfer complete, no NACK
+  case 0x8C: return 0;           // CONFIG_LOAD complete
+  case 0x68: return (1 << 11);   // INT_STATUS: BUS_CLEAR_DONE
+  case I2C_CMD_DATA1: {
+    if (i2c2_slave != BH1730_I2C_ADDR)
+      return 0;
+    uint16_t vis = state->als_visible.load();
+    uint16_t ir  = state->als_ir.load();
+    switch (i2c2_reg & 0x7F) {   // strip the command magic
+    case BH1730_ID_REG:       return state->als_part_id.load();
+    case BH1730_DATA0LOW:     return vis & 0xFF;
+    case BH1730_DATA0LOW + 1: return (vis >> 8) & 0xFF;
+    case BH1730_DATA1LOW:     return ir & 0xFF;
+    case BH1730_DATA1LOW + 1: return (ir >> 8) & 0xFF;
+    default:                  return 0;
+    }
+  }
+  default: return 0;
+  }
+}
+
+void i2c2_write(EmuState *state, uint64_t addr, uint32_t val) {
+  (void)state;
+  switch ((uint32_t)(addr - I2C2_BASE)) {
+  case 0x00:            i2c2_cnfg  = val; break;
+  case I2C_CMD_ADDR0:   i2c2_slave = (val >> 1) & 0x7F; break;
+  case I2C_CMD_DATA1:   i2c2_reg   = val & 0xFF; break;
+  default: break;
+  }
+}
+
 // Forward decl: the "normal" (CMD_DATA1) register model, reused below so both
 // I2C transfer styles see identical device state.
 static uint32_t i2c_device_reg_read(EmuState *state, bool on_i2c5, uint8_t slave,
@@ -2345,6 +2401,9 @@ static void hook_mmio_read(uc_engine *uc, uc_mem_type type, uint64_t address,
       result = i2s_read(state, address);
     } else if (address >= RTC_BASE && address < RTC_BASE + RTC_SIZE) {
       result = rtc_read(state, address);
+    } else if (address >= I2C2_BASE && address < I2C2_BASE + I2C2_SIZE) {
+      // I²C2 / BH1730 ambient light sensor (slave 0x29).
+      result = i2c2_read(state, address);
     } else if (address >= I2C3_BASE && address < I2C3_BASE + I2C3_SIZE) {
       // I²C3 / STMFTS touchscreen (slave 0x49). Must be tested before the I²C1
       // branch, which would otherwise swallow the I²C3 page.
@@ -2456,6 +2515,8 @@ static void hook_mmio_write(uc_engine *uc, uc_mem_type type, uint64_t address,
       i2s_write(state, address, val);
     } else if (address >= RTC_BASE && address < RTC_BASE + RTC_SIZE) {
       rtc_write(state, address, val);
+    } else if (address >= I2C2_BASE && address < I2C2_BASE + I2C2_SIZE) {
+      i2c2_write(state, address, val);
     } else if (address >= I2C3_BASE && address < I2C3_BASE + I2C3_SIZE) {
       i2c3_write(state, address, val);
     } else if (address >= I2C1_BASE && address < I2C1_BASE + 0x100) {
@@ -2729,6 +2790,7 @@ void mmio_init(uc_engine *uc, EmuState *state) {
       {MC_BASE, MC_SIZE},
       {DISPLAY_A_BASE, DISPLAY_SIZE},
       {DSI_BASE, DSI_SIZE},
+      {I2C2_BASE, I2C2_SIZE},
       {SOC_THERM_BASE, SOC_THERM_SIZE},
       {MIPI_CAL_BASE, MIPI_CAL_SIZE},
       {SOR_BASE, SOR_SIZE},

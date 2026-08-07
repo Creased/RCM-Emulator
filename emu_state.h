@@ -197,6 +197,13 @@ struct EmuState {
     std::atomic<uint8_t>  emmc_cid_month{6};             // 1-12
     std::atomic<uint16_t> emmc_cid_year{2017};           // 2013-2025 (Hekate caps at 2025: see config_window.cpp)
 
+    // Ambient light sensor (Rohm BH1730, I2C2 @ 0x29). Defaults are what a
+    // real Mariko reported in a lit room; part id 0x71 is the measured value
+    // a payload checks to decide the sensor is present at all.
+    std::atomic<uint8_t>  als_part_id{0x71};
+    std::atomic<uint16_t> als_visible{128};   // DATA0 counts
+    std::atomic<uint16_t> als_ir{21};         // DATA1 counts
+
     // SoC thermal sensor (TMP451, I2C5 @ 0x4C).
     std::atomic<int16_t>  soc_temp_c10{420};        // remote channel (SoC die): °C * 10
     std::atomic<int16_t>  pcb_temp_c10{350};        // local channel (PCB):     °C * 10

@@ -63,6 +63,8 @@ constexpr uint64_t UART_SIZE   = 0x1000;
 // I2C1=0x0, I2C2=0x400, I2C3=0x500, I2C4=0x700, I2C5=0x1000, I2C6=0x1100
 // All measured from APB I2C base 0x7000C000.
 constexpr uint64_t I2C1_BASE = 0x7000C000;
+constexpr uint64_t I2C2_BASE = 0x7000C400; // GEN2_I2C, Rohm BH1730 ALS at slave 0x29
+constexpr uint64_t I2C2_SIZE = 0x100;
 constexpr uint64_t I2C3_BASE = 0x7000C500; // GEN3_I2C, used by STMFTS touchscreen at slave 0x49
 constexpr uint64_t I2C5_BASE = 0x7000D000;
 constexpr uint64_t I2C_SIZE  = 0x1000;
