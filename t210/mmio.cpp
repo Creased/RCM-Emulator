@@ -1662,14 +1662,96 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
   // simulate "always locked + always enabled" so the polls return immediately.
   // Offsets: PLLC=0x80, PLLM=0x90, PLLP=0xA0, PLLA=0xB0, PLLU=0xC0, PLLD=0xD0,
   //          PLLX=0xE0, PLLE=0xE8, PLLD2=0x4B8, PLLREFE=0x4C4.
+  bool mariko = state && state->pmic_otp.load() == 0x53;
+
+  // On a real console in RCM most PLLs are DOWN - measured on a Mariko, only
+  // PLLP (the BPMP source) and PLLD are enabled and locked; PLLC/M/A/U/X/D2/
+  // DP/RE all read disabled. Reporting everything as locked made a payload's
+  // PLL page pure fiction.
+  //
+  // The lock bit still has to follow an ENABLE the payload writes itself,
+  // otherwise a clock_enable_pll* poll loop would spin forever - so a written
+  // ENABLE always comes back with LOCK set.
   switch (offset) {
-  case 0x80: case 0x90: case 0xA0: case 0xB0:
-  case 0xC0: case 0xD0: case 0xE0: case 0xE8:
-  case 0x4B8: case 0x4C4:
-    return (1u << 30) | (1u << 27); // ENABLE | LOCK
+  case 0x80: case 0x90: case 0xB0: case 0xC0:
+  case 0xE0: case 0xE8: case 0x4B8: case 0x4C4: {
+    uint32_t w = mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+    if (w & (1u << 30))
+      return w | (1u << 27);          // payload brought it up -> locked
+    return mariko ? w                 // measured: down
+                  : ((1u << 30) | (1u << 27)); // Erista: not measured yet
   }
+  case 0xA0: // PLLP_BASE
+    return mariko ? 0x48115408u : ((1u << 30) | (1u << 27));
+  case 0xD0: // PLLD_BASE - up on a real console
+    return (1u << 30) | (1u << 27);
+  }
+
+  // Informational clock registers, measured on a real Mariko. These read back
+  // as 0 otherwise, which makes the whole clock page look dead.
+  if (mariko) {
+    switch (offset) {
+    case 0xA4:  return 0x00000003; // PLLP_OUTA
+    case 0x68:  return 0x00005C00; // PLLP_OUTB
+    case 0x28:  return 0x20003333; // SCLK_BURST_POLICY
+    case 0x2C:  return 0x80000000; // SUPER_SCLK_DIVIDER
+    case 0x30:  return 0x00000002; // CLK_SYSTEM_RATE
+    case 0x14:  return 0x030180C1; // CLK_OUT_ENB_H
+    case 0x280: return 0x23024780; // CLK_OUT_ENB_X
+    // _L and _U carry the SDMMC clock-enable bits this emulator's storage
+    // model depends on. _L already has SDMMC1 (bit 14) set on real silicon;
+    // _U needs SDMMC4 (bit 15) forced on, which the measured value does not
+    // have - the console had not brought eMMC up at that instant.
+    case 0x10:  return 0x9802D1B0;
+    case 0x18:  return 0x01F00200 | (1u << 15);
+    }
+  }
+
+  // ---- PTO (Peripheral Test Output) clock counter ----
+  //
+  // bdk's clock_get_dev_freq() measures a clock by selecting it with
+  // PTO_CLK_CNT_CNTL (0x60), counting its edges over a 16-tick 32768 Hz
+  // window, then reading PTO_CLK_CNT_STATUS (0x64): bit 31 = BUSY, bits 23:0
+  // = the count, and freq_khz = cnt * 32768 / 16 / 1000 (i.e. cnt * 2.048).
+  //
+  // Unmodelled, STATUS read 0 and every rate on a payload's clock page came
+  // out "(idle / not clocked)". Return counts that decode to the rates a real
+  // Mariko reports in RCM; anything not measured stays 0, which is the honest
+  // "not running" answer (CCLK_G really is idle - the A57s are off - and
+  // PLLP_OBS is not routed).
+  if (offset == 0x64) {
+    uint32_t cntl = mmio_regs.count(CLK_RST_BASE + 0x60)
+                        ? mmio_regs[CLK_RST_BASE + 0x60] : 0;
+    uint32_t src = (cntl >> 14) & 0x1FF;   // PTO_SRC_SEL
+    uint32_t khz = 0;
+    if (mariko) {
+      switch (src) {
+      case 0x1C: khz = 407971; break;  // SCLK / BPMP
+      case 0x24: khz = 203991; break;  // EMC (DRAM)
+      case 0x23: khz = 199673; break;  // SDMMC4 (eMMC)
+      case 0x20: khz = 199671; break;  // SDMMC1 (SD)
+      case 0x12: khz = 0;      break;  // CCLK_G - A57 cluster is off in RCM
+      case 0x43: khz = 0;      break;  // PLLP_OBS - not routed
+      default:   khz = 0;      break;
+      }
+    }
+    // Invert bdk's maths; BUSY is always clear because we answer instantly.
+    return (uint32_t)(((uint64_t)khz * 1000ull * 16ull) / 32768ull) & 0xFFFFFF;
+  }
+
+  // ---- OSC_FREQ_DET: crystal frequency measurement ----
+  //
+  // clock_get_osc_freq() does NOT read OSC_CTRL - it triggers this counter
+  // (0x58), waits for BUSY in the status register (0x5C) to clear, and looks
+  // the count up in a table. bdk asks for a 2-period 32768 Hz window, so a
+  // 38.4 MHz crystal gives 38400000 * 2 / 32768 = 2343 counts, inside the
+  // table's 2268..2418 bucket for 38400 kHz. Unmodelled this returned 0 and
+  // every payload printed "OSC : 0.000 MHz".
+  if (offset == 0x5C)
+    return 2343;  // -> 38.4 MHz, BUSY clear (we answer instantly)
+
   if (offset == 0x50)
-    return (4 << 28); // 38.4 MHz (OSC_FREQ field in OSC_CTRL)
+    return (4 << 28); // OSC_CTRL, informational
   if (offset == 0x10)
     return (1 << 14); // CLK_ENB_SDMMC1
   if (offset == 0x18)
