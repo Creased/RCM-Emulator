@@ -227,6 +227,8 @@ static void max77620_regs_init(EmuState *state) {
     max77620_regs[0x43] = 0x28;   // FPS0: 1280 us slot
     max77620_regs[0x44] = 0x2A;   // FPS1: 1280 us slot, EN_SRC 1
     max77620_regs[0x45] = 0x28;   // FPS2: 1280 us slot
+    // ONOFFCNFG2 wake-source mask, measured: POWER | ACOK | MBATT | ALARM1/2.
+    max77620_regs[0x42] = 0x1F;
   }
 }
 
@@ -434,8 +436,16 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
     if (on_i2c5 && i2c_slave_addr == 0x3C) {
       max77620_regs_init(state);
       switch (i2c_reg_addr) {
-      case 0x15: { // ONOFFSTAT — EN0 bit reflects power button
-        return state->btn_power.load() ? (1 << 2) : 0;
+      case 0x15: { // ONOFFSTAT
+        // bit 2 EN0  - power button
+        // bit 1 ACOK - charger present. Measured 0x02 on a real Mariko sitting
+        //              on a charger; reporting 0 here made the PMIC disagree
+        //              with the BQ24193 and tripped payload VBUS<->ACOK
+        //              cross-checks that are meant to catch a broken ACOK trace.
+        uint32_t v = state->btn_power.load() ? (1u << 2) : 0;
+        if (state->chg_vbus_stat.load() != 0 || state->chg_power_good.load())
+          v |= (1u << 1);
+        return v;
       }
       // CID3 is a whole byte (0x5B on a real console); payloads print its low
       // nibble as "max77620 v%d". Masking here would turn 0x5B into 0x0B.
@@ -863,17 +873,30 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
         lsr |= 0x01;
       return lsr;
     }
-    if (offset == 0x00) {
-      // RBR (read alias of THR/DLL when DLAB=0). Pop the next host-injected
-      // byte; if the FIFO is empty return 0 (the payload should have
-      // checked LSR.RDR first).
+    // With DLAB set, 0x00 and 0x04 are the divisor latches, NOT RBR/IER.
+    // Honouring that matters twice over: a payload reading back its own baud
+    // divisor gets the real value, and - more importantly - reading the
+    // divisor no longer POPS a byte off the receive FIFO. That silently ate
+    // host bytes, which is corruption waiting to happen on a sideload.
+    uint32_t base = 0x70006000 + port * 0x40;
+    bool dlab = (mmio_regs.count(base + 0x0C) ? mmio_regs[base + 0x0C] : 0) & 0x80;
+
+    if (offset == 0x00 && !dlab) {
+      // RBR: pop the next host-injected byte; empty FIFO returns 0 (the
+      // payload should have checked LSR.RDR first).
       if (port < EmuState::N_UARTS && !state->uart_rx_fifo[port].empty()) {
         uint8_t b = state->uart_rx_fifo[port].front();
         state->uart_rx_fifo[port].pop_front();
         return b;
       }
+      return 0;
     }
-    return 0;
+    // Every other register (LCR, IER/DLM, DLL, MCR, IRDA_CSR, ASR...) reads
+    // back what the payload wrote. bdk's uart_init programs LCR and the
+    // divisor latches, and a payload that reports its own UART config - baud
+    // divisor, word length, DLAB state - got zeros before this, so it decoded
+    // as "0 baud, word=5".
+    return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
   }
   // DSI
   if (addr >= DSI_BASE && addr < DSI_BASE + DSI_SIZE) {
@@ -2379,7 +2402,16 @@ static void hook_mmio_write(uc_engine *uc, uc_mem_type type, uint64_t address,
     } else if (address >= 0x70006000 && address < 0x70006500) {
       uint32_t port   = (address - 0x70006000) / 0x40;
       uint32_t offset = (address - 0x70006000) % 0x40;
-      if (offset == 0 && port < EmuState::N_UARTS) {
+      // Keep every non-TX register (LCR, IER/DLM, DLL, MCR...) so it reads
+      // back. Note offset 0 is the divisor latch LSB - not the transmit
+      // register - whenever DLAB is set, so writing the baud divisor must not
+      // be mistaken for a character to print.
+      uint32_t ubase = 0x70006000 + port * 0x40;
+      bool dlab = (mmio_regs.count(ubase + 0x0C) ? mmio_regs[ubase + 0x0C] : 0) & 0x80;
+      if (offset != 0 || dlab)
+        mmio_regs[address] = val;
+
+      if (offset == 0 && !dlab && port < EmuState::N_UARTS) {
         uint8_t b = (uint8_t)val;
 
         // Append every byte to the per-port TX log — the console window
