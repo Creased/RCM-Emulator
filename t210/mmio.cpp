@@ -31,6 +31,9 @@ static std::map<uint64_t, uint32_t> mmio_regs;
 // Button state is stored in EmuState and read via GPIO registers.
 // VOL_UP = GPIO_X6 (port X, pin 6), VOL_DOWN = GPIO_X7, POWER = GPIO_X0 (PMC)
 
+// PWM controller channel 1 drives the cooling fan (bdk t210.h).
+#define PWM_CSR_1_OFF 0x10
+
 uint32_t gpio_read(EmuState *state, uint64_t addr) {
   uint32_t offset = (uint32_t)(addr - GPIO_BASE);
 
@@ -47,10 +50,40 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
     return val;
   }
 
-  if (offset == 0x61C) {
-    // Port Z IN. Bit 1 active-low = SD card detect.
+  // Port Z IN. Bit 1 active-low = SD card detect.
+  //
+  // The offset is (port>>2)*0x100 + (port&3)*4 + 0x30; port Z is 25, so
+  // 0x600 + 0x04 + 0x30 = 0x634. This used to answer at 0x61C - which is
+  // bank 6's OE slot, not an IN register - so the read fell through to the
+  // generic path and the "SD card ejected" tweak never reached the payload.
+  // (The default happened to look right: an unhandled read returned 0, and
+  // the signal is active-low, i.e. "inserted".)
+  if (offset == 0x634) {
     uint32_t val = state->sd_inserted.load() ? 0x00 : (1u << 1);
     return val;
+  }
+
+  // Port S IN (port 18 -> 0x400 + 0x08 + 0x30). Pin 7 is the cooling-fan
+  // tachometer.
+  //
+  // The fan puts out two pulses per revolution and a payload counts edges
+  // over a sampling window: rpm = edges / 4 * (60000 / window_ms). A real
+  // Mariko driven at duty 150 reports ~6750 RPM, i.e. 183 edges in 400 ms,
+  // so an edge every ~2186 us. Without this the line never moved, 0 RPM came
+  // back, and a fan test concluded "fan dead" on a healthy console.
+  //
+  // Only toggle while the PWM channel is actually driving the fan, so a
+  // payload that checks "duty 0 -> should read 0 RPM" still sees that.
+  if (offset == 0x438) {
+    uint32_t csr = mmio_regs.count(PWM_BASE + PWM_CSR_1_OFF)
+                       ? mmio_regs[PWM_BASE + PWM_CSR_1_OFF] : 0;
+    bool ch_en   = (csr & (1u << 31)) != 0;
+    bool abs_off = (csr & (1u << 24)) != 0;
+    uint32_t inv_duty = (csr >> 16) & 0xFF;   // inverted: 236 = ~0%
+    bool spinning = ch_en && !abs_off && inv_duty < 236;
+    if (spinning && ((state->emu_usec / 2186ull) & 1ull))
+      return (1u << 7);
+    return 0;
   }
 
   // Tegra X1 GPIO is organized as 8 banks of 256 bytes; within each
