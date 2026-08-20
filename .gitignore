@@ -1,5 +1,6 @@
 # Build artifacts
 rcm_emu
+rcm_emu.exe
 *.o
 *.d
 
@@ -11,6 +12,8 @@ out.log
 out*.txt
 emu_run*.log
 emu_capture*.txt
+win_run.log
+last_audio*.wav
 
 # User data — never commit dumps or keys
 *.img

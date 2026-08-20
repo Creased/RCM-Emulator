@@ -1,0 +1,135 @@
+name: Build
+
+# Tags publish a release; pushes and PRs just prove it still builds. That
+# second half is the point: the Windows build broke three different ways the
+# first time anyone tried it (a compiler ICE in a dependency, POSIX-only file
+# I/O, and library ordering), none of which a Linux-only workflow would show.
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libunicorn-dev libsdl2-dev
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Smoke test
+        # No display and no sound card on a runner, so this only checks the
+        # binary starts, reads its ini and rejects a missing payload. That is
+        # enough to catch a bad link or a missing shared library.
+        env:
+          RCM_EMU_NO_AUDIO: "1"
+        run: |
+          test -x rcm_emu || { echo "rcm_emu missing"; exit 1; }
+          ./rcm_emu /nonexistent.bin 2>&1 | tee out.txt || true
+          grep -q "RCM Payload Emulator" out.txt \
+            || { echo "banner missing - binary did not start"; exit 1; }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rcm_emu-linux
+          path: rcm_emu
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: rcm_emu
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+  build-windows:
+    # Cross-compiled from Linux rather than built on a Windows runner: neither
+    # dependency has a MinGW package (SDL2 ships a devel tarball, unicorn has
+    # to be compiled), so the toolchain has to be assembled either way - and
+    # doing it in the container means CI and a local `make windows` are the
+    # same build.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the cross-compile image
+        # Cached between runs: compiling unicorn for Windows is the slow part
+        # and it only changes when the Dockerfile pins a new version.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.windows
+          tags: rcm_emu_win:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Cross-compile rcm_emu.exe
+        run: |
+          docker run --rm -v "$PWD:/work" rcm_emu_win
+          test -s rcm_emu.exe || { echo "rcm_emu.exe missing"; exit 1; }
+          file rcm_emu.exe | grep -q "PE32+" \
+            || { echo "not a Windows executable"; exit 1; }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rcm_emu-windows
+          path: rcm_emu.exe
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: rcm_emu.exe
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+  smoke-windows:
+    # The cross-build only proves it links. This proves the .exe actually
+    # starts on a real Windows machine - the static link, the SDL entry point
+    # and the unicorn init are all things that can pass the linker and still
+    # fail at runtime.
+    needs: build-windows
+    runs-on: windows-latest
+    steps:
+      - name: Download the exe
+        uses: actions/download-artifact@v4
+        with:
+          name: rcm_emu-windows
+
+      - name: Run it
+        env:
+          RCM_EMU_NO_AUDIO: "1"
+        shell: bash
+        run: |
+          ./rcm_emu.exe /nonexistent.bin 2>&1 | tee out.txt || true
+          grep -q "RCM Payload Emulator" out.txt \
+            || { echo "banner missing - the exe did not start on Windows"; exit 1; }
+          echo "rcm_emu.exe starts on a clean Windows runner"

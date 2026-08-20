@@ -9,11 +9,33 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <sys/stat.h>
 #include <map>
 #include <unistd.h>
 #include <vector>
+#include <SDL2/SDL.h>
+
+// pread/pwrite are POSIX and MinGW does not have them, so the SD/eMMC image
+// access below would not compile for Windows. Seek-then-read is equivalent
+// here: the emulated storage is touched only from the CPU thread, so the
+// atomicity real pread() buys against a shared file offset is not in play.
+// Kept next to the includes rather than in a header because these four call
+// sites are the only users in the tree.
+#ifdef _WIN32
+#include <io.h>
+static inline ssize_t pread(int fd, void *buf, size_t n, long long off) {
+  if (_lseeki64(fd, off, SEEK_SET) < 0)
+    return -1;
+  return _read(fd, buf, (unsigned int)n);
+}
+static inline ssize_t pwrite(int fd, const void *buf, size_t n, long long off) {
+  if (_lseeki64(fd, off, SEEK_SET) < 0)
+    return -1;
+  return _write(fd, buf, (unsigned int)n);
+}
+#endif
 
 #define BIT(n) (1U << (n))
 
@@ -2930,12 +2952,152 @@ static uint32_t admaif_read(EmuState *state, uint64_t addr) {
   }
 }
 
+// Captured PIO audio. Every word the payload pushes into the FIFO is a whole
+// stereo frame - low 16 bits left, high 16 bits right, per the CIF's UNPACK16
+// - so the capture is already interleaved PCM and needs only a header.
+//
+// This exists because "the probe reached its verdict" and "the console made
+// the right noise" are different claims, and only one of them can be checked
+// by reading registers. Writing the samples out means the tone an emulated
+// run produces can actually be listened to, and measured, the same way a
+// line-in capture of the real console is.
+static std::vector<int16_t> audio_pcm;
+static bool audio_pcm_full = false;
+
+// 4 M frames is ~3 minutes at this rate: far more than any test tone, and
+// bounded so a runaway payload cannot eat memory.
+static const size_t AUDIO_PCM_MAX_FRAMES = 4u * 1024u * 1024u;
+
+// Playback on the host sound card.
+//
+// The take is played AFTER it is complete, not streamed while it is produced.
+// That is deliberate. The emulator does not generate samples anywhere near a
+// steady rate - a phrase arrives in a burst, then generation stalls entirely
+// while the payload talks to the codec over I2C between phrases - so a live
+// stream underruns wherever the producer falls behind the sound card, which
+// is heard as flicker. Queueing the finished buffer in one go removes the
+// producer from the timing path completely: SDL has every sample before the
+// first one is played, so it cannot run dry.
+//
+// The cost is latency - the melody is heard once the payload has finished
+// writing it - which for a test tone is a fair trade for hearing it cleanly.
+//
+// An absent or unusable device (headless CI, no sound server) is not an
+// error: playback is skipped and the WAV is still written, so a run never
+// fails for want of speakers.
+static SDL_AudioDeviceID audio_dev = 0;
+
+static uint32_t audio_rate_hz(void) {
+  uint32_t timing = mmio_regs.count(I2S_BASE + 0xA4)
+                        ? (mmio_regs[I2S_BASE + 0xA4] & 0x7FFu) : 31u;
+  uint32_t frame = 2u * (timing + 1u);
+  return frame ? (1500000u / frame) : 23437u;
+}
+
+static void audio_play_take(void) {
+  if (audio_pcm.empty() || getenv("RCM_EMU_NO_AUDIO"))
+    return;
+
+  if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
+    printf("[audio] no audio subsystem (%s) - WAV only\n", SDL_GetError());
+    return;
+  }
+
+  SDL_AudioSpec want{}, have{};
+  want.freq     = (int)audio_rate_hz();
+  want.format   = AUDIO_S16SYS;
+  want.channels = 2;
+  want.samples  = 4096;
+  want.callback = nullptr;    // queue-driven, no callback
+
+  // No ALLOW_ANY_CHANGE: SDL_QueueAudio does not convert, so a device opened
+  // at a different rate or format would replay the take at the wrong pitch.
+  // Better to fail and keep the WAV than to play something misleading.
+  audio_dev = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
+  if (!audio_dev) {
+    printf("[audio] no device (%s) - WAV only\n", SDL_GetError());
+    return;
+  }
+
+  SDL_QueueAudio(audio_dev, audio_pcm.data(),
+                 (Uint32)(audio_pcm.size() * sizeof(int16_t)));
+  SDL_PauseAudioDevice(audio_dev, 0);
+  printf("[audio] playing %.2f s on the host at %d Hz stereo\n",
+         (double)(audio_pcm.size() / 2) / (double)have.freq, have.freq);
+  fflush(stdout);
+
+  // Wait it out, bounded, so the run cannot hang on a stuck device.
+  int guard = (int)(audio_pcm.size() / 2 / (size_t)have.freq) * 20 + 200;
+  while (guard-- > 0 && SDL_GetQueuedAudioSize(audio_dev) > 0)
+    SDL_Delay(50);
+
+  SDL_CloseAudioDevice(audio_dev);
+  audio_dev = 0;
+}
+
+
+static void audio_write_wav(void) {
+  if (audio_pcm.empty())
+    return;
+
+  // The frame length the payload programmed decides the rate: I2S_TIMING
+  // holds the per-channel bit count minus one, so a frame is 2 x (cnt + 1)
+  // bit clocks and fs = bclk / that. hwtest drives BCLK at PLLA_OUT0 / 80 =
+  // 1.5 MHz, which with its TIMING of 31 gives 23437.5 Hz - the real rate,
+  // and the one its note table is computed against. Falling back to a
+  // nominal 48 kHz would replay the melody at twice the intended pitch.
+  uint32_t timing = mmio_regs.count(I2S_BASE + 0xA4)
+                        ? (mmio_regs[I2S_BASE + 0xA4] & 0x7FFu) : 31u;
+  uint32_t frame = 2u * (timing + 1u);
+  uint32_t rate  = frame ? (1500000u / frame) : 23437u;
+
+  const char *path = "last_audio.wav";
+  FILE *f = fopen(path, "wb");
+  if (!f) {
+    printf("[audio] could not open %s\n", path);
+    return;
+  }
+
+  uint32_t data_bytes = (uint32_t)(audio_pcm.size() * sizeof(int16_t));
+  uint32_t byte_rate  = rate * 2u * 2u;   // stereo, 16-bit
+  auto u32 = [&](uint32_t v) { fwrite(&v, 4, 1, f); };
+  auto u16 = [&](uint16_t v) { fwrite(&v, 2, 1, f); };
+
+  fwrite("RIFF", 1, 4, f); u32(36 + data_bytes); fwrite("WAVE", 1, 4, f);
+  fwrite("fmt ", 1, 4, f); u32(16); u16(1); u16(2);
+  u32(rate); u32(byte_rate); u16(4); u16(16);
+  fwrite("data", 1, 4, f); u32(data_bytes);
+  fwrite(audio_pcm.data(), 1, data_bytes, f);
+  fclose(f);
+
+  printf("[audio] wrote %s: %zu frames, %u Hz stereo%s\n", path,
+         audio_pcm.size() / 2, rate,
+         audio_pcm_full ? " (truncated)" : "");
+  fflush(stdout);
+  audio_play_take();          // buffer is complete: safe to play it straight
+  audio_pcm.clear();
+  audio_pcm_full = false;
+}
+
 static void admaif_write(EmuState *state, uint64_t addr, uint32_t val) {
   (void)state;
-  (void)val;
   uint32_t offset = (uint32_t)(addr - ADMAIF_BASE);
   if (offset == 0x32C) {
-    // Sample sink. Deliberately does nothing and logs nothing.
+    // One packed word = one stereo frame. Record it rather than dropping it.
+    if (audio_pcm.size() / 2 < AUDIO_PCM_MAX_FRAMES) {
+      audio_pcm.push_back((int16_t)(val & 0xFFFF));          // left
+      audio_pcm.push_back((int16_t)((val >> 16) & 0xFFFF));  // right
+    } else {
+      audio_pcm_full = true;
+    }
+    return;
+  }
+  if (offset == 0x300 && val == 0) {
+    // TX channel disabled: the payload has finished feeding the port, so the
+    // take is complete. Write it out and play it. Doing this here rather
+    // than at exit means a run killed on its time budget still produces
+    // both the file and the sound.
+    audio_write_wav();
     return;
   }
   // Everything else is left in mmio_regs by the write hook.

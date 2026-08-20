@@ -37,9 +37,42 @@ ifneq ($(SDL2_CFLAGS),)
     LIBS = -lunicorn $(SDL2_LIBS) -lpthread
 endif
 
-.PHONY: all clean
+# ---- Windows cross-build ---------------------------------------------------
+#
+# `make windows` builds rcm_emu.exe with the MinGW toolchain. Both deps come
+# from the cross sysroot the container prepares (see Dockerfile.windows):
+# SDL2 from its official MinGW devel tree, unicorn built from source.
+#
+# Statically linked on purpose. A .exe that needs libstdc++, libgcc, winpthread
+# and SDL2.dll beside it is not something anyone wants to download from a
+# release page, and SDL2 is linked static here too so there is exactly one
+# file to ship.
+#
+# SDL on Windows renames main to SDL_main and supplies its own entry point, so
+# the link order -lmingw32 -lSDL2main -lSDL2 matters and SDL2main must come
+# before SDL2. The trailing Windows libraries are what static SDL2 and unicorn
+# pull in: without them the link fails on missing WinMM / OLE / socket symbols.
+WIN_CXX  = x86_64-w64-mingw32-g++
+WIN_OUT  = rcm_emu.exe
+WIN_OBJS = $(SRCS:.cpp=.win.o)
+WIN_CXXFLAGS = -Wall -g -O2 -std=c++17 -MMD -MP -I. -I$(IMGUI_DIR)                -I$(IMGUI_DIR)/backends -I/usr/x86_64-w64-mingw32/include/SDL2                -DSDL_MAIN_HANDLED
+WIN_LIBS = -lmingw32 -lSDL2main -lSDL2 -lunicorn -lpthread            -lwinmm -limm32 -lole32 -loleaut32 -lversion -lsetupapi -lcfgmgr32            -lgdi32 -lrpcrt4 -lws2_32 -luuid -lshell32 -ladvapi32 -luser32
+WIN_LDFLAGS = -static -static-libgcc -static-libstdc++
+
+.PHONY: all clean windows
 
 all: $(OUTPUT)
+
+windows: $(WIN_OUT)
+
+$(WIN_OUT): $(WIN_OBJS)
+	$(WIN_CXX) $(WIN_LDFLAGS) -o $@ $^ $(WIN_LIBS)
+	@echo "   built $@ ($$(stat -c%s $@) bytes)"
+
+%.win.o: %.cpp
+	$(WIN_CXX) $(WIN_CXXFLAGS) -c -o $@ $<
+
+-include $(WIN_OBJS:.o=.d)
 
 $(OUTPUT): $(OBJS)
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
@@ -52,4 +85,4 @@ $(OUTPUT): $(OBJS)
 -include $(OBJS:.o=.d)
 
 clean:
-	rm -f $(OUTPUT) $(OBJS) $(OBJS:.o=.d)
+	rm -f $(OUTPUT) $(OBJS) $(OBJS:.o=.d) \n	      $(WIN_OUT) $(WIN_OBJS) $(WIN_OBJS:.o=.d)

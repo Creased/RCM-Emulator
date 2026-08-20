@@ -1,0 +1,52 @@
+# Windows cross-build for the emulator.
+#
+# There is no MinGW package for either dependency, so both are built or
+# unpacked into the cross sysroot here: SDL2 ships an official MinGW devel
+# tarball, and Unicorn is compiled from source with the same toolchain.
+# Doing it in a container keeps the host free of a second toolchain and makes
+# the CI job and a local build the same thing.
+FROM ubuntu:24.04
+
+ARG SDL2_VERSION=2.30.9
+ARG UNICORN_VERSION=2.1.1
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        g++-mingw-w64-x86-64 gcc-mingw-w64-x86-64 \
+        build-essential cmake make git pkg-config \
+        wget ca-certificates xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV MINGW_PREFIX=/usr/x86_64-w64-mingw32
+
+# SDL2: unpack the official MinGW devel tree into the cross sysroot.
+RUN wget -q https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VERSION}/SDL2-devel-${SDL2_VERSION}-mingw.tar.gz \
+    && tar xf SDL2-devel-${SDL2_VERSION}-mingw.tar.gz \
+    && cp -r SDL2-${SDL2_VERSION}/x86_64-w64-mingw32/* ${MINGW_PREFIX}/ \
+    && rm -rf SDL2-${SDL2_VERSION}*
+
+# Unicorn: no prebuilt Windows package, so cross-compile it. Static, so the
+# emulator .exe does not need a unicorn DLL beside it.
+#
+# Built at -O1, not -O2: mingw GCC 13 hits an internal compiler error
+# (segfault) on qemu/softmmu/memory.c at -O2. -O1 compiles it, and unicorn is
+# not the bottleneck here - the MMIO hooks are.
+RUN git clone --depth 1 --branch ${UNICORN_VERSION} \
+        https://github.com/unicorn-engine/unicorn.git /tmp/unicorn \
+    && cmake -S /tmp/unicorn -B /tmp/unicorn/build \
+        -DCMAKE_SYSTEM_NAME=Windows \
+        -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+        -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+        -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
+        -DCMAKE_INSTALL_PREFIX=${MINGW_PREFIX} \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS_RELEASE="-O1" \
+        -DCMAKE_CXX_FLAGS_RELEASE="-O1" \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DUNICORN_ARCH="arm;aarch64" \
+    && cmake --build /tmp/unicorn/build -j"$(nproc)" \
+    && cmake --install /tmp/unicorn/build \
+    && rm -rf /tmp/unicorn
+
+WORKDIR /work
+CMD ["sh", "-c", "git config --global --add safe.directory /work; git submodule update --init --recursive && make windows -j$(nproc)"]

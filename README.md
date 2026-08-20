@@ -119,6 +119,21 @@ green:
 
 ![PIN recovery demo](img/pin_recovery_demo.png)
 
+### Build (Windows)
+
+Cross-compiled from Linux in a container, because neither dependency has a
+MinGW package: SDL2 ships a devel tarball and unicorn has to be compiled.
+
+```sh
+docker build -f Dockerfile.windows -t rcm_emu_win .
+docker run --rm -v "$PWD:/work" rcm_emu_win     # produces rcm_emu.exe
+```
+
+The result is statically linked - one `rcm_emu.exe` with no DLLs beside it.
+Audio goes to WASAPI on Windows and ALSA/PulseAudio on Linux; SDL picks the
+backend, so nothing in the emulator cares which. `RCM_EMU_NO_AUDIO=1` skips
+playback entirely, which is what CI uses since a runner has no sound device.
+
 ## Live hardware tweaks
 
 Press `M` in the main window to open a second window that exposes the values
