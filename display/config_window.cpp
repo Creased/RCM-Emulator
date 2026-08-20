@@ -55,6 +55,9 @@ void reset_to_defaults(EmuState *s) {
     s->pmic_silicon_rev  = 0x5B;          // CID3, measured on a real console
     s->pmic_es_rev       = 0x81;          // CID5
     s->cpu_pmic_version  = 0x1C;
+    s->pmic_cnfg1_32k    = 0xFC;          // 32K_OK | 32K_OUT0_EN
+    s->bt_radio          = BT_RADIO_HEALTHY;
+    s->wifi_radio        = WIFI_RADIO_HEALTHY;
     s->sd_inserted       = true;
     s->sd_cid_manfid     = 0x03;
     s->sd_cid_oemid      = 0x5344;        // "SD"
@@ -141,6 +144,7 @@ void reset_to_defaults(EmuState *s) {
     X(pmic_silicon_rev,    "soc",     "pmic_silicon_rev",0)                  \
     X(pmic_es_rev,         "soc",     "pmic_es_rev",     0)                  \
     X(cpu_pmic_version,    "soc",     "cpu_pmic_version",0)                  \
+    X(pmic_cnfg1_32k,      "soc",     "pmic_cnfg1_32k",  0)                  \
     /* Storage — SD (SDMMC1 CMD2) */                                         \
     X(sd_inserted,         "sd",      "inserted",        0)                  \
     X(sd_cid_manfid,       "sd",      "cid_manfid",      0)                  \
@@ -198,6 +202,19 @@ bool config_window_save_ini_impl(const EmuState *s, const char *path) {
     write_header("display");
     fprintf(f, "backlight=%u\n", (unsigned)s->backlight);
     fprintf(f, "rotation_override=%d\n", (int)s->rotation_override);
+
+    // Bluetooth radio mode. Deliberately NOT a schema row: the schema parses
+    // with strtoull, so "faulty" would silently become 0 = healthy and the
+    // faulty path would be unreachable from the ini with nothing to warn you.
+    // Must stay above the [fuses] header below, or the next load would find
+    // it inside the fuse dump.
+    write_header("bluetooth");
+    fprintf(f, "radio=%s\n", bt_radio_name(s->bt_radio.load()));
+
+    // Same reasoning for the WLAN half: a separate device on PCIe with its
+    // own failure modes, and the same string-vs-schema trap.
+    write_header("wifi");
+    fprintf(f, "radio=%s\n", wifi_radio_name(s->wifi_radio.load()));
 
     // Fuses are dumped wholesale — small enough (256 × 4 bytes) and keeps the
     // load path branch-free.
@@ -268,6 +285,26 @@ bool config_window_load_ini_impl(EmuState *s, const char *path) {
                 s->rotation_override = (int32_t)strtol(val, nullptr, 0);
                 continue;
             }
+        }
+        if (strcmp(section, "bluetooth") == 0 && strcmp(key, "radio") == 0) {
+            uint8_t mode = BT_RADIO_HEALTHY;
+            if (bt_radio_parse(val, &mode)) {
+                s->bt_radio.store(mode);
+            } else {
+                fprintf(stderr, "[config] Unknown [bluetooth] radio value '%s';"
+                                " expected healthy, faulty or absent\n", val);
+            }
+            continue;
+        }
+        if (strcmp(section, "wifi") == 0 && strcmp(key, "radio") == 0) {
+            uint8_t mode = WIFI_RADIO_HEALTHY;
+            if (wifi_radio_parse(val, &mode)) {
+                s->wifi_radio.store(mode);
+            } else {
+                fprintf(stderr, "[config] Unknown [wifi] radio value '%s';"
+                                " expected healthy, faulty or absent\n", val);
+            }
+            continue;
         }
         if (strcmp(section, "fuses") == 0) {
             uint32_t off = (uint32_t)strtoul(key, nullptr, 0);
@@ -417,6 +454,40 @@ void build_ui(EmuState *state) {
         atomic_slider_int<uint8_t>("MAX77620 CID3 (Si rev)", state->pmic_silicon_rev, 0, 255);
         atomic_slider_int<uint8_t>("MAX77620 CID5 (ES rev)", state->pmic_es_rev,      0, 255);
         atomic_slider_int<uint8_t>("MAX77621 chipid",        state->cpu_pmic_version, 0, 255);
+        // CNFG1_32K is the radio's low-power oscillator config. 0xFC and 0xDC
+        // are both measured on healthy consoles of both generations; the
+        // difference is per unit, so it is a value, not a generation switch.
+        atomic_slider_int<uint8_t>("MAX77620 CNFG1_32K",      state->pmic_cnfg1_32k,   0, 255, "0x%02X");
+    }
+
+    if (ImGui::CollapsingHeader("Bluetooth (CYW4356)")) {
+        // Selected before the probe runs; press 'a' on the payload's pager to
+        // re-run the sweep after changing it, or Reboot for a clean POR.
+        const char *bt_items[] = {"Healthy (answers HCI)",
+                                  "Faulty (never comes out of POR)",
+                                  "Absent (no module fitted)"};
+        int bt = (int)state->bt_radio.load();
+        if (ImGui::Combo("Radio", &bt, bt_items, IM_ARRAYSIZE(bt_items))) {
+            state->bt_radio.store((uint8_t)bt);
+        }
+        ImGui::TextDisabled("Faulty reproduces the 2110-1118 console: BT_HOST_WAKE\n"
+                            "low, chip RTS_N never asserts, no HCI on any arm.");
+    }
+
+    if (ImGui::CollapsingHeader("Wi-Fi (CYW4356 WLAN, PCIe)")) {
+        // The other half of the same package. Independent of the Bluetooth
+        // setting on purpose: a console can answer HCI perfectly and still
+        // have a dead WLAN core, which is precisely the case the PCIe probe
+        // exists to separate.
+        const char *wifi_items[] = {"Healthy (enumerates, ChipID 4356)",
+                                    "Faulty (enumerates, backplane dead)",
+                                    "Absent (link never trains)"};
+        int wifi = (int)state->wifi_radio.load();
+        if (ImGui::Combo("WLAN core", &wifi, wifi_items, IM_ARRAYSIZE(wifi_items))) {
+            state->wifi_radio.store((uint8_t)wifi);
+        }
+        ImGui::TextDisabled("Faulty is the console that shows 14E4:43EC on the bus\n"
+                            "and still has no Wi-Fi: front-end alive, die is not.");
     }
 
     if (ImGui::CollapsingHeader("Charger (BQ24193)", ImGuiTreeNodeFlags_DefaultOpen)) {

@@ -10,6 +10,7 @@ last_fb*.png
 out.log
 out*.txt
 emu_run*.log
+emu_capture*.txt
 
 # User data — never commit dumps or keys
 *.img

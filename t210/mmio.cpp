@@ -2,6 +2,7 @@
 #include "../emu_state.h"
 #include "i2c3.h"
 #include "memory_map.h"
+#include "pcie.h"
 #include "se_engine.h"
 #include "tegra_bl.h"
 
@@ -20,6 +21,76 @@ static uint32_t pmc_scratch0 = 0;
 static uint32_t pmc_scratch37 = 0;
 static std::map<uint64_t, uint32_t> mmio_regs;
 
+// Standard CRC32 (poly 0xEDB88320), matching hekate's crc32_calc(0, ...) which
+// the payload uses to validate the GPT. Init/final via ~ like the reference.
+static uint32_t emu_crc32(const uint8_t *buf, size_t len) {
+  uint32_t crc = 0xFFFFFFFFu;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= buf[i];
+    for (int b = 0; b < 8; b++)
+      crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1)));
+  }
+  return ~crc;
+}
+
+// Synthesize a minimal but spec-valid Switch eMMC GPT so hwtest's [eMMC GPT]
+// probe reads "EFI PART" with matching header/entry CRC32s instead of
+// "signature missing" when no --rawnand image is loaded. Returns a buffer
+// covering LBA 0..2 (protective-MBR sector left zero); header at LBA 1
+// (offset 512), 128-byte entries at LBA 2 (offset 1024). Byte offset into the
+// buffer == byte offset into the GPP, so the read path can copy directly.
+static const uint8_t *emmc_synth_gpt(size_t *out_len) {
+  // 6 sectors: LBA 0 (MBR) + LBA 1 (header) + LBA 2..4 (11*128 = 1408 B of
+  // entries spans three sectors). Undersizing this overflows the buffer.
+  static uint8_t gpt[6 * 512];
+  static bool built = false;
+  *out_len = sizeof(gpt);
+  if (built) return gpt;
+  memset(gpt, 0, sizeof(gpt));
+
+  struct Part { const char *name; uint64_t first, last; };
+  static const Part parts[] = {
+      {"PRODINFO", 34, 8191},                 {"PRODINFOF", 8192, 16383},
+      {"BCPKG2-1-Normal-Main", 16384, 32767}, {"BCPKG2-2-Normal-Sub", 32768, 49151},
+      {"BCPKG2-3-SafeMode-Main", 49152, 65535},{"BCPKG2-4-SafeMode-Sub", 65536, 81919},
+      {"BCPKG2-5-Repair-Main", 81920, 98303}, {"BCPKG2-6-Repair-Sub", 98304, 114687},
+      {"SAFE", 114688, 245759},               {"SYSTEM", 245760, 5488639},
+      {"USER", 5488640, 60014591},
+  };
+  const uint32_t nparts = sizeof(parts) / sizeof(parts[0]);
+
+  uint8_t *entries = gpt + 2 * 512; // LBA 2
+  for (uint32_t i = 0; i < nparts; i++) {
+    uint8_t *e = entries + i * 128;
+    memset(e + 0x00, 0x11, 16);         // partition type GUID (non-zero => used)
+    memset(e + 0x10, 0x20 + i, 16);     // unique partition GUID
+    *(uint64_t *)(e + 0x20) = parts[i].first;
+    *(uint64_t *)(e + 0x28) = parts[i].last;
+    for (uint32_t c = 0; parts[i].name[c] && c < 36; c++) // name UTF-16LE
+      *(uint16_t *)(e + 0x38 + c * 2) = (uint16_t)parts[i].name[c];
+  }
+  uint32_t ent_crc = emu_crc32(entries, nparts * 128);
+
+  uint8_t *hdr = gpt + 1 * 512; // LBA 1
+  memcpy(hdr + 0x00, "EFI PART", 8);
+  *(uint32_t *)(hdr + 0x08) = 0x00010000; // revision 1.0
+  *(uint32_t *)(hdr + 0x0C) = 0x5C;       // header size 92
+  *(uint32_t *)(hdr + 0x10) = 0;          // header CRC (filled after)
+  *(uint64_t *)(hdr + 0x18) = 1;          // my LBA
+  *(uint64_t *)(hdr + 0x20) = 60030975;   // alternate (backup) LBA
+  *(uint64_t *)(hdr + 0x28) = 34;         // first usable LBA
+  *(uint64_t *)(hdr + 0x30) = 60014591;   // last usable LBA
+  memset(hdr + 0x38, 0xAB, 16);           // disk GUID
+  *(uint64_t *)(hdr + 0x48) = 2;          // partition entry LBA
+  *(uint32_t *)(hdr + 0x50) = nparts;     // number of entries
+  *(uint32_t *)(hdr + 0x54) = 128;        // size of each entry
+  *(uint32_t *)(hdr + 0x58) = ent_crc;    // entry-array CRC32
+  *(uint32_t *)(hdr + 0x10) = emu_crc32(hdr, 0x5C); // header CRC32 (field zeroed)
+
+  built = true;
+  return gpt;
+}
+
 /*
  * Central MMIO dispatcher.
  *
@@ -27,12 +98,335 @@ static std::map<uint64_t, uint32_t> mmio_regs;
  * We dispatch to the appropriate peripheral handler based on address range.
  */
 
+// ==================== PINMUX ====================
+//
+// Pad control registers read back whatever the payload last wrote (the write
+// hook caches every store), but a pad nobody has touched still has a reset
+// value, and probes read those to prove a pad is where the BootROM left it.
+// Only the pads a probe actually samples are listed; everything else keeps
+// reading 0, which is the honest "not modelled" answer.
+struct PinmuxDefault { uint16_t off; uint32_t val; };
+static const PinmuxDefault pinmux_defaults[] = {
+    // PH5 / BT_HOST_WAKE: E_INPUT | PARKED | TRISTATE | PULL_DOWN. Measured
+    // as 0x0074 at payload entry on all four reference consoles.
+    {0x1C8, 0x00000074},
+};
+
+static uint32_t pinmux_reset_default(uint64_t addr) {
+  uint32_t off = (uint32_t)(addr - PINMUX_BASE);
+  for (size_t i = 0; i < sizeof(pinmux_defaults) / sizeof(pinmux_defaults[0]); i++)
+    if (pinmux_defaults[i].off == off)
+      return pinmux_defaults[i].val;
+  return 0;
+}
+
+// PINMUX_AUX bits 3:2 select the pad's internal pull.
+enum PadPull { PAD_PULL_NONE = 0, PAD_PULL_DOWN = 1, PAD_PULL_UP = 2 };
+
+static uint32_t pinmux_pull(uint64_t pinmux_addr) {
+  uint32_t v = mmio_regs.count(pinmux_addr) ? mmio_regs[pinmux_addr]
+                                            : pinmux_reset_default(pinmux_addr);
+  return (v >> 2) & 3;
+}
+
+// ==================== UART ====================
+//
+// Five 16550-style controllers whose register blocks are NOT evenly spaced:
+// bdk's soc/uart.c carries the offset table { 0, 0x40, 0x200, 0x300, 0x400 }.
+// The dispatcher used to derive the port with (addr - UART_A) / 0x40, which
+// is only correct for A and B -- it puts C at 8, D at 12 and E at 16, all
+// past the end of every per-port array, so UART-C/D/E silently had no receive
+// FIFO, no TX capture and a hard-wired LSR.
+//
+// The index order is A=0..E=4. UART_B must stay 1: the payload's debug log,
+// the `[uartB]` stdout mirror, console_window's default port and
+// input_script's receive FIFO all address it by that number.
+static const uint32_t uart_bases[EmuState::N_UARTS] = {
+    0x70006000, 0x70006040, 0x70006200, 0x70006300, 0x70006400};
+
+#define UART_D 3
+
+// Per-port electrical state the plain register cache cannot express.
+struct UartPort {
+  uint16_t divisor   = 0;      // latched DLL/DLM, i.e. the programmed baud
+  uint8_t  mcr       = 0;      // last MCR write; bit 4 = internal loopback
+  uint8_t  msr_delta = 0;      // MSR bits 3:0: set on change, cleared on read
+  bool     cts       = false;  // peer drove its RTS_N low -> MSR bit 4
+};
+static UartPort uart_ports[EmuState::N_UARTS];
+
+// Port index for an address inside one of the five 0x40-byte blocks, or -1
+// for the gaps between them.
+static int uart_port_of(uint64_t addr, uint32_t *offset) {
+  for (int p = 0; p < (int)EmuState::N_UARTS; p++) {
+    if (addr >= uart_bases[p] && addr < uart_bases[p] + 0x40) {
+      *offset = (uint32_t)(addr - uart_bases[p]);
+      return p;
+    }
+  }
+  return -1;
+}
+
+// ==================== Bluetooth radio (Broadcom CYW4356) ====================
+//
+// The Switch's combo radio presents its Bluetooth core over two interfaces,
+// and everything a payload can observe about it goes through one of them:
+//
+//   UART-D 0x70006300   H4/HCI at 115200 8N1, plus the chip's RTS_N arriving
+//                       on the Tegra's CTS input as UART_MSR bit 4.
+//   GPIO port H         PH1 WL_REG_ON     host output, shares the module CBUCK
+//                       PH3 BT_DEV_WAKE   host output; in UART transport the
+//                           chip never drives it (the same ball is SPI_INT, a
+//                           chip output, only once the SPI strap has latched)
+//                       PH4 BT_REG_ON     host output; LOW->HIGH is the POR
+//                       PH5 BT_HOST_WAKE  chip side; a live part holds it high
+//                       PH7 BT_GPIO5      host output
+//
+// The chip itself is three states driven entirely by BT_REG_ON:
+//
+//   OFF --(PH4 rises)--> POR --(~110 ms)--> READY --(PH4 falls)--> OFF
+//
+// POR is not instant: the internal PMU has to bring VDDC up behind the
+// module's own CBUCK, and the datasheet allows up to 110 ms after the rails
+// cross threshold -- rails that only start moving at the edge. Only in READY
+// does the part drive RTS_N low and answer HCI, which is why the payload
+// waits 200 ms after the edge before it concludes anything.
+//
+// A faulty module never gets there, and that is the entire difference between
+// the three reference consoles that answer and the one that returns 2110-1118
+// in HOS: BT_HOST_WAKE reads low, RTS_N never asserts, and not one byte comes
+// back -- while the SoC side (loopback, clocks, pads, PMIC) tests perfectly.
+enum BtPhase { BT_PHASE_OFF, BT_PHASE_POR, BT_PHASE_READY };
+
+// Datasheet worst case for POR completion after the BT_REG_ON edge.
+#define BT_POR_US 110000ull
+// DLL for 115200 off PLLP_OUT0/2: (8*115200 + 408000000) / (16*115200) = 221.
+// The chip only speaks its own rate, so gating the responder on this makes
+// the payload's host-baud sweep silent for free -- exactly as on hardware.
+#define BT_HCI_DIVISOR 221
+// uart4_rx_pi5 pad control, sampled to decide whether an unfitted module
+// leaves the receive line in a break condition.
+#define UART_D_RX_PINMUX (PINMUX_BASE + 0x118)
+
+struct BtChip {
+  BtPhase  phase  = BT_PHASE_OFF;
+  bool     reg_on = false;       // last sampled BT_REG_ON level
+  uint64_t por_us = 0;           // emu_usec at the rising edge
+  uint8_t  cmd[4 + 255];         // H4 command being assembled, host -> chip
+  uint32_t cmd_n  = 0;
+};
+static BtChip bt_chip;
+
+static bool bt_radio_fitted(EmuState *state) {
+  return state && state->bt_radio.load() != BT_RADIO_ABSENT;
+}
+
+static bool bt_radio_alive(EmuState *state) {
+  return state && state->bt_radio.load() == BT_RADIO_HEALTHY;
+}
+
+// Advance the power-up state machine. Called lazily from every access that
+// could observe it rather than from a timer: emu_usec only moves while the
+// CPU runs, so "now" is always current at the point of a register access.
+static void bt_chip_tick(EmuState *state) {
+  if (bt_chip.phase == BT_PHASE_POR &&
+      state->emu_usec - bt_chip.por_us >= BT_POR_US)
+    bt_chip.phase = BT_PHASE_READY;
+}
+
+// Re-evaluate the chip's RTS_N, which the host sees as UART_MSR bit 4. Only a
+// healthy part that has finished POR asserts it; a change latches DCTS.
+static void bt_uart_sync(EmuState *state) {
+  bt_chip_tick(state);
+  UartPort &up = uart_ports[UART_D];
+  bool cts = bt_radio_alive(state) && bt_chip.phase == BT_PHASE_READY;
+  if (cts != up.cts) {
+    up.cts = cts;
+    up.msr_delta |= 0x01; // DCTS
+  }
+}
+
+// BT_HOST_WAKE (PH5) as the module drives it, for the window where the Tegra
+// has the pad high-Z with no pull of its own. A live module holds it high
+// through its own pull-up whether or not BT_REG_ON has been pulsed yet --
+// which is what the good captures show while both REG_ON pins are still low,
+// and it is the single cleanest good/bad discriminator in the whole probe.
+static bool bt_host_wake(EmuState *state) { return bt_radio_alive(state); }
+
+// Sticky LSR error bits contributed by the line itself. With no module fitted
+// nothing drives BT_UART_TXD, so the Tegra's own pull-down on that pad holds
+// the line at 0 -- a permanent break, which a 16550 latches as BRK | FERR. A
+// module that is merely dead still parks its TXD as an input with an internal
+// pull-up (datasheet p93 Table 29), so the line idles high and LSR stays
+// clean: that is exactly what the faulty reference console reports, and it is
+// the one place where "absent" and "faulty" differ from the register side.
+static uint32_t bt_line_lsr_bits(EmuState *state, int port) {
+  if (port != UART_D || bt_radio_fitted(state))
+    return 0;
+  if (pinmux_pull(UART_D_RX_PINMUX) != PAD_PULL_DOWN)
+    return 0;
+  return 0x18; // BRK | FERR
+}
+
+static void bt_queue(EmuState *state, const uint8_t *ev, size_t n) {
+  for (size_t i = 0; i < n; i++)
+    state->uart_rx_fifo[UART_D].push_back(ev[i]);
+}
+
+// One complete HCI command has arrived. Broadcom parts run their lower-layer
+// stack out of on-die ROM, so a bare HCI_Reset is answered long before any
+// firmware download -- which is the whole reason this probe works at all.
+static void bt_chip_command(EmuState *state, uint16_t opcode) {
+  switch (opcode) {
+  case 0x0C03: { // HCI_Reset
+    static const uint8_t cc[] = {0x04, 0x0E, 0x04, 0x01, 0x03, 0x0C, 0x00};
+    bt_queue(state, cc, sizeof(cc));
+    break;
+  }
+  case 0x1001: { // Read_Local_Version_Information
+    // [0]type [1]evt 0x0E [2]plen [3]ncmd [4..5]opcode [6]status [7]hci_ver
+    // [8..9]hci_rev [10]lmp_ver [11..12]manufacturer [13..14]lmp_subver,
+    // the two 16-bit fields little-endian. Values are what all three good
+    // reference consoles report; hci_rev is the one field the probe does not
+    // print, so it is a plausible build number rather than a measurement.
+    static const uint8_t cc[] = {
+        0x04, 0x0E, 0x0C, 0x01, 0x01, 0x10, 0x00,
+        0x08,       // HCI version 8 = Bluetooth 5.0
+        0x48, 0x02, // HCI revision (not sampled by the probe)
+        0x08,       // LMP version 8
+        0x0F, 0x00, // manufacturer 0x000F = Broadcom
+        0x09, 0x24, // lmp_subver 0x2409 = BCM4356
+    };
+    bt_queue(state, cc, sizeof(cc));
+    break;
+  }
+  default: { // Unknown Command, so the H4 stream stays framed either way.
+    const uint8_t cc[] = {0x04, 0x0E, 0x04, 0x01, (uint8_t)opcode,
+                          (uint8_t)(opcode >> 8), 0x01};
+    bt_queue(state, cc, sizeof(cc));
+    break;
+  }
+  }
+}
+
+// One byte from the host. Nothing is ever emitted unsolicited: the payload
+// counts what it has to flush before talking and every good capture shows
+// `junk=0`, so a chatty model would break the very line it is meant to match.
+static void bt_chip_rx(EmuState *state, uint8_t b) {
+  bt_uart_sync(state);
+  if (!bt_radio_alive(state) || bt_chip.phase != BT_PHASE_READY ||
+      uart_ports[UART_D].divisor != BT_HCI_DIVISOR) {
+    bt_chip.cmd_n = 0;
+    return;
+  }
+  if (bt_chip.cmd_n == 0 && b != 0x01)
+    return; // resync on the H4 command indicator
+  if (bt_chip.cmd_n < sizeof(bt_chip.cmd))
+    bt_chip.cmd[bt_chip.cmd_n++] = b;
+  if (bt_chip.cmd_n < 4)
+    return; // 01 <opcode lo> <opcode hi> <plen>
+  if (bt_chip.cmd_n < 4u + bt_chip.cmd[3])
+    return;
+  uint16_t opcode = (uint16_t)bt_chip.cmd[1] | ((uint16_t)bt_chip.cmd[2] << 8);
+  bt_chip.cmd_n = 0;
+  bt_chip_command(state, opcode);
+}
+
+// BT_REG_ON (PH4) moved. The rising edge is the chip's power-on reset; the
+// falling edge drops everything, which is what makes each of the payload's
+// three arms a genuine cold power cycle rather than a warm poke -- the
+// transport strap is latched once per POR and never re-evaluated.
+static void bt_reg_on_set(EmuState *state, bool level) {
+  if (level == bt_chip.reg_on)
+    return;
+  bt_chip.reg_on = level;
+  if (level) {
+    bt_chip.phase  = BT_PHASE_POR;
+    bt_chip.por_us = state->emu_usec;
+  } else {
+    bt_chip.phase = BT_PHASE_OFF;
+  }
+  bt_chip.cmd_n = 0;
+  state->uart_rx_fifo[UART_D].clear();
+  bt_uart_sync(state);
+  printf("[bt] BT_REG_ON %s (%s radio)\n", level ? "HIGH - POR" : "LOW - off",
+         bt_radio_name(state->bt_radio.load()));
+}
+
 // ==================== GPIO ====================
 // Button state is stored in EmuState and read via GPIO registers.
 // VOL_UP = GPIO_X6 (port X, pin 6), VOL_DOWN = GPIO_X7, POWER = GPIO_X0 (PMC)
 
 // PWM controller channel 1 drives the cooling fan (bdk t210.h).
 #define PWM_CSR_1_OFF 0x10
+
+// ---- GPIO port H -----------------------------------------------------------
+//
+// Port H is index 7, i.e. bank 1 slot 3: CNF 0x10C, OE 0x11C, OUT 0x12C,
+// IN 0x13C. It is the only port whose input side is resolved per pin rather
+// than mirrored from OUT, because it is the only one where the payload's
+// conclusions depend on what happens when it deliberately lets go of a pad.
+#define GPIO_H_CNF (GPIO_BASE + 0x10C)
+#define GPIO_H_OE  (GPIO_BASE + 0x11C)
+#define GPIO_H_OUT (GPIO_BASE + 0x12C)
+#define GPIO_H_IN  (GPIO_BASE + 0x13C)
+
+// PINMUX_AUX offset per port-H pin, 0 where the ball is not modelled. These
+// are not contiguous: the pad control registers are ordered by ball name, not
+// by GPIO port, so PH6 (the right Joy-Con attach detect) sits elsewhere
+// entirely and PH2/PH6 are simply not needed here.
+static const uint16_t gpio_h_pinmux[8] = {
+    0x000, 0x1B8, 0x000, 0x1C0, 0x1C4, 0x1C8, 0x000, 0x1CC};
+
+static uint32_t gpio_reg(uint64_t addr) {
+  return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+}
+
+// Level of a port-H pin the Tegra is NOT driving: the pad simply follows
+// whatever is pulling it, ours or the other end of the trace.
+static int gpio_h_float(EmuState *state, int pin) {
+  uint16_t pmx = gpio_h_pinmux[pin];
+  if (pmx) {
+    switch (pinmux_pull(PINMUX_BASE + pmx)) {
+    case PAD_PULL_DOWN: return 0;
+    case PAD_PULL_UP:   return 1;
+    default:            break;
+    }
+  }
+  // No Tegra pull, so whatever is on the far end of the trace decides.
+  if (pin == 5)
+    return bt_host_wake(state) ? 1 : 0; // BT_HOST_WAKE, chip-side pull-up
+  if (pin == 6)
+    return 1; // Joy-Con right attach: active low, and nothing is plugged in
+  return 0;
+}
+
+static uint32_t gpio_h_in(EmuState *state) {
+  uint32_t cnf = gpio_reg(GPIO_H_CNF);
+  uint32_t oe  = gpio_reg(GPIO_H_OE);
+  uint32_t out = gpio_reg(GPIO_H_OUT);
+  uint32_t in  = 0;
+  for (int pin = 0; pin < 8; pin++) {
+    uint32_t m = 1u << pin;
+    // A pad only reaches the GPIO controller at all while its CNF bit selects
+    // GPIO over the muxed function, and it only reads back its own level
+    // while output-enable is set. Anything else is an input.
+    int level = ((cnf & m) && (oe & m)) ? ((out & m) ? 1 : 0)
+                                        : gpio_h_float(state, pin);
+    if (level)
+      in |= m;
+  }
+  return in;
+}
+
+// Re-sample the two REG_ON straps after anything that could have moved port
+// H. PH4 is BT_REG_ON, PH1 is WL_REG_ON - one per half of the CYW4356.
+static void gpio_h_update(EmuState *state) {
+  uint32_t driven = gpio_reg(GPIO_H_CNF) & gpio_reg(GPIO_H_OE) &
+                    gpio_reg(GPIO_H_OUT);
+  bt_reg_on_set(state, (driven & (1u << 4)) != 0);
+  pcie_wl_reg_on(state, (driven & (1u << 1)) != 0);
+}
 
 uint32_t gpio_read(EmuState *state, uint64_t addr) {
   uint32_t offset = (uint32_t)(addr - GPIO_BASE);
@@ -60,6 +454,15 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
   // the signal is active-low, i.e. "inserted".)
   if (offset == 0x634) {
     uint32_t val = state->sd_inserted.load() ? 0x00 : (1u << 1);
+    // PZ4 is the audio codec's LDO1 enable (device tree:
+    // realtek,ldo1-en-gpios). A payload drives it as an output and then reads
+    // the pad back to tell "I drove it and nothing answered" from "the pad
+    // never moved" - so the input register has to reflect what the output
+    // register is driving, or that check reports a dead pin on a healthy
+    // console. Mirror OUT (port Z is 0x624) into IN for that pin.
+    uint32_t out = mmio_regs.count(GPIO_BASE + 0x624)
+                       ? mmio_regs[GPIO_BASE + 0x624] : 0;
+    val |= out & (1u << 4);
     return val;
   }
 
@@ -84,6 +487,17 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
     if (spinning && ((state->emu_usec / 2186ull) & 1ull))
       return (1u << 7);
     return 0;
+  }
+
+  // Port H IN. Resolved per pin (see gpio_h_in) instead of mirroring OUT,
+  // because this is the port the Bluetooth probe measures by RELEASING pads:
+  // PH5/BT_HOST_WAKE and PH3/BT_DEV_WAKE are read while the Tegra is
+  // deliberately not driving them, and mirroring OUT there answers 0 to every
+  // question regardless of what is on the board.
+  if (offset == 0x13C) {
+    uint32_t v = gpio_h_in(state);
+    printf("[gpio] R: Port H IN = 0x%02X\n", v);
+    return v;
   }
 
   // Tegra X1 GPIO is organized as 8 banks of 256 bytes; within each
@@ -116,6 +530,14 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
              offset, (uint32_t)(offset - 0x10), v);
       return v;
     }
+    // MSK_CNF 0x80 / MSK_OE 0x90 / MSK_OUT 0xA0: aliases that read back the
+    // plain register they write through, 0x80 lower.
+    if (bank_off >= 0x80 && bank_off < 0xB0) {
+      uint32_t v = mmio_regs.count(addr - 0x80) ? mmio_regs[addr - 0x80] : 0;
+      printf("[gpio] R: offset 0x%X (masked alias of 0x%X) = 0x%08X\n", offset,
+             (uint32_t)(offset - 0x80), v);
+      return v;
+    }
   }
 
   printf("[gpio] R: offset 0x%X = 0\n", offset);
@@ -124,8 +546,31 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
 
 void gpio_write(EmuState *state, uint64_t addr, uint32_t val) {
   uint32_t offset = (uint32_t)(addr - GPIO_BASE);
-  printf("[gpio] W: offset 0x%X = 0x%08X\n", offset, val);
-  (void)state;
+  uint32_t bank_off = offset & 0xFF;
+
+  // Masked writes: one store of (pins << 8) | value that moves only the named
+  // pins. The controller applies them to the plain CNF / OE / OUT register
+  // 0x80 lower, and that plain register is what every reader -- including
+  // this model -- looks at. Caching the raw masked word (all the write hook
+  // used to do) meant a payload that drives a pin exclusively through the
+  // masked aliases never moved the pin at all: the Bluetooth probe writes
+  // port H that way and nothing else, so PH4/BT_REG_ON never went high and
+  // the probe reported "write did not latch".
+  if (offset < 0x800 && bank_off >= 0x80 && bank_off < 0xB0) {
+    uint64_t plain = addr - 0x80;
+    uint32_t mask  = (val >> 8) & 0xFF;
+    uint32_t cur   = mmio_regs.count(plain) ? mmio_regs[plain] : 0;
+    mmio_regs[plain] = (cur & ~mask) | (val & mask);
+    printf("[gpio] W: offset 0x%X masked -> 0x%X = 0x%08X\n", offset,
+           (uint32_t)(offset - 0x80), mmio_regs[plain]);
+  } else {
+    printf("[gpio] W: offset 0x%X = 0x%08X\n", offset, val);
+  }
+
+  // Bank 1 holds ports E..H, and port H carries BT_REG_ON, so re-sample the
+  // radio's power pin after anything that could have moved it.
+  if (offset >= 0x100 && offset < 0x200)
+    gpio_h_update(state);
 }
 
 // ==================== I2C ====================
@@ -151,6 +596,54 @@ static uint8_t i2c_slave_addr = 0;
 static uint8_t i2c_reg_addr = 0;
 // Last full CMD_DATA1 word, committed when I2C_CNFG starts the transfer.
 static uint32_t i2c_cmd_data1 = 0;
+
+// ALC5639 codec register file (slave 0x1C on I2C_1). Sparse, because the
+// payload's init table touches only a few dozen of the 256 registers and
+// every one it reads back is one it wrote. Values are stored the natural way
+// round; the byte swap onto the wire happens at the read site.
+static std::map<uint8_t, uint16_t> codec_regs;
+
+static uint16_t codec_reg_get(uint8_t reg) {
+  auto it = codec_regs.find(reg);
+  return it == codec_regs.end() ? 0 : it->second;
+}
+
+// Which slaves actually answer, per bus. This is the emulator's answer to
+// "is that chip fitted?", so it must list exactly what is modelled below and
+// nothing else - a bus scan is a real diagnostic and an emulator that ACKs
+// every address turns it into noise.
+//
+// Deliberately absent, because they are absent on the board this models:
+//   I2C_1 0x1A  TC94B15WBG headphone amp - not fitted on Erista; hwtest
+//               reports "not fitted on this board" and that is correct.
+#define I2C_STATUS_NOACK (0xFu << 0)
+
+static bool i2c_slave_present(EmuState *state, bool on_i2c5, uint8_t addr) {
+  if (on_i2c5) {
+    switch (addr) {
+    case 0x1B:                    // MAX77621 CPU DC-DC
+    case 0x33:                    // RTC / PMIC sub-block
+    case MAX77620_I2C_ADDR:       // 0x3C PMIC
+    case 0x68:                    // MAX77812 / GPU rail
+      return true;
+    default:
+      return false;
+    }
+  }
+  switch (addr) {
+  case 0x18:                      // BM92T36 USB-PD
+  case 0x36:                      // MAX17050 fuel gauge
+  case 0x4C:                      // TMP451 thermal
+  case 0x6B:                      // BQ24193 charger
+    return true;
+  case 0x1C:                      // ALC5639 codec - only once LDO1_EN is up
+    return (mmio_regs.count(GPIO_BASE + 0x624)
+                ? mmio_regs[GPIO_BASE + 0x624] : 0) & (1u << 4);
+  default:
+    (void)state;
+    return false;
+  }
+}
 // I2C_CNFG has to read back what was written: bdk sets NORMAL_MODE_GO with a
 // read-modify-write (`cnfg = (cnfg & ~GO) | GO`), so returning 0 would drop the
 // transfer size and direction bits before the transaction runs. [0]=I2C1, [1]=I2C5.
@@ -267,7 +760,22 @@ static void max77620_regs_init(EmuState *state) {
     max77620_regs[0x45] = mariko ? 0x28 : 0x38;   // FPS2
     // ONOFFCNFG2 wake-source mask: POWER | ACOK | MBATT | ALARM1/2.
     max77620_regs[0x42] = 0x1F;
+
+    // AME_GPIO (0x40) picks the alternate function per PMIC GPIO; a clear bit
+    // is a plain GPIO. Measured 0x1E on Mariko and 0x1C on Erista -- the only
+    // value in the whole Bluetooth section that varies by SoC generation.
+    // Bit 4 is the 32K_OUT1 mux the vendor device tree asks for on GPIO4, and
+    // bit 3 hands GPIO3 (the vdd_3v3 gate) to the Flexible Power Sequencer.
+    // Unseeded this read 0x00, so a payload concluded the mux was unset and
+    // programmed it itself.
+    max77620_regs[0x40] = mariko ? 0x1E : 0x1C;
   }
+
+  // CNFG1_32K (0x03): the LPO that clocks the combo radio. 32K_OK (bit 7) and
+  // 32K_OUT0_EN (bit 2) are set on every healthy console; the remaining bits
+  // differ per unit rather than per SoC generation (0xFC and 0xDC are both
+  // measured on Erista and on Mariko), so the byte is a config knob.
+  max77620_regs[0x03] = state ? state->pmic_cnfg1_32k.load() : 0xFC;
 }
 
 // ---- Packet-mode I2C (BM92T36 USB-PD on I2C_1 @ 0x18) ----
@@ -419,7 +927,16 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
   case 0x00:          // I2C_CNFG — read back what was written (see note at decl)
     return i2c_cnfg_reg[on_i2c5 ? 1 : 0];
   case 0x1C:          // I2C_STATUS
-    return 0;         // Transaction complete, no error, not busy
+    // Complete, not busy - and NOACK unless something actually lives at the
+    // addressed slave. Answering ACK for every address made a bus census
+    // report all 112 addresses as populated and, worse, made chips that are
+    // NOT fitted on this board look present: hwtest concluded the TC94B15WBG
+    // headphone amp answered at 0x1A and then decoded its zeroed registers as
+    // real readings. An emulator that says yes to everything cannot be used
+    // to test a probe whose whole job is deciding what is there.
+    return i2c_slave_present(state, on_i2c5, i2c_slave_addr)
+               ? 0u
+               : I2C_STATUS_NOACK;
   case 0x8C:          // I2C_CONFIG_LOAD
     return 0;         // MSTR_CONFIG_LOAD (bit 0) cleared = load complete
   case 0x68:          // I2C_INT_STATUS
@@ -471,6 +988,42 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
       case 0x10: return (uint8_t)((soc_lsb & 0xF) << 4); // SoC dec
       case 0x15: return (uint8_t)((pcb_lsb & 0xF) << 4); // PCB dec
       default:   return 0;
+      }
+    }
+    // ALC5639 / RT5639 audio codec (slave 0x1C on I2C_1).
+    //
+    // Two things make this different from every other chip on this bus.
+    //
+    // BYTE ORDER. The codec's registers are 16 bit, MSB first on the wire
+    // ("Read WORD Protocol"), and a payload reassembles them as
+    // (buf[0] << 8) | buf[1]. bdk's _i2c_recv_normal fills buf with a plain
+    // memcpy from CMD_DATA1, i.e. little-endian, so the value returned here
+    // reaches the payload byte-swapped. Everything below is therefore stored
+    // the natural way round and swapped once on the way out - getting this
+    // backwards makes the vendor ID read 0xEC10 and the part look absent.
+    //
+    // POWER GATING. The codec's own LDO1 is off until PZ4 is driven high, and
+    // nothing in RCM does that, so a real console answers here only after the
+    // payload enables it. Gating on PZ4 keeps that behaviour observable
+    // instead of handing out an identity the hardware would not have given.
+    if (!on_i2c5 && i2c_slave_addr == 0x1C) {
+      uint32_t pz4_out = mmio_regs.count(GPIO_BASE + 0x624)
+                             ? mmio_regs[GPIO_BASE + 0x624] : 0;
+      if (!(pz4_out & (1u << 4)))
+        return 0;              // LDO1 still off: the part is silent
+      auto be16 = [](uint16_t v) -> uint16_t {
+        return (uint16_t)((v << 8) | (v >> 8));
+      };
+      switch (i2c_reg_addr) {
+      case 0xFE: return be16(0x10EC);  // vendor ID, Realtek
+      case 0xFF: return be16(0x6231);  // device ID, the rt5640 driver's probe
+      case 0x00: return be16(0x0002);  // device id field, read-only here
+      default:
+        // Everything else reads back what the init table wrote. The payload
+        // verifies several of its own writes (0xFA MCLK_DET, 0x73 ADDA_CLK,
+        // the power and mixer registers), and a codec that always read 0
+        // would report every one of them as not having stuck.
+        return be16((uint16_t)codec_reg_get(i2c_reg_addr));
       }
     }
     // MAX17050 fuel gauge (slave 0x36 on I2C_1).
@@ -735,6 +1288,24 @@ void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
       max77620_regs_init(state);
       max77620_regs[i2c_cmd_data1 & 0xFF] = (uint8_t)((i2c_cmd_data1 >> 8) & 0xFF);
     }
+    // ALC5639 codec: a 16-bit register write arrives as three bytes packed
+    // into CMD_DATA1 - [reg, value MSB, value LSB] - because the part is
+    // big-endian on the wire while bdk packs the buffer little-endian.
+    if ((val & (1u << 9)) && is_write && size >= 3 && !on_i2c5 &&
+        i2c_slave_addr == 0x1C) {
+      uint8_t  reg = (uint8_t)(i2c_cmd_data1 & 0xFF);
+      uint16_t v   = (uint16_t)((((i2c_cmd_data1 >> 8) & 0xFF) << 8) |
+                                ((i2c_cmd_data1 >> 16) & 0xFF));
+      if (reg == 0x00) {
+        // MX-00h is the software reset: a WRITE clears the whole register
+        // file (a READ just returns the device id). The payload opens its
+        // init sequence with it, so honouring it keeps the model's state
+        // machine in step with the part's.
+        codec_regs.clear();
+      } else {
+        codec_regs[reg] = v;
+      }
+    }
     break;
   }
   case I2C_CMD_ADDR0:
@@ -939,7 +1510,7 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
   // (the old behavior) silently dropped the muxed function bits, which
   // broke any probe that read back PINMUX_AUX_* to confirm a pin's mode.
   if (addr >= PINMUX_BASE && addr < PINMUX_BASE + PINMUX_SIZE) {
-    return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+    return mmio_regs.count(addr) ? mmio_regs[addr] : pinmux_reset_default(addr);
   }
   // APB_MISC_GP_HIDREV - hardware revision.
   // Bits 11:8 = chip ID (0x21 for both T210 / T210B01),
@@ -957,39 +1528,66 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
 
   // UART
   if (addr >= 0x70006000 && addr < 0x70006500) {
-    uint32_t port   = (addr - 0x70006000) / 0x40;
-    uint32_t offset = (addr - 0x70006000) % 0x40;
+    uint32_t offset = 0;
+    int port = uart_port_of(addr, &offset);
+    if (port < 0)  // the gaps between the five register blocks
+      return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+    UartPort &up = uart_ports[port];
+    // Anything on UART-D can observe the radio, so settle its state machine
+    // (POR completion, RTS_N) before answering.
+    if (port == UART_D)
+      bt_uart_sync(state);
+
     if (offset == 0x14) {
-      // LSR: THRE | TMTY (0x60) always ready, plus RDR (bit 0) when our
-      // host-side RX FIFO has bytes queued by the console window.
+      // LSR: THRE | TMTY (0x60) always ready -- bdk's uart_wait_xfer spins on
+      // TMTY with no timeout, so a modelled TX-busy state would deadlock the
+      // payload -- plus RDR (bit 0) when this port's receive FIFO has bytes,
+      // and any break/framing error the line itself is generating.
       uint32_t lsr = 0x60;
-      if (port < EmuState::N_UARTS && !state->uart_rx_fifo[port].empty())
+      if (!state->uart_rx_fifo[port].empty())
         lsr |= 0x01;
+      lsr |= bt_line_lsr_bits(state, port);
       return lsr;
+    }
+    if (offset == 0x18) {
+      // MSR. Bit 6 (RI) reads high on a Tegra UART whether or not anything is
+      // wired to that pin: it is the 0x40 floor all four reference consoles
+      // report. Bit 4 is the peer's RTS_N arriving on our CTS input. Bits 3:0
+      // are "changed since you last looked" -- sticky, and cleared BY this
+      // read, which is why the payload sees 0x4F once right after its
+      // loopback self-test and 0x40 on every quiet read afterwards.
+      uint32_t msr = 0x40 | (up.cts ? 0x10 : 0) | up.msr_delta;
+      up.msr_delta = 0;
+      return msr;
     }
     // With DLAB set, 0x00 and 0x04 are the divisor latches, NOT RBR/IER.
     // Honouring that matters twice over: a payload reading back its own baud
     // divisor gets the real value, and - more importantly - reading the
     // divisor no longer POPS a byte off the receive FIFO. That silently ate
     // host bytes, which is corruption waiting to happen on a sideload.
-    uint32_t base = 0x70006000 + port * 0x40;
+    uint32_t base = uart_bases[port];
     bool dlab = (mmio_regs.count(base + 0x0C) ? mmio_regs[base + 0x0C] : 0) & 0x80;
 
-    if (offset == 0x00 && !dlab) {
-      // RBR: pop the next host-injected byte; empty FIFO returns 0 (the
-      // payload should have checked LSR.RDR first).
-      if (port < EmuState::N_UARTS && !state->uart_rx_fifo[port].empty()) {
+    if (offset == 0x00 && dlab)
+      return up.divisor & 0xFF;         // DLL
+    if (offset == 0x04 && dlab)
+      return (up.divisor >> 8) & 0xFF;  // DLM
+
+    if (offset == 0x00) {
+      // RBR: pop the next queued byte; empty FIFO returns 0 (the payload
+      // should have checked LSR.RDR first).
+      if (!state->uart_rx_fifo[port].empty()) {
         uint8_t b = state->uart_rx_fifo[port].front();
         state->uart_rx_fifo[port].pop_front();
         return b;
       }
       return 0;
     }
-    // Every other register (LCR, IER/DLM, DLL, MCR, IRDA_CSR, ASR...) reads
-    // back what the payload wrote. bdk's uart_init programs LCR and the
-    // divisor latches, and a payload that reports its own UART config - baud
-    // divisor, word length, DLAB state - got zeros before this, so it decoded
-    // as "0 baud, word=5".
+    // Every other register (LCR, IER, IIR, MCR, IRDA_CSR, ASR...) reads back
+    // what the payload wrote. bdk's uart_init programs LCR and the divisor
+    // latches, and a payload that reports its own UART config - baud divisor,
+    // word length, DLAB state - got zeros before this, so it decoded as
+    // "0 baud, word=5".
     return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
   }
   // DSI
@@ -1497,24 +2095,17 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
         bool is_acmd = (base == SDMMC1_BASE) ? state->last_cmd_was_55
                                              : state->last_cmd4_was_55;
         if (is_acmd) {
+          // SD SCR: byte 0 low nibble = SD_SPEC (2 => v2.00), byte 1 low
+          // nibble = SD_BUS_WIDTHS (5 => 1-bit + 4-bit). This is what makes
+          // hekate switch the bus to 4-bit; without it the init falls back to
+          // 1-bit HS25 and hwtest flags "1-bit (dirty slot?)".
           uint8_t scr[8] = {0x02, 0x35, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-          uint64_t dma_addr = 0;
-          if (trnmod & 0x0001) {
-            if ((hostctl & 0x18) == 0x10) { // ADMA2
-              uint8_t desc[12];
-              if (uc_mem_read(uc, adma_addr, desc, 12) == UC_ERR_OK) {
-                uint32_t low = *(uint32_t *)(desc + 4);
-                uint32_t high = *(uint32_t *)(desc + 8);
-                dma_addr = ((uint64_t)high << 32) | low;
-              }
-            } else { // SDMA
-              dma_addr = sysad;
-            }
-            if (dma_addr)
-              uc_mem_write(uc, dma_addr, scr, 8);
-          } else {
-            uc_mem_write(uc, sysad, scr, 8);
-          }
+          // Tegra drives this small read over SDMA with the destination in
+          // register 0x58 (captured here as adma_addr), NOT the SDHCI-standard
+          // sysad (0x00), which Tegra leaves unused. Matches the EXT_CSD path.
+          uint64_t dma_addr = adma_addr ? adma_addr : sysad;
+          if (dma_addr)
+            uc_mem_write(uc, dma_addr, scr, 8);
           norintsts |= 0x0002;
         } else {
           printf("[sdmmc] ERROR: Storage command %d on base 0x%llX but fd is "
@@ -1559,6 +2150,22 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
           auto do_io = [&](int current_fd, uint64_t current_off,
                            uint64_t dma_addr, size_t len) {
             if (current_fd == -2) { // GPP Spanning
+              // No rawnand image loaded: serve a synthesized valid GPT so the
+              // [eMMC GPT] probe sees "EFI PART" with good CRCs instead of
+              // "signature missing". Everything outside LBA 0..2 reads as zero.
+              if (state->emmc_gpp_fds.empty()) {
+                if (is_read) {
+                  size_t glen = 0;
+                  const uint8_t *gpt = emmc_synth_gpt(&glen);
+                  std::vector<uint8_t> io_buf(len, 0);
+                  for (size_t o = 0; o < len; o++) {
+                    uint64_t abs = current_off + o;
+                    if (abs < glen) io_buf[o] = gpt[abs];
+                  }
+                  uc_mem_write(uc, dma_addr, io_buf.data(), len);
+                }
+                return;
+              }
               // Hekate-style rawnand splitting can use 2GB or 4GB chunks.
               // Stat the first part once and cache; assumes all but the last
               // part are the same size (true for both Hekate's standard
@@ -1683,10 +2290,32 @@ void rtc_write(EmuState *state, uint64_t addr, uint32_t val) {
   (void)val;
 }
 
+// ---- power partitions and I/O-pad deep power down --------------------------
+//
+// PWRGATE_STATUS is a live bitmap of ungated partitions, toggled one at a
+// time through PWRGATE_TOGGLE. Unmodelled it read 0 forever, so bdk's
+// pmc_domain_pwrgate_set() burned its full 5000-iteration retry budget and
+// then reported failure for any partition a payload tried to bring up.
+//
+// IO_DPD_REQ/STATUS park pad groups in deep power down. Both reset to 0 (no
+// pad parked), and writes carry a 2-bit command in bits 31:30: 1 = DPD OFF
+// (wake the named pads), 2 = DPD ON (park them).
+static uint32_t pmc_pwrgate_status = 0;
+static uint32_t pmc_io_dpd_status[2] = {0, 0};
+
 uint32_t pmc_read(EmuState *state, uint64_t addr) {
+  (void)state;
   uint32_t offset = (uint32_t)(addr - PMC_BASE);
 
   switch (offset) {
+  case 0x38:
+    return pmc_pwrgate_status; // APBDEV_PMC_PWRGATE_STATUS
+  case 0x30:
+    return 0; // APBDEV_PMC_PWRGATE_TOGGLE - START always already clear
+  case 0x1BC:
+    return pmc_io_dpd_status[0];  // APBDEV_PMC_IO_DPD_STATUS
+  case 0x1C4:
+    return pmc_io_dpd_status[1];  // APBDEV_PMC_IO_DPD2_STATUS
   case 0x50:
     return pmc_scratch0; // APBDEV_PMC_SCRATCH0
   case 0x1A0:
@@ -1711,6 +2340,28 @@ void pmc_write(EmuState *state, uint64_t addr, uint32_t val) {
       state->reboot_requested = true;
     }
     break;
+  case 0x30: {
+    // APBDEV_PMC_PWRGATE_TOGGLE: bits 4:0 select a partition, bit 8 starts
+    // the toggle. The transition is instantaneous here, so START reads back
+    // clear and the caller's poll on PWRGATE_STATUS succeeds immediately.
+    if (val & (1u << 8)) {
+      uint32_t part = val & 0x1F;
+      pmc_pwrgate_status ^= (1u << part);
+      if (part == 3) // POWER_RAIL_PCIE
+        pcie_set_powergate((pmc_pwrgate_status & (1u << 3)) != 0);
+    }
+    break;
+  }
+  case 0x1B8:
+  case 0x1C0: {
+    int bank = (offset == 0x1C0) ? 1 : 0;
+    uint32_t code = val >> 30, mask = val & 0x3FFFFFFF;
+    if (code == 1)
+      pmc_io_dpd_status[bank] &= ~mask;   // DPD OFF: wake these pads
+    else if (code == 2)
+      pmc_io_dpd_status[bank] |= mask;    // DPD ON: park them
+    break;
+  }
   case 0x50:
     pmc_scratch0 = val;
     break;
@@ -1794,6 +2445,24 @@ static void flow_write(EmuState *state, uint64_t addr, uint32_t val) {
 
 // ==================== Clock/Reset ====================
 
+// ---- RST_DEVICES_U / CLK_OUT_ENB_U -----------------------------------------
+//
+// bdk never writes these two directly: clock_enable() goes through the SET and
+// CLR aliases (RST_DEV_U_SET 0x310 / _CLR 0x314, CLK_ENB_U_SET 0x330 / _CLR
+// 0x334). With clk_rst_write a no-op and both reads hardcoded, enabling a _U
+// peripheral had no observable effect at all -- clock_enable_uart(UART_D) ran
+// to completion and the payload's own "is this port clocked?" gate then read
+// CLK_U_UARTD clear and aborted. Both seeds are the values measured on a real
+// console at that point in the sweep.
+//
+// Note the previous CLK_OUT_ENB_U value force-set bit 15 with a comment about
+// keeping SDMMC4 alive; bit 15 of the _U register is DTV (deprecated). SDMMC4
+// is CLK_L bit 15, which the hardcoded _L value 0x9802D1B0 already carries, so
+// dropping the forced bit costs the storage model nothing and lets _U match
+// hardware exactly.
+static uint32_t car_rst_u = 0x828EC5F8;
+static uint32_t car_enb_u = 0x01F00200;
+
 uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
   uint32_t offset = (uint32_t)(addr - CLK_RST_BASE);
   // PLL_BASE registers (per Hekate bdk/soc/clock.h): each PLL has an _BASE
@@ -1859,12 +2528,17 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
     case 0x30:  return 0x00000002; // CLK_SYSTEM_RATE
     case 0x14:  return 0x030180C1; // CLK_OUT_ENB_H
     case 0x280: return 0x23024780; // CLK_OUT_ENB_X
-    // _L and _U carry the SDMMC clock-enable bits this emulator's storage
-    // model depends on. _L already has SDMMC1 (bit 14) set on real silicon;
-    // _U needs SDMMC4 (bit 15) forced on, which the measured value does not
-    // have - the console had not brought eMMC up at that instant.
+    // _L carries the SDMMC clock-enable bits the storage model depends on:
+    // SDMMC1 is bit 14 and SDMMC4 is bit 15, and the measured value has both.
     case 0x10:  return 0x9802D1B0;
-    case 0x18:  return 0x01F00200 | (1u << 15);
+    // _U and its reset counterpart are live, so a payload that enables a _U
+    // peripheral (UART-D, I2C3, SDMMC3, ...) can see that it worked.
+    case 0x0C:  return car_rst_u;  // RST_DEVICES_U
+    case 0x18:  return car_enb_u;  // CLK_OUT_ENB_U
+    // CLK_SOURCE_UARTD. clock_uart_use_src_div() programs PLLP_OUT0 with
+    // CLK_SRC_DIV(2) here (0x00000002) and sets UART_SRC_CLK_DIV_EN for the
+    // 1M/3M rates; the payload reads it back to confirm the port's source.
+    case 0x1C0: return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
     }
   }
 
@@ -1911,22 +2585,38 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
 
   if (offset == 0x50)
     return (4 << 28); // OSC_CTRL, informational
-  if (offset == 0x10)
-    return (1 << 14); // CLK_ENB_SDMMC1
-  if (offset == 0x18)
-    return (1 << 15); // CLK_ENB_SDMMC4
   if (offset == 0x04)
     return 0; // RST_DEVICES_L (none in reset)
-  if (offset == 0x0C)
-    return 0; // RST_DEVICES_H (none in reset)
+
+  // PLLE and PLLREFE report lock in their _MISC registers, not in _BASE bit
+  // 27 like the PLLs handled above, so the PCIe model answers for them.
+  {
+    uint32_t v = mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+    if (pcie_car_read(offset, &v))
+      return v;
+  }
   (void)state;
   return 0;
 }
 
 void clk_rst_write(EmuState *state, uint64_t addr, uint32_t val) {
   (void)state;
-  (void)addr;
-  (void)val;
+  uint32_t offset = (uint32_t)(addr - CLK_RST_BASE);
+  // Only the _U pair is live so far; everything else stays a no-op, and the
+  // generic mmio_regs cache in the write hook still serves the CLK_SOURCE_*
+  // read-backs. bdk reaches these through the SET/CLR aliases exclusively.
+  switch (offset) {
+  case 0x00C: car_rst_u  =  val; break; // RST_DEVICES_U, direct write
+  case 0x018: car_enb_u  =  val; break; // CLK_OUT_ENB_U, direct write
+  case 0x310: car_rst_u |=  val; break; // RST_DEV_U_SET
+  case 0x314: car_rst_u &= ~val; break; // RST_DEV_U_CLR
+  case 0x330: car_enb_u |=  val; break; // CLK_ENB_U_SET
+  case 0x334: car_enb_u &= ~val; break; // CLK_ENB_U_CLR
+  default: break;
+  }
+  // The PCIe root complex depends on PLLE, PLLREFE and the PCIE/AFI/
+  // PCIEXCLK/UPHY/padctl reset+enable bits, so it shadows the same writes.
+  pcie_car_write(offset, val);
 }
 
 // ==================== Fuse ====================
@@ -2191,13 +2881,77 @@ static void vic_write_internal(EmuState *state, uint32_t offset, uint32_t val) {
   printf("[vic] W: 0x%08X = 0x%08X\n", offset, val);
 }
 
+// ==================== APE audio hub: I2S, ADMAIF, ADMA ====================
+//
+// hwtest's speaker probe drives a real tone through this path, so all three
+// blocks needed a model. They were previously stubs returning 0, which made
+// the probe print nonsense - I2S_TIMING reading back 0 turns
+// "64 bclk/frame, fs 23437 Hz" into "2 bclk/frame, fs 750000 Hz" - and the
+// ADMAIF page was not dispatched at all, so a quarter of a million PIO
+// sample writes each fell through to the write-chain's logging arm.
+//
+// Write-back is the right default here: every register hwtest reads back is
+// one it wrote itself (I2S_CTRL, I2S_TIMING, the CIF and FIFO_CTRL words),
+// and reporting what was programmed is exactly what the real block does.
+
 static uint32_t i2s_read(EmuState *state, uint64_t addr) {
   (void)state;
-  (void)addr;
-  return 0;
+  // Read back what the payload programmed. mmio_regs is populated by the
+  // write hook before dispatch, so this needs no state of its own.
+  return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
 }
 
 static void i2s_write(EmuState *state, uint64_t addr, uint32_t val) {
+  (void)state;
+  (void)addr;
+  (void)val;
+  // The write hook already cached the value in mmio_regs; nothing else to do.
+}
+
+// ADMAIF + AXBAR. Two offsets carry behaviour, the rest is write-back:
+//
+//   +0x32C  TX channel 0 FIFO_WRITE - the PIO sample port. Accept and drop.
+//           This MUST be silent: it is written ~224k times per run.
+//   +0x744  TX ACIF FIFO_FULL - the flag the sample loop spins on. Bit 0
+//           must stay clear or hwtest burns 200,001 reads per sample before
+//           giving up, i.e. ~45 billion reads for one melody.
+//
+// Soft-reset registers read back 0 because the payload polls them until they
+// self-clear (bdk's usual "write 1, wait for 0" handshake).
+static uint32_t admaif_read(EmuState *state, uint64_t addr) {
+  (void)state;
+  uint32_t offset = (uint32_t)(addr - ADMAIF_BASE);
+  switch (offset) {
+  case 0x704:            // global soft reset - completed
+  case 0x744:            // TX ACIF FIFO_FULL - never full, so PIO never spins
+    return 0;
+  default:
+    return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+  }
+}
+
+static void admaif_write(EmuState *state, uint64_t addr, uint32_t val) {
+  (void)state;
+  (void)val;
+  uint32_t offset = (uint32_t)(addr - ADMAIF_BASE);
+  if (offset == 0x32C) {
+    // Sample sink. Deliberately does nothing and logs nothing.
+    return;
+  }
+  // Everything else is left in mmio_regs by the write hook.
+}
+
+// ADMA. hwtest resets the block and sets GLOBAL_CMD, then feeds the FIFO by
+// PIO and never starts a channel, so only the soft-reset read-back matters.
+static uint32_t adma_read(EmuState *state, uint64_t addr) {
+  (void)state;
+  uint32_t offset = (uint32_t)(addr - ADMA_BASE);
+  if (offset == 0xC04)   // global soft reset - completed
+    return 0;
+  return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+}
+
+static void adma_write(EmuState *state, uint64_t addr, uint32_t val) {
   (void)state;
   (void)addr;
   (void)val;
@@ -2465,6 +3219,19 @@ static void hook_mmio_read(uc_engine *uc, uc_mem_type type, uint64_t address,
 
     if (address >= GPIO_BASE && address < GPIO_BASE + GPIO_SIZE) {
       result = gpio_read(state, address);
+    } else if ((address >= PCIE_BLOCK_BASE &&
+                address < PCIE_BLOCK_BASE + PCIE_BLOCK_SIZE) ||
+               (address >= PCIE_CS_BASE &&
+                address < PCIE_CS_BASE + PCIE_CS_MODEL_SIZE) ||
+               (address >= PCIE_MEM_BASE &&
+                address < PCIE_MEM_BASE + PCIE_MEM_MODEL_SIZE)) {
+      result = pcie_read(state, address);
+    } else if (address >= XUSB_PADCTL_BASE &&
+               address < XUSB_PADCTL_BASE + XUSB_PADCTL_SIZE) {
+      result = padctl_read(state, address);
+    } else if (address >= MSELECT_BASE &&
+               address < MSELECT_BASE + MSELECT_SIZE) {
+      result = mselect_read(state, address);
     } else if (address >= VIC_BASE && address < VIC_BASE + VIC_SIZE) {
       result = vic_read(state, address);
     } else if (address >= SYSREG_BASE && address < SYSREG_BASE + SYSREG_SIZE) {
@@ -2479,6 +3246,10 @@ static void hook_mmio_read(uc_engine *uc, uc_mem_type type, uint64_t address,
       result = flow_read(state, address);
     } else if (address >= I2S_BASE && address < I2S_BASE + I2S_SIZE) {
       result = i2s_read(state, address);
+    } else if (address >= ADMAIF_BASE && address < ADMAIF_BASE + ADMAIF_SIZE) {
+      result = admaif_read(state, address);
+    } else if (address >= ADMA_BASE && address < ADMA_BASE + ADMA_SIZE) {
+      result = adma_read(state, address);
     } else if (address >= RTC_BASE && address < RTC_BASE + RTC_SIZE) {
       result = rtc_read(state, address);
     } else if (address >= I2C2_BASE && address < I2C2_BASE + I2C2_SIZE) {
@@ -2534,51 +3305,103 @@ static void hook_mmio_write(uc_engine *uc, uc_mem_type type, uint64_t address,
 
     if (address >= GPIO_BASE && address < GPIO_BASE + GPIO_SIZE) {
       gpio_write(state, address, val);
+    } else if ((address >= PCIE_BLOCK_BASE &&
+                address < PCIE_BLOCK_BASE + PCIE_BLOCK_SIZE) ||
+               (address >= PCIE_CS_BASE &&
+                address < PCIE_CS_BASE + PCIE_CS_MODEL_SIZE) ||
+               (address >= PCIE_MEM_BASE &&
+                address < PCIE_MEM_BASE + PCIE_MEM_MODEL_SIZE)) {
+      pcie_write(state, address, val);
+    } else if (address >= XUSB_PADCTL_BASE &&
+               address < XUSB_PADCTL_BASE + XUSB_PADCTL_SIZE) {
+      padctl_write(state, address, val);
+    } else if (address >= MSELECT_BASE &&
+               address < MSELECT_BASE + MSELECT_SIZE) {
+      mselect_write(state, address, val);
     } else if (address >= SDMMC1_BASE && address < SDMMC1_BASE + 0x200) {
       misc_write(uc, state, address, value, size);
     } else if (address >= SDMMC4_BASE && address < SDMMC4_BASE + 0x200) {
       misc_write(uc, state, address, value, size);
     } else if (address >= 0x70006000 && address < 0x70006500) {
-      uint32_t port   = (address - 0x70006000) / 0x40;
-      uint32_t offset = (address - 0x70006000) % 0x40;
-      // Keep every non-TX register (LCR, IER/DLM, DLL, MCR...) so it reads
-      // back. Note offset 0 is the divisor latch LSB - not the transmit
-      // register - whenever DLAB is set, so writing the baud divisor must not
-      // be mistaken for a character to print.
-      uint32_t ubase = 0x70006000 + port * 0x40;
-      bool dlab = (mmio_regs.count(ubase + 0x0C) ? mmio_regs[ubase + 0x0C] : 0) & 0x80;
-      if (offset != 0 || dlab)
-        mmio_regs[address] = val;
+      uint32_t offset = 0;
+      int port = uart_port_of(address, &offset);
+      // Note offset 0 is the divisor latch LSB - not the transmit register -
+      // whenever DLAB is set, so writing the baud divisor must not be
+      // mistaken for a character to print. Every register (including this
+      // one) was already cached above; the divisor is additionally kept in
+      // UartPort because a later THR write overwrites that cache entry.
+      if (port >= 0) {
+        UartPort &up = uart_ports[port];
+        uint32_t ubase = uart_bases[port];
+        bool dlab = (mmio_regs.count(ubase + 0x0C) ? mmio_regs[ubase + 0x0C] : 0) & 0x80;
 
-      if (offset == 0 && !dlab && port < EmuState::N_UARTS) {
-        uint8_t b = (uint8_t)val;
+        if (offset == 0x00 && dlab) {
+          up.divisor = (uint16_t)((up.divisor & 0xFF00) | (val & 0xFF));
+        } else if (offset == 0x04 && dlab) {
+          up.divisor = (uint16_t)((up.divisor & 0x00FF) | ((val & 0xFF) << 8));
+        } else if (offset == 0x08) {
+          // FCR. RX_CLR is honoured only on the BT port, where the receive
+          // FIFO is fed by an emulated device and dropping it is exactly what
+          // the hardware does. On the console ports that FIFO models a human
+          // at a terminal, and bdk's uart_init() issues an unconditional
+          // RX_CLR - which would silently eat scripted keystrokes.
+          if (port == UART_D && (val & 0x02))
+            state->uart_rx_fifo[port].clear();
+        } else if (offset == 0x10) {
+          uint8_t old_mcr = up.mcr;
+          up.mcr = (uint8_t)val;
+          // Entering or leaving 16550 internal loopback swings all four modem
+          // inputs at once - MCR[3:0] are tied onto MSR[7:4] while it is on -
+          // so every delta bit latches. That is what makes the payload's
+          // first MSR read after its loopback self-test 0x4F, not 0x40.
+          if ((old_mcr ^ up.mcr) & 0x10)
+            up.msr_delta |= 0x0F;
+        }
 
-        // Append every byte to the per-port TX log — the console window
-        // renders this as scrolling text. Trim from the front if it grows
-        // past 64 KB so ImGui rendering stays responsive.
-        std::string &log = state->uart_tx_log[port];
-        if (b == '\n' || (b >= 0x20 && b < 0x7F))
-          log.push_back((char)b);
-        if (log.size() > 64 * 1024)
-          log.erase(0, log.size() - 48 * 1024);
+        if (offset == 0 && !dlab) {
+          uint8_t b = (uint8_t)val;
 
-        // Mirror to host stdout in line-buffered form so existing
-        // `grep '[uart]'` workflows still work.
-        static char uart_line[5][512];
-        static size_t uart_len[5] = {0};
-        auto flush_uart_line = [&](uint32_t p) {
-          if (uart_len[p] > 0) {
-            uart_line[p][uart_len[p]] = 0;
-            printf("[uart%c] %s\n", 'A' + (char)p, uart_line[p]);
-            fflush(stdout);
-            uart_len[p] = 0;
+          if (up.mcr & 0x10) {
+            // Internal loopback: the byte is tied straight back to this
+            // port's own receiver inside the controller and never reaches a
+            // pad. It must NOT be handed to whatever is on the far end, or
+            // the BT chip's H4 parser desyncs on the A5 5A 00 FF test
+            // pattern - and it must not reach the TX log either, since it is
+            // not something the payload actually transmitted.
+            state->uart_rx_fifo[port].push_back(b);
+          } else {
+            // UART-D is the Bluetooth radio's H4 transport.
+            if (port == UART_D)
+              bt_chip_rx(state, b);
+
+            // Append every byte to the per-port TX log — the console window
+            // renders this as scrolling text. Trim from the front if it grows
+            // past 64 KB so ImGui rendering stays responsive.
+            std::string &log = state->uart_tx_log[port];
+            if (b == '\n' || (b >= 0x20 && b < 0x7F))
+              log.push_back((char)b);
+            if (log.size() > 64 * 1024)
+              log.erase(0, log.size() - 48 * 1024);
+
+            // Mirror to host stdout in line-buffered form so existing
+            // `grep '[uart]'` workflows still work.
+            static char uart_line[EmuState::N_UARTS][512];
+            static size_t uart_len[EmuState::N_UARTS] = {0};
+            auto flush_uart_line = [&](int p) {
+              if (uart_len[p] > 0) {
+                uart_line[p][uart_len[p]] = 0;
+                printf("[uart%c] %s\n", 'A' + (char)p, uart_line[p]);
+                fflush(stdout);
+                uart_len[p] = 0;
+              }
+            };
+            if (b == '\n' || b == '\r') {
+              flush_uart_line(port);
+            } else if (b >= 0x20 && b < 0x7F) {
+              if (uart_len[port] + 1 >= sizeof(uart_line[port])) flush_uart_line(port);
+              uart_line[port][uart_len[port]++] = (char)b;
+            }
           }
-        };
-        if (b == '\n' || b == '\r') {
-          flush_uart_line(port);
-        } else if (b >= 0x20 && b < 0x7F) {
-          if (uart_len[port] + 1 >= sizeof(uart_line[port])) flush_uart_line(port);
-          uart_line[port][uart_len[port]++] = (char)b;
         }
       }
     } else if (address >= VIC_BASE && address < VIC_BASE + VIC_SIZE) {
@@ -2593,6 +3416,10 @@ static void hook_mmio_write(uc_engine *uc, uc_mem_type type, uint64_t address,
       soc_therm_write(state, address, val);
     } else if (address >= I2S_BASE && address < I2S_BASE + I2S_SIZE) {
       i2s_write(state, address, val);
+    } else if (address >= ADMAIF_BASE && address < ADMAIF_BASE + ADMAIF_SIZE) {
+      admaif_write(state, address, val);
+    } else if (address >= ADMA_BASE && address < ADMA_BASE + ADMA_SIZE) {
+      adma_write(state, address, val);
     } else if (address >= RTC_BASE && address < RTC_BASE + RTC_SIZE) {
       rtc_write(state, address, val);
     } else if (address >= I2C2_BASE && address < I2C2_BASE + I2C2_SIZE) {
@@ -2881,11 +3708,21 @@ void mmio_init(uc_engine *uc, EmuState *state) {
       {VIC_BASE, VIC_SIZE},
       {SYSREG_BASE, SYSREG_SIZE},
       {I2S_BASE, I2S_SIZE},
+      {ADMAIF_BASE, ADMAIF_SIZE},
+      {ADMA_BASE, ADMA_SIZE},
       {SE_BASE, SE_SIZE},
       {TSEC_BASE, TSEC_SIZE},
       {SYSCTR0_BASE, SYSCTR0_SIZE},
       {BPMP_CACHE_BASE, BPMP_CACHE_SIZE}, // BPMP_CACHE
       {TZRAM_BASE, TZRAM_SIZE},           // TZRAM
+      {XUSB_PADCTL_BASE, XUSB_PADCTL_SIZE},
+      {MSELECT_BASE, MSELECT_SIZE},
+      // PCIe. These are the only mapped regions below 0x50000000, so they
+      // also need their own hooks (see below) - the main MMIO hook pair
+      // covers 0x50000000..0x7FFFFFFF and would never see them.
+      {PCIE_BLOCK_BASE, PCIE_BLOCK_SIZE},
+      {PCIE_CS_BASE, PCIE_CS_MODEL_SIZE},
+      {PCIE_MEM_BASE, PCIE_MEM_MODEL_SIZE},
   };
 
   for (const auto &r : regions) {
@@ -2899,6 +3736,18 @@ void mmio_init(uc_engine *uc, EmuState *state) {
               0x50000000, 0x7FFFFFFF);
   uc_hook_add(uc, &h_write, UC_HOOK_MEM_WRITE, (void *)hook_mmio_write, state,
               0x50000000, 0x7FFFFFFF);
+
+  // T210 puts the PCIe root complex at the BOTTOM of the address map, below
+  // every other peripheral, so it needs a second hook pair. The range is a
+  // filter, not a mapping - only the three small regions mapped above ever
+  // resolve inside it.
+  static uc_hook h_pcie_read, h_pcie_write;
+  uc_hook_add(uc, &h_pcie_read, UC_HOOK_MEM_READ, (void *)hook_mmio_read,
+              state, PCIE_BLOCK_BASE, PCIE_MEM_BASE + PCIE_MEM_MODEL_SIZE - 1);
+  uc_hook_add(uc, &h_pcie_write, UC_HOOK_MEM_WRITE, (void *)hook_mmio_write,
+              state, PCIE_BLOCK_BASE, PCIE_MEM_BASE + PCIE_MEM_MODEL_SIZE - 1);
+
+  pcie_reset(state);
 
   uc_hook_add(uc, &h_unmapped,
               UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED,

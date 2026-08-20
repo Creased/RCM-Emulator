@@ -155,9 +155,61 @@ constexpr uint64_t SYSREG_SIZE = 0x1000;
 constexpr uint64_t I2S_BASE = 0x702D1000;
 constexpr uint64_t I2S_SIZE = 0x1000;
 
+// APE audio hub: ADMAIF (+0x000) and the AXBAR crossbar (+0x800) share one
+// 4 KB page directly below I2S. Modelling it is not optional for hwtest: its
+// speaker probe pushes ~224k samples through the ADMAIF PIO FIFO one 32-bit
+// write at a time, and every write reaching the write-chain's fall-through
+// arm costs a printf + fflush. Unmodelled, the melody alone emits a quarter
+// of a million log lines and the run never reaches the Display / Inputs /
+// Raw state / Diagnostics pages.
+constexpr uint64_t ADMAIF_BASE = 0x702D0000;
+constexpr uint64_t ADMAIF_SIZE = 0x1000;
+
+// ADMA, the audio DMA engine. hwtest resets and enables it but never runs a
+// channel (the tone goes in by PIO), so only the soft-reset handshake has to
+// be believable.
+constexpr uint64_t ADMA_BASE = 0x702E2000;
+constexpr uint64_t ADMA_SIZE = 0x1000;
+
 // SE (Security Engine)
 constexpr uint64_t SE_BASE = 0x70012000;
 constexpr uint64_t SE_SIZE = 0x2000;
+
+// MSELECT: the fabric between every master (CCPLEX and BPMP alike) and the
+// AXI slaves, PCIe among them. Modelled because leaving it in reset is the
+// difference between a register read and a permanently hung console.
+constexpr uint64_t MSELECT_BASE = 0x50060000;
+constexpr uint64_t MSELECT_SIZE = 0x1000;
+
+// XUSB pad controller. Owns the UPHY SERDES lanes shared by PCIe (pcie-0..4)
+// and USB 3.0 SuperSpeed (pcie-5/6 on this board), plus UPHY PLL P0.
+constexpr uint64_t XUSB_PADCTL_BASE = 0x7009F000;
+constexpr uint64_t XUSB_PADCTL_SIZE = 0x1000;
+
+// ==================== PCIe ====================
+//
+// Unlike every other peripheral here, the PCIe apertures live BELOW the
+// 0x50000000 MMIO band - T210 puts the whole root complex in the bottom of
+// the address map (tegra210.dtsi pcie@1003000). The BPMP can address it:
+// bdk's MMU table defines DRAM and IRAM entries only and leaves the fallback
+// entry RWX, so PCIe space is reachable and uncached.
+//
+// Only the windows a payload actually touches are mapped: 16 KiB covering
+// both root ports plus PADS and AFI, 128 KiB of configuration aperture (bus
+// 0 and bus 1 are all that exist), and one 4 KiB page of downstream memory
+// for the endpoint's BAR0 register window. Mapping the architectural sizes
+// (256 MiB of config, 208 MiB of memory) would cost the host gigabytes for
+// address ranges nothing ever reads.
+constexpr uint64_t PCIE_RP0_BASE  = 0x01000000;  // root port 0 registers
+constexpr uint64_t PCIE_RP1_BASE  = 0x01001000;  // root port 1 registers
+constexpr uint64_t PCIE_PADS_BASE = 0x01003000;
+constexpr uint64_t PCIE_AFI_BASE  = 0x01003800;
+constexpr uint64_t PCIE_BLOCK_BASE = 0x01000000;
+constexpr uint64_t PCIE_BLOCK_SIZE = 0x4000;
+constexpr uint64_t PCIE_CS_BASE   = 0x02000000;  // type-1 extended config
+constexpr uint64_t PCIE_CS_MODEL_SIZE = 0x20000; // buses 0 and 1 only
+constexpr uint64_t PCIE_MEM_BASE  = 0x13000000;  // non-prefetchable window
+constexpr uint64_t PCIE_MEM_MODEL_SIZE = 0x1000;
 
 // TSEC (Falcon control regs are in the 0x1000–0x11FF window within TSEC_BASE)
 constexpr uint64_t TSEC_BASE = 0x54500000;

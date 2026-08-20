@@ -209,6 +209,8 @@ needed.
 | `--rawnand`           | `rawnand.bin` | eMMC GPP partition prefix (auto-detects `.00`, `.01`, …). |
 | `--prod-keys`         | `prod.keys`   | Override BIS keys from a Lockpick-style key file.         |
 | `--oem`               | `erista` \| `mariko` | Switch SoC generation. Drives `APB_MISC_GP_HIDREV` so Hekate's `h_cfg.t210b01` matches and pkg1 identification skips the right OEM header. Default `erista`. |
+| `--bt-radio`          | `healthy` \| `faulty` \| `absent` | Broadcom CYW4356 behaviour on UART-D. `healthy` powers up on the `BT_REG_ON` edge, holds `BT_HOST_WAKE` high, asserts `RTS_N` and answers HCI; `faulty` reproduces the 2110-1118 console (module fitted, never leaves POR); `absent` additionally leaves `BT_UART_RXD` in a break condition. Overrides `[bluetooth] radio` in the ini. Default `healthy`. |
+| `--wifi-radio`        | `healthy` \| `faulty` \| `absent` | The WLAN half of the same CYW4356: a PCI Express endpoint on root port 1. `healthy` trains the link, enumerates as `14E4:43EC` and answers a ChipCommon ChipID read with `0x4356`; `faulty` still trains and enumerates but reads all ones on the backplane (live PCIe front-end, dead radio die); `absent` never leaves detect. The model also enforces the datasheet's power-up ordering, so a payload that releases PERST# too early gets a link that stays down and a `[pcie]` line naming the reason. Overrides `[wifi] radio` in the ini. Default `healthy`. |
 | `--auto-pin-recovery` | (none)        | Drive the Lockpick PIN-recovery menu without user input.  |
 | `--auto-te-script`    | (none)        | Drive `recover_pin.te` in TegraExplorer without input.    |
 

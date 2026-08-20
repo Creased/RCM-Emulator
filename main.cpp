@@ -275,7 +275,7 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <payload.bin> [--sd <sd.img>] [--boot0 <boot0.bin>] [--rawnand <rawnand_prefix>] [--prod-keys <prod.keys>] [--oem erista|mariko]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <payload.bin> [--sd <sd.img>] [--boot0 <boot0.bin>] [--rawnand <rawnand_prefix>] [--prod-keys <prod.keys>] [--oem erista|mariko] [--bt-radio healthy|faulty|absent] [--wifi-radio healthy|faulty|absent]\n", argv[0]);
         fprintf(stderr, "\nControls:\n");
         fprintf(stderr, "  Arrow Up/Down = VOL+/VOL- buttons\n");
         fprintf(stderr, "  Enter         = POWER button\n");
@@ -337,6 +337,34 @@ int main(int argc, char *argv[]) {
             } else {
                 fprintf(stderr, "[emu] Unknown --oem value '%s'; expected 'erista' or 'mariko'\n", oem);
             }
+        } else if (strcmp(argv[i], "--bt-radio") == 0 && i + 1 < argc) {
+            // Bluetooth radio behaviour. Same contract as --oem: the ini is
+            // the source of truth, this is the one-shot override that lets
+            // the same payload+ini be re-run against a dead radio.
+            const char *mode = argv[++i];
+            uint8_t sel = BT_RADIO_HEALTHY;
+            if (bt_radio_parse(mode, &sel)) {
+                state.bt_radio = sel;
+                printf("[emu] BT radio: %s [overrides ini]\n", bt_radio_name(sel));
+            } else {
+                fprintf(stderr, "[emu] Unknown --bt-radio value '%s'; expected"
+                                " 'healthy', 'faulty' or 'absent'\n", mode);
+            }
+        } else if (strcmp(argv[i], "--wifi-radio") == 0 && i + 1 < argc) {
+            // WLAN half of the same package, on PCIe. 'faulty' means
+            // something different here from the Bluetooth side: the link
+            // trains and config space enumerates, but the radio die behind
+            // the PCIe front-end is dead. See WifiRadioMode in emu_state.h.
+            const char *mode = argv[++i];
+            uint8_t sel = WIFI_RADIO_HEALTHY;
+            if (wifi_radio_parse(mode, &sel)) {
+                state.wifi_radio = sel;
+                printf("[emu] Wi-Fi radio: %s [overrides ini]\n",
+                       wifi_radio_name(sel));
+            } else {
+                fprintf(stderr, "[emu] Unknown --wifi-radio value '%s'; expected"
+                                " 'healthy', 'faulty' or 'absent'\n", mode);
+            }
         }
     }
 
@@ -357,6 +385,14 @@ int main(int argc, char *argv[]) {
         // be driven any other way from a headless / CI run.
         else if (strcmp(argv[i], "--input-script") == 0 && i + 1 < argc)
             input_script_load(argv[++i]);
+    }
+
+    // Default to sd.img in the working directory when --sd is not given, so the
+    // payload mounts a real FAT volume instead of failing on an empty card
+    // ("f_mount failed (13)" / NO FAT at init). Explicit --sd always wins.
+    if (!sd_path && access("sd.img", F_OK) == 0) {
+        sd_path = "sd.img";
+        printf("[emu] No --sd given; defaulting to sd.img\n");
     }
 
     if (sd_path) {

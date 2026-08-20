@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <vector>
 #include <string>
@@ -15,6 +16,80 @@
  */
 
 #include <unicorn/unicorn.h>
+
+// Bluetooth radio behaviour, selected by `[bluetooth] radio=` in rcm_emu.ini
+// or `--bt-radio` on the command line. The Broadcom CYW4356 model in
+// t210/mmio.cpp reads this every time the payload can observe the part.
+//
+//   healthy - the module powers up on the BT_REG_ON edge, holds BT_HOST_WAKE
+//             high, drives its RTS_N low once POR completes and answers HCI.
+//   faulty  - the module is fitted but never comes out of POR: BT_HOST_WAKE
+//             reads low, RTS_N never asserts and nothing ever reaches the
+//             wire. This is the console that returns 2110-1118 in HOS.
+//   absent  - no module at all. As faulty, plus nothing drives BT_UART_TXD,
+//             so the Tegra's own pull-down on RX reads as a line break.
+enum BtRadioMode : uint8_t {
+    BT_RADIO_HEALTHY = 0,
+    BT_RADIO_FAULTY  = 1,
+    BT_RADIO_ABSENT  = 2,
+};
+
+inline const char *bt_radio_name(uint8_t mode) {
+    switch (mode) {
+    case BT_RADIO_FAULTY: return "faulty";
+    case BT_RADIO_ABSENT: return "absent";
+    default:              return "healthy";
+    }
+}
+
+// Accepts the three names above and the raw 0/1/2 the enum uses. Returns
+// false on anything else so the caller can warn instead of silently
+// selecting a mode the user did not ask for -- which is exactly what would
+// happen if this key went through the ini's numeric schema, where
+// strtoull("faulty") is 0 and 0 is "healthy".
+inline bool bt_radio_parse(const char *s, uint8_t *out) {
+    if (!s || !*s) return false;
+    if (!strcmp(s, "healthy") || !strcmp(s, "0")) { *out = BT_RADIO_HEALTHY; return true; }
+    if (!strcmp(s, "faulty")  || !strcmp(s, "1")) { *out = BT_RADIO_FAULTY;  return true; }
+    if (!strcmp(s, "absent")  || !strcmp(s, "2")) { *out = BT_RADIO_ABSENT;  return true; }
+    return false;
+}
+
+// WLAN half of the same CYW4356 package, selected by `[wifi] radio=` in
+// rcm_emu.ini or `--wifi-radio` on the command line. It is a PCI Express
+// endpoint on root port 1, so the failure modes are different from the
+// Bluetooth side's and worth separating:
+//
+//   healthy - the link trains, the endpoint enumerates as 14E4:43EC, and
+//             its BAR0 backplane window answers with ChipCommon ChipID
+//             0x4356. A working radio.
+//   faulty  - the PCIe front-end is alive: the link trains and config space
+//             reads back correctly, but the WLAN die behind it is not, so
+//             every backplane read returns all ones. This is the console
+//             that enumerates and still has no Wi-Fi.
+//   absent  - no module, or one whose PCIe side never comes up: the link
+//             never leaves detect and no config access is ever answered.
+enum WifiRadioMode : uint8_t {
+    WIFI_RADIO_HEALTHY = 0,
+    WIFI_RADIO_FAULTY  = 1,
+    WIFI_RADIO_ABSENT  = 2,
+};
+
+inline const char *wifi_radio_name(uint8_t mode) {
+    switch (mode) {
+    case WIFI_RADIO_FAULTY: return "faulty";
+    case WIFI_RADIO_ABSENT: return "absent";
+    default:                return "healthy";
+    }
+}
+
+inline bool wifi_radio_parse(const char *s, uint8_t *out) {
+    if (!s || !*s) return false;
+    if (!strcmp(s, "healthy") || !strcmp(s, "0")) { *out = WIFI_RADIO_HEALTHY; return true; }
+    if (!strcmp(s, "faulty")  || !strcmp(s, "1")) { *out = WIFI_RADIO_FAULTY;  return true; }
+    if (!strcmp(s, "absent")  || !strcmp(s, "2")) { *out = WIFI_RADIO_ABSENT;  return true; }
+    return false;
+}
 
 struct EmuState {
     uc_engine *uc = nullptr;
@@ -169,6 +244,13 @@ struct EmuState {
     std::atomic<uint8_t>  pmic_es_rev{0x81};         // MAX77620 CID5
     std::atomic<uint8_t>  cpu_pmic_version{0x12};    // MAX77621 CHIPID1 (measured, Erista)
 
+    // MAX77620 CNFG1_32K (reg 0x03), the LPO that clocks the combo radio.
+    // 32K_OK (bit 7) and 32K_OUT0_EN (bit 2) are set on every healthy
+    // console, but the rest of the byte varies per UNIT, not per SoC
+    // generation: 0xFC and 0xDC are both measured on Erista and on Mariko.
+    // Exposed so a capture from a specific console can be reproduced exactly.
+    std::atomic<uint8_t>  pmic_cnfg1_32k{0xFC};
+
     // SD card insertion (GPIO Port Z bit 1 = 0 means inserted).
     std::atomic<bool>     sd_inserted{true};
 
@@ -203,6 +285,14 @@ struct EmuState {
     std::atomic<uint8_t>  als_part_id{0x71};
     std::atomic<uint16_t> als_visible{128};   // DATA0 counts
     std::atomic<uint16_t> als_ir{21};         // DATA1 counts
+
+    // Bluetooth radio (Broadcom CYW4356, HCI/H4 on UART-D plus five control
+    // lines on GPIO port H). See BtRadioMode above for what each mode models.
+    std::atomic<uint8_t>  bt_radio{BT_RADIO_HEALTHY};
+
+    // WLAN radio (the other half of the same CYW4356, a PCIe endpoint on
+    // root port 1). See WifiRadioMode above for what each mode models.
+    std::atomic<uint8_t>  wifi_radio{WIFI_RADIO_HEALTHY};
 
     // SoC thermal sensor (TMP451, I2C5 @ 0x4C).
     std::atomic<int16_t>  soc_temp_c10{420};        // remote channel (SoC die): °C * 10
@@ -324,16 +414,21 @@ struct EmuState {
     // ============================================================
     // Per-UART scratch state used by the in-emulator UART console.
     // ============================================================
-    // Tegra X1 has UART_A..UART_E (5 ports). The mmio dispatcher for the
-    // 0x70006000 region uses (addr & 0x1FF) / 0x40 to derive the port idx.
+    // Tegra X1 has UART_A..UART_E (5 ports). Their register blocks are NOT
+    // evenly spaced -- bdk soc/uart.c carries the offset table
+    // { 0, 0x40, 0x200, 0x300, 0x400 } -- so the mmio dispatcher resolves the
+    // port index against that same table (uart_bases[] in t210/mmio.cpp), not
+    // by dividing the offset. Index order is therefore A=0..E=4.
     //
     // - uart_tx_log[idx] mirrors every byte the payload writes to that
     //   port's TX register, so the console window can render scrolling
     //   history without having to re-parse stdout. Capped at ~64 KB by a
     //   simple "drop the front when too big" trim.
-    // - uart_rx_fifo[idx] is bytes the host has typed in the console
-    //   window awaiting consumption by the next UART read (RBR via
-    //   offset 0x00, with bit 0 of LSR at offset 0x14 set when non-empty).
+    // - uart_rx_fifo[idx] is bytes waiting to be consumed by the next UART
+    //   read (RBR via offset 0x00, with bit 0 of LSR at offset 0x14 set when
+    //   non-empty). Filled by the console window, the input script, 16550
+    //   internal loopback, and emulated devices such as the CYW4356 on
+    //   UART_D.
     //
     // The CPU-emulation hooks and the ImGui console both run on the main
     // thread between SDL polls, so no locking is required.
