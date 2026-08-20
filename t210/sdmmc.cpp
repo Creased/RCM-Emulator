@@ -1,4 +1,5 @@
 #include "sdmmc.h"
+#include "trace.h"
 #include "memory_map.h"
 #include <cstdio>
 #include <cstring>
@@ -102,7 +103,7 @@ static void handle_sd_command(uc_engine *uc, EmuState *state, int id, uint32_t c
     uint32_t *norintsts = (id == 1) ? &state->sdmmc_norintsts : &state->sdmmc4_norintsts;
     bool *last_55 = (id == 1) ? &state->last_cmd_was_55 : &state->last_cmd4_was_55;
 
-    printf("[sdmmc%d] CMD%d Arg: 0x%08X\n", id, cmd, *arg);
+    TRACE("[sdmmc%d] CMD%d Arg: 0x%08X\n", id, cmd, *arg);
 
     *norintsts |= 0x01; // Command Complete interrupt
 

@@ -1,4 +1,5 @@
 #include "i2c3.h"
+#include "trace.h"
 #include "../emu_state.h"
 #include "memory_map.h"
 
@@ -289,7 +290,7 @@ void execute(EmuState *state, uint32_t expected_rx_size) {
     break;
   }
 
-  printf("[i2c3] EXEC slave=0x%02X dir=%c cmd=0x%02X tx=%zuB rx=%zuB stack=%zu\n",
+  TRACE("[i2c3] EXEC slave=0x%02X dir=%c cmd=0x%02X tx=%zuB rx=%zuB stack=%zu\n",
          slave_addr, dir_read ? 'R' : 'W', cmd, tx_buf.size(), rx_buf.size(),
          ev_stack.size());
 }

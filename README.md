@@ -119,6 +119,13 @@ green:
 
 ![PIN recovery demo](img/pin_recovery_demo.png)
 
+### Running without arguments
+
+Starting the emulator with no payload opens a small window that takes a
+dropped `.bin`, or press **O** for the system file dialog (zenity or kdialog
+on Linux). Dragging a payload onto the executable itself still works and
+skips the picker - it arrives as `argv[1]`.
+
 ### Build (Windows)
 
 Cross-compiled from Linux in a container, because neither dependency has a

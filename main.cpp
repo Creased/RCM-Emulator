@@ -22,6 +22,9 @@
 #include <unicorn/unicorn.h>
 
 #include "emu_state.h"
+#include <string>
+#include "payload_picker.h"
+#include "trace.h"
 #include "t210/memory_map.h"
 #include "t210/mmio.h"
 #include "display/sdl_display.h"
@@ -273,16 +276,37 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
 
 // ==================== Main ====================
 
+// Defined here, declared in trace.h. Off by default - see the note there.
+bool emu_trace_enabled = false;
+
 int main(int argc, char *argv[]) {
+    if (getenv("RCM_EMU_TRACE"))
+        emu_trace_enabled = true;
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--trace") == 0)
+            emu_trace_enabled = true;
+
+    // Started with no payload - usually a double-click, where a usage line
+    // on stderr goes to a console nobody is looking at. Offer the picker
+    // instead: drop a file on its window, or press O for the system dialog.
+    // Dragging a .bin onto the executable still bypasses all of this, since
+    // it arrives as argv[1].
+    std::string picked;
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <payload.bin> [--sd <sd.img>] [--boot0 <boot0.bin>] [--rawnand <rawnand_prefix>] [--prod-keys <prod.keys>] [--oem erista|mariko] [--bt-radio healthy|faulty|absent] [--wifi-radio healthy|faulty|absent]\n", argv[0]);
-        fprintf(stderr, "\nControls:\n");
-        fprintf(stderr, "  Arrow Up/Down = VOL+/VOL- buttons\n");
-        fprintf(stderr, "  Enter         = POWER button\n");
-        fprintf(stderr, "  Escape        = Quit\n");
-        fprintf(stderr, "  F8            = Save raw guest FB to fb_dump_NNNN.raw\n");
-        return 1;
+        picked = payload_picker_run();
+        if (picked.empty()) {
+            fprintf(stderr, "Usage: %s <payload.bin> [--sd <sd.img>] [--boot0 <boot0.bin>] [--rawnand <rawnand_prefix>] [--prod-keys <prod.keys>] [--oem erista|mariko] [--bt-radio healthy|faulty|absent] [--wifi-radio healthy|faulty|absent]\n", argv[0]);
+            fprintf(stderr, "\nControls:\n");
+            fprintf(stderr, "  Arrow Up/Down = VOL+/VOL- buttons\n");
+            fprintf(stderr, "  Enter         = POWER button\n");
+            fprintf(stderr, "  Escape        = Quit\n");
+            fprintf(stderr, "  F8            = Save raw guest FB to fb_dump_NNNN.raw\n");
+            return 1;
+        }
     }
+
+    // Everything below indexes argv, so present the picked file as argv[1].
+    const char *payload_arg = picked.empty() ? argv[1] : picked.c_str();
 
     printf("=== RCM Payload Emulator ===\n");
     printf("Using Unicorn Engine for ARM32 emulation\n\n");
@@ -298,7 +322,7 @@ int main(int argc, char *argv[]) {
 
     // Load payload binary
     size_t payload_size = 0;
-    uint8_t *payload = load_payload(argv[1], &payload_size);
+    uint8_t *payload = load_payload(payload_arg, &payload_size);
     if (!payload) return 1;
 
     // Parse additional arguments for storage. Configuration state

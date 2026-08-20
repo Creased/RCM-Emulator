@@ -56,7 +56,7 @@ WIN_CXX  = x86_64-w64-mingw32-g++
 WIN_OUT  = rcm_emu.exe
 WIN_OBJS = $(SRCS:.cpp=.win.o)
 WIN_CXXFLAGS = -Wall -g -O2 -std=c++17 -MMD -MP -I. -I$(IMGUI_DIR)                -I$(IMGUI_DIR)/backends -I/usr/x86_64-w64-mingw32/include/SDL2                -DSDL_MAIN_HANDLED
-WIN_LIBS = -lmingw32 -lSDL2main -lSDL2 -lunicorn -lpthread            -lwinmm -limm32 -lole32 -loleaut32 -lversion -lsetupapi -lcfgmgr32            -lgdi32 -lrpcrt4 -lws2_32 -luuid -lshell32 -ladvapi32 -luser32
+WIN_LIBS = -lmingw32 -lSDL2main -lSDL2 -lunicorn -lpthread            -lwinmm -limm32 -lole32 -loleaut32 -lversion -lsetupapi -lcfgmgr32            -lcomdlg32 -lgdi32 -lrpcrt4 -lws2_32 -luuid -lshell32 -ladvapi32 -luser32
 WIN_LDFLAGS = -static -static-libgcc -static-libstdc++
 
 .PHONY: all clean windows

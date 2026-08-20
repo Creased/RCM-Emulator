@@ -1,4 +1,5 @@
 #include "mmio.h"
+#include "trace.h"
 #include "../emu_state.h"
 #include "i2c3.h"
 #include "memory_map.h"
@@ -462,7 +463,7 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
       val &= ~(1 << 6); // VOL_UP  = PX6
     if (state->btn_vol_down)
       val &= ~(1 << 7); // VOL_DOWN = PX7
-    printf("[gpio] R: Port X IN = 0x%02X\n", val);
+    TRACE("[gpio] R: Port X IN = 0x%02X\n", val);
     return val;
   }
 
@@ -518,7 +519,7 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
   // question regardless of what is on the board.
   if (offset == 0x13C) {
     uint32_t v = gpio_h_in(state);
-    printf("[gpio] R: Port H IN = 0x%02X\n", v);
+    TRACE("[gpio] R: Port H IN = 0x%02X\n", v);
     return v;
   }
 
@@ -541,14 +542,14 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
     if (bank_off < 0x30) {
       // CNF / OE / OUT: hand back the cached write.
       uint32_t v = mmio_regs.count(addr) ? mmio_regs[addr] : 0;
-      printf("[gpio] R: offset 0x%X (CNF/OE/OUT cache) = 0x%08X\n", offset, v);
+      TRACE("[gpio] R: offset 0x%X (CNF/OE/OUT cache) = 0x%08X\n", offset, v);
       return v;
     }
     if (bank_off < 0x40) {
       // IN: mirror of the matching OUT one slot earlier.
       uint64_t out_addr = addr - 0x10;
       uint32_t v = mmio_regs.count(out_addr) ? mmio_regs[out_addr] : 0;
-      printf("[gpio] R: offset 0x%X (IN, mirror of OUT @ 0x%X) = 0x%08X\n",
+      TRACE("[gpio] R: offset 0x%X (IN, mirror of OUT @ 0x%X) = 0x%08X\n",
              offset, (uint32_t)(offset - 0x10), v);
       return v;
     }
@@ -556,13 +557,13 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
     // plain register they write through, 0x80 lower.
     if (bank_off >= 0x80 && bank_off < 0xB0) {
       uint32_t v = mmio_regs.count(addr - 0x80) ? mmio_regs[addr - 0x80] : 0;
-      printf("[gpio] R: offset 0x%X (masked alias of 0x%X) = 0x%08X\n", offset,
+      TRACE("[gpio] R: offset 0x%X (masked alias of 0x%X) = 0x%08X\n", offset,
              (uint32_t)(offset - 0x80), v);
       return v;
     }
   }
 
-  printf("[gpio] R: offset 0x%X = 0\n", offset);
+  TRACE("[gpio] R: offset 0x%X = 0\n", offset);
   return 0;
 }
 
@@ -583,10 +584,10 @@ void gpio_write(EmuState *state, uint64_t addr, uint32_t val) {
     uint32_t mask  = (val >> 8) & 0xFF;
     uint32_t cur   = mmio_regs.count(plain) ? mmio_regs[plain] : 0;
     mmio_regs[plain] = (cur & ~mask) | (val & mask);
-    printf("[gpio] W: offset 0x%X masked -> 0x%X = 0x%08X\n", offset,
+    TRACE("[gpio] W: offset 0x%X masked -> 0x%X = 0x%08X\n", offset,
            (uint32_t)(offset - 0x80), mmio_regs[plain]);
   } else {
-    printf("[gpio] W: offset 0x%X = 0x%08X\n", offset, val);
+    TRACE("[gpio] W: offset 0x%X = 0x%08X\n", offset, val);
   }
 
   // Bank 1 holds ports E..H, and port H carries BT_REG_ON, so re-sample the
@@ -1751,7 +1752,7 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
     else if (offset == 0xFE)
       result = 0x0303; // SDHCI Version 4.0
 
-    printf("[sdmmc%c] R: 0x%02lX = 0x%08X (PC=0x%llX)\n",
+    TRACE("[sdmmc%c] R: 0x%02lX = 0x%08X (PC=0x%llX)\n",
            (base == SDMMC4_BASE) ? '4' : '1', (unsigned long)offset,
            result, (unsigned long long)state->insn_count);
     return result;
@@ -1773,7 +1774,7 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
     uint32_t base = (addr >= SDMMC4_BASE) ? SDMMC4_BASE : SDMMC1_BASE;
     uint32_t offset = addr - base;
 
-    printf("[sdmmc%c] W: 0x%02X = 0x%08X (size %d)\n",
+    TRACE("[sdmmc%c] W: 0x%02X = 0x%08X (size %d)\n",
            (base == SDMMC4_BASE) ? '4' : '1', offset, val, size);
 
     uint32_t &arg =
@@ -1847,10 +1848,10 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
       bool is_read = (trnmod & 0x0010); // Bit 4 of TRNMOD is Read/Write
 
       if (base == SDMMC1_BASE) {
-        printf("[sdmmc] W: offset 0x%X = 0x%08X (PC=0x%08llX)\n", offset, val,
+        TRACE("[sdmmc] W: offset 0x%X = 0x%08X (PC=0x%08llX)\n", offset, val,
                (unsigned long long)state->insn_count);
         if (offset == 0x0E || (offset == 0x0C && size == 4)) {
-          printf("[sdmmc] CMD%d: arg=0x%08X, blkcnt=%d, trnmod=0x%04X\n", cmd,
+          TRACE("[sdmmc] CMD%d: arg=0x%08X, blkcnt=%d, trnmod=0x%04X\n", cmd,
                  arg, blkcnt, trnmod);
         }
         fflush(stdout);
@@ -2092,7 +2093,7 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
           uint8_t val = (arg >> 8) & 0xFF;
           if (index == 179) { // PARTITION_CONFIG
             state->emmc_partition = val & 0x7;
-            printf("[sdmmc] eMMC Partition Switch: %u\n",
+            TRACE("[sdmmc] eMMC Partition Switch: %u\n",
                    state->emmc_partition);
           }
           rsp[0] = r1_base | (4 << 9);
@@ -2130,7 +2131,7 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
             uc_mem_write(uc, dma_addr, scr, 8);
           norintsts |= 0x0002;
         } else {
-          printf("[sdmmc] ERROR: Storage command %d on base 0x%llX but fd is "
+          TRACE("[sdmmc] ERROR: Storage command %d on base 0x%llX but fd is "
                  "-1. (Missing --sd or --boot0?)\n",
                  cmd, (unsigned long long)base);
         }
@@ -2162,7 +2163,7 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
           if (bcnt == 0)
             bcnt = 1;
           if (cmd == 17 || cmd == 18) {
-            printf("[sdmmc] %s READ CMD%d: Sector = %llu, Count = %u (part=%u)\n",
+            TRACE("[sdmmc] %s READ CMD%d: Sector = %llu, Count = %u (part=%u)\n",
                    (base == SDMMC1_BASE) ? "SD" : "eMMC", cmd,
                    (unsigned long long)sector, bcnt,
                    (base == SDMMC1_BASE) ? 0 : state->emmc_partition);
@@ -2199,7 +2200,7 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
                   part_size = (size_t)st.st_size;
                 else
                   part_size = 4ULL * 1024 * 1024 * 1024;
-                printf("[sdmmc] GPP part size detected: %zu bytes\n", part_size);
+                TRACE("[sdmmc] GPP part size detected: %zu bytes\n", part_size);
               }
               if (!part_size) return; // No GPP files — nothing to read.
               int part_idx = (int)(current_off / part_size);
@@ -2210,7 +2211,7 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
                 if (is_read) {
                   ssize_t res = pread(real_fd, io_buf.data(), len, part_off);
                   if (res != (ssize_t)len)
-                    printf("[sdmmc] eMMC GPP READ ERROR: res=%zd, "
+                    TRACE("[sdmmc] eMMC GPP READ ERROR: res=%zd, "
                            "expected=%zu, off=0x%llX\n",
                            res, len, (unsigned long long)part_off);
                   uc_mem_write(uc, dma_addr, io_buf.data(), len);
@@ -2218,7 +2219,7 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
                   uc_mem_read(uc, dma_addr, io_buf.data(), len);
                   ssize_t res = pwrite(real_fd, io_buf.data(), len, part_off);
                   if (res != (ssize_t)len)
-                    printf("[sdmmc] eMMC GPP WRITE ERROR: res=%zd, "
+                    TRACE("[sdmmc] eMMC GPP WRITE ERROR: res=%zd, "
                            "expected=%zu, off=0x%llX\n",
                            res, len, (unsigned long long)part_off);
                 }
@@ -2229,7 +2230,7 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
                 ssize_t res =
                     pread(current_fd, io_buf.data(), len, current_off);
                 if (res != (ssize_t)len)
-                  printf("[sdmmc] SD/BOOT READ ERROR: res=%zd, expected=%zu, "
+                  TRACE("[sdmmc] SD/BOOT READ ERROR: res=%zd, expected=%zu, "
                          "off=0x%llX\n",
                          res, len, (unsigned long long)current_off);
                 uc_mem_write(uc, dma_addr, io_buf.data(), len);
@@ -2238,7 +2239,7 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
                 ssize_t res =
                     pwrite(current_fd, io_buf.data(), len, current_off);
                 if (res != (ssize_t)len)
-                  printf("[sdmmc] SD/BOOT WRITE ERROR: res=%zd, expected=%zu, "
+                  TRACE("[sdmmc] SD/BOOT WRITE ERROR: res=%zd, expected=%zu, "
                          "off=0x%llX\n",
                          res, len, (unsigned long long)current_off);
               }
@@ -3262,7 +3263,7 @@ static void sysreg_write(EmuState *state, uint64_t addr, uint32_t val) {
     actmon_write(state, offset - ACTMON_OFF_IN_SYSREG, val);
     return;
   }
-  printf("[sysreg] W: 0x%08X = 0x%08X\n", offset, val);
+  TRACE("[sysreg] W: 0x%08X = 0x%08X\n", offset, val);
 }
 
 // ==================== SOC_THERM (on-die thermal sensors) ====================
@@ -3444,7 +3445,7 @@ static void hook_mmio_read(uc_engine *uc, uc_mem_type type, uint64_t address,
     } else {
       result = misc_read(state, address);
     }
-    // printf("[mmio] R: 0x%08llX = 0x%08X (PC=0x%08X)\n", (unsigned long
+    // TRACE("[mmio] R: 0x%08llX = 0x%08X (PC=0x%08X)\n", (unsigned long
     // long)address, result, pc);
   }
 
@@ -3457,7 +3458,7 @@ static void hook_mmio_write(uc_engine *uc, uc_mem_type type, uint64_t address,
   uint32_t val = (uint32_t)value;
   uint32_t pc;
   uc_reg_read(uc, UC_ARM_REG_PC, &pc);
-  // printf("[mmio] W: 0x%08llX = 0x%08X (PC=0x%08X)\n", (unsigned long
+  // TRACE("[mmio] W: 0x%08llX = 0x%08X (PC=0x%08X)\n", (unsigned long
   // long)address, val, pc); fflush(stdout);
 
   if (address >= IRAM_BASE && address < IRAM_BASE + 0x40000) {
@@ -3620,7 +3621,7 @@ static void hook_mmio_write(uc_engine *uc, uc_mem_type type, uint64_t address,
             (address >= I2C5_BASE && address < I2C5_BASE + 0x1000) ||
             (address >= SE_BASE && address < SE_BASE + SE_SIZE) ||
             (address >= RTC_BASE && address < RTC_BASE + RTC_SIZE))) {
-        printf("[mmio] W: 0x%08llX = 0x%08X (PC=0x%08X)\n",
+        TRACE("[mmio] W: 0x%08llX = 0x%08X (PC=0x%08X)\n",
                (unsigned long long)address, val, pc);
         fflush(stdout);
       }
@@ -3634,10 +3635,10 @@ static bool hook_unmapped(uc_engine *uc, uc_mem_type type, uint64_t address,
   uint32_t pc;
   uc_reg_read(uc, UC_ARM_REG_PC, &pc);
   if (type == UC_MEM_READ_UNMAPPED) {
-    printf("[mmio] UNMAPPED R: 0x%08lX (PC=0x%08X)\n", (unsigned long)address,
+    TRACE("[mmio] UNMAPPED R: 0x%08lX (PC=0x%08X)\n", (unsigned long)address,
            pc);
   } else {
-    printf("[mmio] UNMAPPED W: 0x%08lX = 0x%08llX (PC=0x%08X)\n",
+    TRACE("[mmio] UNMAPPED W: 0x%08lX = 0x%08llX (PC=0x%08X)\n",
            (unsigned long)address, (unsigned long long)value, pc);
   }
   uint64_t page = address & ~0xFFFULL;
