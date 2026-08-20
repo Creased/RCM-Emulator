@@ -3027,13 +3027,12 @@ static void audio_play_take(void) {
          (double)(audio_pcm.size() / 2) / (double)have.freq, have.freq);
   fflush(stdout);
 
-  // Wait it out, bounded, so the run cannot hang on a stuck device.
-  int guard = (int)(audio_pcm.size() / 2 / (size_t)have.freq) * 20 + 200;
-  while (guard-- > 0 && SDL_GetQueuedAudioSize(audio_dev) > 0)
-    SDL_Delay(50);
-
-  SDL_CloseAudioDevice(audio_dev);
-  audio_dev = 0;
+  // Deliberately does NOT wait for playback to finish. This runs on the
+  // emulation thread, so blocking here freezes the whole emulator for the
+  // length of the take - nearly ten seconds for hwtest's melody - during
+  // which the window stops repainting and Windows paints it as hung. The
+  // whole buffer is already queued, so SDL drains it in the background
+  // while emulation carries on, and the device is left open for it.
 }
 
 
