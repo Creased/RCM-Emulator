@@ -1,7 +1,9 @@
 #ifndef RCM_PLATFORM_H
 #define RCM_PLATFORM_H
 
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -33,5 +35,15 @@ static inline int64_t file_size64(int fd) {
   return (int64_t)st.st_size;
 #endif
 }
+
+// Large zero-filled memory that only becomes resident where it is touched
+// (platform.cpp). zeroed_reset() makes all of it zero again, at the same
+// address, without touching it.
+uint8_t *zeroed_alloc(size_t size);
+void     zeroed_reset(uint8_t *p, size_t size);
+void     zeroed_free(uint8_t *p, size_t size);
+
+// fopen() that also accepts a UTF-8 name on Windows (a dropped file).
+FILE    *platform_fopen(const char *path, const char *mode);
 
 #endif // RCM_PLATFORM_H

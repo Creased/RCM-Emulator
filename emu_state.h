@@ -102,15 +102,40 @@ struct EmuState {
     // Updated by SDL mouse events; consumed by i2c3_*/STMFTS code on CPU thread.
     // Coordinates are in panel-raw space (X long axis 0..1264, Y short 0..704)
     // matching what touch.c expects before its rescaling.
-    std::atomic<uint16_t> tc_x{0};
-    std::atomic<uint16_t> tc_y{0};
+    //
+    // Events queue up rather than overwrite each other: a click shorter than
+    // the payload's poll interval used to reach it as a bare LEAVE, the
+    // ENTER lost under it. Single producer (SDL), single consumer (I2C3).
+    struct TouchEvent { uint8_t op; uint16_t x, y; }; // op 3/4/5 = ENTER/LEAVE/MOTION
+    static constexpr uint32_t TC_QUEUE = 32;
+    TouchEvent            tc_queue[TC_QUEUE] = {};
+    std::atomic<uint32_t> tc_q_head{0};    // next slot the producer fills
+    std::atomic<uint32_t> tc_q_tail{0};    // next slot the consumer takes
     std::atomic<bool>     tc_pressed{false};
-    std::atomic<bool>     tc_event_pending{false};
-    std::atomic<uint8_t>  tc_event_op{0};   // 0x03=ENTER, 0x04=LEAVE, 0x05=MOTION
-    uint8_t               tc_finger_id = 1; // FTS4 finger IDs are 1-indexed
+    uint8_t               tc_finger_id = 0; // raw FTS4 ID; bdk reports it + 1
+
+    // Queue a touch event. MOTION is dropped when the queue is nearly full,
+    // so an ENTER or LEAVE always finds room.
+    void touch_post(uint8_t op, uint16_t x, uint16_t y) {
+      uint32_t head = tc_q_head.load(), tail = tc_q_tail.load();
+      uint32_t used = head - tail;
+      if (used >= TC_QUEUE || (op == 0x05 && used >= TC_QUEUE - 4))
+        return;
+      tc_queue[head % TC_QUEUE] = {op, x, y};
+      tc_q_head.store(head + 1);
+    }
+    bool touch_take(TouchEvent *ev) {
+      uint32_t tail = tc_q_tail.load();
+      if (tail == tc_q_head.load())
+        return false;
+      *ev = tc_queue[tail % TC_QUEUE];
+      tc_q_tail.store(tail + 1);
+      return true;
+    }
     // last_rot mirrors the rotation last applied by sdl_display_update.
     // Read from the SDL event handler to invert the display→window transform.
     std::atomic<uint32_t> last_rot{0};
+    std::atomic<uint32_t> last_auto_rot{0}; // what auto-detect picked, before any override
     std::atomic<uint32_t> last_out_w{1280};
     std::atomic<uint32_t> last_out_h{720};
 
@@ -141,6 +166,14 @@ struct EmuState {
     std::atomic<bool> running{true};
     std::atomic<bool> paused{false};
     std::atomic<bool> reboot_requested{false};
+    // The reboot is a power cycle (PMIC software reset, the UI's Reboot):
+    // the regulators lose their state too. Otherwise it is a SoC reset
+    // (PMC MAIN_RST), which the PMIC, and its rails, sit out.
+    std::atomic<bool> reboot_cold{false};
+    // The BPMP parked itself for good (bpmp_halt(): WAITEVENT with no timer)
+    // while CPU0 still runs - the handoff fusee and hekate's L4T launch do.
+    // Time keeps passing for CPU0; the BPMP executes nothing until reset.
+    bool bpmp_halted = false;
 
     // Payload kept around for soft reboot (re-write to IRAM and reset PC).
     uint8_t *payload_ptr = nullptr;
@@ -328,6 +361,8 @@ struct EmuState {
     std::atomic<uint32_t>& fuse_at(uint32_t offset) { return fuse_word[(offset & 0x3FC) / 4]; }
 
     void init_fuse_defaults() {
+        for (auto &w : fuse_word)
+            w.store(0);
         // Names below mirror Hekate's bdk/soc/fuse.h. Values picked from a
         // typical Erista golden-sample dump (any retail Switch is similar).
         fuse_at(0x100).store(1);            // FUSE_PRODUCTION_MODE

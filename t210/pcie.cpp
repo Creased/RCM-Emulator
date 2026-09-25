@@ -1,4 +1,5 @@
 #include "pcie.h"
+#include "ccplex.h"
 
 #include <cstdio>
 #include <cstring>
@@ -115,6 +116,7 @@ static constexpr uint64_t T_REFCLK_STABLE_US = 10000; // refclk -> PERST# high
 // stub reads straight after the BPMP has cycled the AFI reset - xbar X4_X1 in
 // bits 23:20 and root port 1 disabled (bit 2) until software clears it.
 static constexpr uint32_t MSELECT_CONFIG_RESET  = 0x07FF4020;
+static constexpr uint32_t MSELECT_CFG_ENABLE_PCIE_APERTURE = 1u << 5;
 static constexpr uint32_t AFI_PCIE_CONFIG_RESET = 0x00103025;
 
 // Broadcom identity (brcm_hw_ids.h, brcmfmac/pcie.c).
@@ -227,9 +229,8 @@ bool radio_core_alive(EmuState *state) {
 // hardware this is the difference between a register read and a dead
 // console, so it is checked before every single access rather than folded
 // into the link-training preconditions.
-// Everything this emulator executes is BPMP code - Unicorn runs the ARM7,
-// there is no CCPLEX model - and the BPMP cannot reach PCIe on real silicon.
-// Measured on an Erista and a Mariko: with clocks, resets, power and PLLE all
+// The BPMP cannot reach PCIe on real silicon; only a CPU-complex master can
+// (CPU0, t210/ccplex.cpp). Measured on an Erista and a Mariko: with clocks, resets, power and PLLE all
 // correct, the AFI window reads 0xFFFFFFFF and every offset of MSELECT reads
 // one constant. The TRM agrees (ch.19: BPMP-Lite is an AHB master, PCIe is
 // not an AHB slave; ch.16: MSELECT is CPU-complex hardware), and so does the
@@ -270,6 +271,21 @@ void mselect_complain(uint64_t addr) {
     printf("[pcie] *** RST_DEV_V bit %d first (bdk ccplex.c:121).        ***\n",
            CLK_V_MSELECT);
     fflush(stdout);
+}
+
+// MSELECT_CONFIG bit 5, ENABLE_PCIE_APERTURE (TRM 16.3.1, set at reset):
+// with it clear MSELECT does not route the PCIe apertures at all.
+static bool pcie_aperture_enabled(uint64_t addr) {
+    if (pcie.mselect[0] & MSELECT_CFG_ENABLE_PCIE_APERTURE)
+        return true;
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        printf("[pcie] access to %08X with MSELECT_CONFIG.ENABLE_PCIE_APERTURE "
+               "clear: MSELECT does not route it\n", (unsigned)addr);
+        fflush(stdout);
+    }
+    return false;
 }
 
 const char *link_blocked(EmuState *state, int port) {
@@ -394,7 +410,8 @@ void pcie_wl_reg_on(EmuState *state, bool level) {
 
 // ---- clock and reset controller -----------------------------------------
 
-void pcie_car_write(uint32_t offset, uint32_t val) {
+void pcie_car_write(EmuState *state, uint32_t offset, uint32_t val) {
+    bool mselect_was_up = mselect_up();
     switch (offset) {
     case CAR_RST_DEVICES_U: pcie.rst_u  =  val; break;
     case CAR_CLK_OUT_ENB_U: pcie.enb_u  =  val; break;
@@ -409,12 +426,17 @@ void pcie_car_write(uint32_t offset, uint32_t val) {
     case CAR_RST_DEVICES_V: pcie.rst_v  =  val; break;
     case CAR_RST_DEV_V_SET: pcie.rst_v |=  val; break;
     case CAR_RST_DEV_V_CLR: pcie.rst_v &= ~val; break;
+    case CAR_RST_DEVICES_W: pcie.rst_w  =  val; break;
     case CAR_RST_DEV_W_SET: pcie.rst_w |=  val; break;
     case CAR_RST_DEV_W_CLR: pcie.rst_w &= ~val; break;
+    case CAR_RST_DEVICES_Y: pcie.rst_y  =  val; break;
     case CAR_PLLE_BASE:     pcie.plle    = (val & PLLE_BASE_ENABLE) != 0; break;
     case CAR_PLLREFE_BASE:  pcie.pllrefe = (val & PLLREFE_BASE_ENABLE) != 0; break;
     default: break;
     }
+    // MSELECT out of reset is one of the things CPU0 waits on.
+    if (!mselect_was_up && mselect_up())
+        ccplex_preconditions_changed(state);
 }
 
 // PLLE and PLLREFE do not follow the generic "ENABLE bit 30, LOCK bit 27 in
@@ -467,6 +489,9 @@ uint32_t mselect_read(EmuState *state, uint64_t addr) {
 
 void mselect_write(EmuState *state, uint64_t addr, uint32_t val) {
     (void)state;
+    // Writes from the BPMP go nowhere either, as with the AFI window.
+    if (bpmp_pcie_denied(addr))
+        return;
     uint32_t off = (uint32_t)(addr - MSELECT_BASE) & 0xFFC;
     // Held in reset, MSELECT latches nothing - which is exactly the state a
     // payload is in when it thinks it configured the fabric and did not.
@@ -635,6 +660,8 @@ uint32_t pcie_read(EmuState *state, uint64_t addr) {
         mselect_complain(addr);
         return 0xFFFFFFFF;
     }
+    if (!pcie_aperture_enabled(addr))
+        return 0xFFFFFFFF;
 
     // Root port register windows, 0x01000000 and 0x01001000.
     if (addr >= PCIE_RP0_BASE && addr < PCIE_RP0_BASE + 0x2000) {
@@ -679,10 +706,14 @@ uint32_t pcie_read(EmuState *state, uint64_t addr) {
     if (addr >= PCIE_CS_BASE && addr < PCIE_CS_BASE + PCIE_CS_MODEL_SIZE) {
         uint32_t a = (uint32_t)(addr - PCIE_CS_BASE);
         uint32_t bus = (a >> 16) & 0xFF, dev = (a >> 11) & 0x1F;
-        uint32_t fn = (a >> 8) & 0x7, reg = a & 0xFC;
+        uint32_t fn = (a >> 8) & 0x7;
+        // Register number: {AXI[27:24], AXI[7:0]} (TRM 34.3.3).
+        uint32_t reg = ((a >> 16) & 0xF00) | (a & 0xFC);
         link_update(state, 1);
         if (bus != 1 || dev != 0 || fn != 0 || !ep_reachable(state))
             return 0xFFFFFFFF;          // unsupported request -> all ones
+        if (reg >= sizeof(pcie.ep))
+            return 0;                   // no extended capabilities
         return pcie.ep[reg / 4];
     }
 
@@ -695,13 +726,24 @@ uint32_t pcie_read(EmuState *state, uint64_t addr) {
             return 0xFFFFFFFF;
         if (!(pcie.ep[0x04 / 4] & 0x2))                 // MEM space disabled
             return 0xFFFFFFFF;
-        if ((pcie.ep[0x10 / 4] & ~0xFu) != PCIE_MEM_BASE)  // BAR0 unassigned
+        // Decode against wherever software put the BARs: BAR0 is the 32 KiB
+        // register window (backplane window in its first 4 KiB, core
+        // registers above), BAR2 the 2 MiB TCM. Anything else is claimed by
+        // no function: all ones.
+        uint32_t a32 = (uint32_t)addr;
+        uint32_t bar0 = pcie.ep[0x10 / 4] & EP_BAR0_MASK;
+        uint32_t bar2 = pcie.ep[0x18 / 4] & EP_BAR2_MASK;
+        bool in_bar0 = bar0 && (a32 & EP_BAR0_MASK) == bar0;
+        bool in_bar2 = bar2 && (a32 & EP_BAR2_MASK) == bar2;
+        if (!in_bar0 && !in_bar2)
             return 0xFFFFFFFF;
         if (!radio_core_alive(state))
             return 0xFFFFFFFF;          // front-end answers, the die does not
+        if (in_bar2 || (a32 - bar0) >= 0x1000)
+            return 0;                   // modelled as quiet registers / RAM
 
         uint32_t win = pcie.ep[BRCM_BAR0_WINDOW / 4] & ~0xFFFu;
-        uint32_t bp = win + ((uint32_t)(addr - PCIE_MEM_BASE) & 0xFFF);
+        uint32_t bp = win + ((a32 - bar0) & 0xFFF);
         if (bp == BRCM_SI_ENUM_BASE)
             return BRCM_4356_CHIPID;
         return 0;
@@ -718,10 +760,15 @@ void pcie_write(EmuState *state, uint64_t addr, uint32_t val) {
         mselect_complain(addr);
         return;
     }
+    if (!pcie_aperture_enabled(addr))
+        return;
 
     if (addr >= PCIE_RP0_BASE && addr < PCIE_RP0_BASE + 0x2000) {
         int port = (addr >= PCIE_RP1_BASE) ? 1 : 0;
-        pcie.rp[port].reg[(uint32_t)(addr & 0xFFC) / 4] = val;
+        uint32_t off = (uint32_t)(addr & 0xFFC);
+        if (off == RP_VEND_XP)
+            val &= ~RP_VEND_XP_DL_UP;   // read-only: the link state
+        pcie.rp[port].reg[off / 4] = val;
         return;
     }
 
@@ -738,8 +785,10 @@ void pcie_write(EmuState *state, uint64_t addr, uint32_t val) {
     if (addr >= PCIE_CS_BASE && addr < PCIE_CS_BASE + PCIE_CS_MODEL_SIZE) {
         uint32_t a = (uint32_t)(addr - PCIE_CS_BASE);
         uint32_t bus = (a >> 16) & 0xFF, dev = (a >> 11) & 0x1F;
-        uint32_t fn = (a >> 8) & 0x7, reg = a & 0xFC;
-        if (bus != 1 || dev != 0 || fn != 0 || !ep_reachable(state))
+        uint32_t fn = (a >> 8) & 0x7;
+        uint32_t reg = ((a >> 16) & 0xF00) | (a & 0xFC);
+        if (bus != 1 || dev != 0 || fn != 0 || !ep_reachable(state) ||
+            reg >= sizeof(pcie.ep))
             return;
         switch (reg) {
         case 0x04:                       // command: only the low half is RW

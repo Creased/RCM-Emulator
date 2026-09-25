@@ -93,7 +93,8 @@ void sdl_display_update(EmuState *state, uc_engine *uc) {
     return a >= FB_BASE && a < FB_BASE + FB_SIZE;
   };
 
-  int rot = state->rotation_override;
+  // Auto-detect first; a manual override is applied on top further down.
+  int rot = -1;
 
   uint32_t sw = state->fb_swizzle;
   uint32_t eff_stride = stride;
@@ -160,6 +161,7 @@ void sdl_display_update(EmuState *state, uc_engine *uc) {
   // rot = 0 for Nyx and Hekate TUI surfaces; if the user pressed R/Shift+R
   // they expect the rotation to actually change, regardless of what the
   // auto-detect picked. -1 means "use auto-detect", anything else overrides.
+  state->last_auto_rot.store((uint32_t)(rot & 3));
   if (state->rotation_override != -1)
     rot = state->rotation_override & 3;
 
@@ -424,30 +426,45 @@ static bool window_to_panel(EmuState *state, int mx, int my,
   if (tx >= out_w) tx = out_w - 1;
   if (ty >= out_h) ty = out_h - 1;
 
-  // The rendered SDL view always represents the physical Switch screen in its
-  // intended orientation (post-rotation, post-de-swizzle). Whatever the
-  // framebuffer's in-memory layout, what the user sees is what they would see
-  // looking at a Switch held landscape (long axis horizontal). The FTS4 panel
-  // sits behind that physical screen with its long axis (panel_x) along the
-  // long dimension and its short axis (panel_y) along the short.
-  //
-  // So we map the texture coord to panel coords by aspect: whichever of (tx,
-  // ty) lives on the longer rendered axis is the long-axis sample.
-  bool landscape = (out_w >= out_h);
-  uint32_t long_pix   = landscape ? tx     : ty;
-  uint32_t long_max   = landscape ? out_w  : out_h;
-  uint32_t short_pix  = landscape ? ty     : tx;
-  uint32_t short_max  = landscape ? out_h  : out_w;
+  // With the auto-detected rotation, the rendered SDL view represents the
+  // physical Switch screen in its intended orientation (post-rotation, post-
+  // de-swizzle): what the user sees is what they would see looking at a
+  // Switch held landscape. A manual override (R / Shift+R) turns that view
+  // by a further quarter-turn or two, so undo exactly that extra turn first:
+  // the render maps a source pixel (sx, sy) of a W x H image to
+  //   1: (H-1-sy, sx)   2: (W-1-sx, H-1-sy)   3: (sy, W-1-sx)
+  uint32_t delta = (state->last_rot.load() - state->last_auto_rot.load()) & 3;
+  uint32_t aw = (delta & 1) ? out_h : out_w;   // auto-rotated view's size
+  uint32_t ah = (delta & 1) ? out_w : out_h;
+  uint32_t ax = tx, ay = ty;
+  switch (delta) {
+  case 1: ax = ty;          ay = ah - 1 - tx; break;
+  case 2: ax = aw - 1 - tx; ay = ah - 1 - ty; break;
+  case 3: ax = aw - 1 - ty; ay = tx;          break;
+  }
+
+  // The FTS4 panel sits behind that physical screen with its long axis
+  // (panel_x) along the long dimension and its short axis (panel_y) along
+  // the short, so whichever of (ax, ay) lives on the longer axis is the
+  // long-axis sample.
+  bool landscape = (aw >= ah);
+  uint32_t long_pix   = landscape ? ax : ay;
+  uint32_t long_max   = landscape ? aw : ah;
+  uint32_t short_pix  = landscape ? ay : ax;
+  uint32_t short_max  = landscape ? ah : aw;
   if (long_max  == 0) long_max  = 1;
   if (short_max == 0) short_max = 1;
 
-  uint32_t px = (long_pix  * 1264u) / long_max;   // FTS4 X_REAL_MAX = 1264
-  uint32_t py = (short_pix * 704u)  / short_max;  // FTS4 Y_REAL_MAX = 704
-  if (px > 1264) px = 1264;
-  if (py > 704)  py = 704;
+  // bdk's touch.c clamps raw samples to EDGE_OFFSET..REAL_MAX (15..1264 and
+  // 15..704) and stretches that span over the 1280x720 screen, so the inverse
+  // starts at the edge offset, not at 0.
+  constexpr uint32_t kEdge = 15, kXMax = 1264, kYMax = 704;
+  uint32_t px = kEdge + (long_pix  * (kXMax - kEdge)) / long_max;
+  uint32_t py = kEdge + (short_pix * (kYMax - kEdge)) / short_max;
+  if (px > kXMax) px = kXMax;
+  if (py > kYMax) py = kYMax;
   *panel_x = (uint16_t)px;
   *panel_y = (uint16_t)py;
-  (void)state; // last_rot still cached for future use; current mapping is rotation-agnostic
   return true;
 }
 
@@ -485,11 +502,8 @@ bool sdl_display_poll_events(EmuState *state, uc_engine *uc) {
     if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
       uint16_t px = 0, py = 0;
       if (window_to_panel(state, event.button.x, event.button.y, &px, &py)) {
-        state->tc_x.store(px);
-        state->tc_y.store(py);
         state->tc_pressed.store(true);
-        state->tc_event_op.store(0x03); // FTS4_EV_MULTI_TOUCH_ENTER
-        state->tc_event_pending.store(true);
+        state->touch_post(0x03, px, py); // FTS4_EV_MULTI_TOUCH_ENTER
         printf("[touch] DOWN win=(%d,%d) panel=(%u,%u)\n",
                event.button.x, event.button.y, px, py);
       }
@@ -497,11 +511,8 @@ bool sdl_display_poll_events(EmuState *state, uc_engine *uc) {
     if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT) {
       uint16_t px = 0, py = 0;
       if (window_to_panel(state, event.button.x, event.button.y, &px, &py)) {
-        state->tc_x.store(px);
-        state->tc_y.store(py);
         state->tc_pressed.store(false);
-        state->tc_event_op.store(0x04); // FTS4_EV_MULTI_TOUCH_LEAVE
-        state->tc_event_pending.store(true);
+        state->touch_post(0x04, px, py); // FTS4_EV_MULTI_TOUCH_LEAVE
         printf("[touch] UP   win=(%d,%d) panel=(%u,%u)\n",
                event.button.x, event.button.y, px, py);
       }
@@ -509,10 +520,15 @@ bool sdl_display_poll_events(EmuState *state, uc_engine *uc) {
     if (event.type == SDL_MOUSEMOTION && state->tc_pressed.load()) {
       uint16_t px = 0, py = 0;
       if (window_to_panel(state, event.motion.x, event.motion.y, &px, &py)) {
-        state->tc_x.store(px);
-        state->tc_y.store(py);
-        state->tc_event_op.store(0x05); // FTS4_EV_MULTI_TOUCH_MOTION
-        state->tc_event_pending.store(true);
+        // A release outside the window never reaches it when mouse capture
+        // is off (the ImGui backend turns SDL's auto-capture off process-
+        // wide), so a motion with the button up ends the touch instead.
+        if (!(event.motion.state & SDL_BUTTON_LMASK)) {
+          state->tc_pressed.store(false);
+          state->touch_post(0x04, px, py); // FTS4_EV_MULTI_TOUCH_LEAVE
+        } else {
+          state->touch_post(0x05, px, py); // FTS4_EV_MULTI_TOUCH_MOTION
+        }
       }
     }
     if (event.type == SDL_KEYDOWN) {
@@ -543,6 +559,7 @@ bool sdl_display_poll_events(EmuState *state, uc_engine *uc) {
         if (!ctrl) {
           // Plain R: soft reboot. Same path as the config window's "Reboot"
           // button — re-prime IRAM payload + WDT cookie, wipe DRAM, reset PC.
+          state->reboot_cold = true;  // the user's reset is a power cycle
           state->reboot_requested = true;
           printf("[diag] Reboot requested (R)\n");
         } else {

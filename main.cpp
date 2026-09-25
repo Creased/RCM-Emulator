@@ -34,10 +34,34 @@
 #include "display/console_window.h"
 #include "input_script.h"
 
+// Low 16 MB of the map (NULL-pointer writes land there); freed at exit.
+static uint8_t *g_low_ptr = nullptr;
+
+// Scripted-navigation progress (--auto-pin-recovery, --auto-te-script). A
+// soft reboot restarts both, as it restarts the emulated clock they run on.
+struct AutoScripts {
+    int      pin_stage = 0;
+    uint64_t pin_t = 0;
+    int      pin_logged_stage = -1;
+    size_t   te_idx = 0;
+};
+static AutoScripts g_auto;
+
+// The IPL framebuffer starts out in hekate's background colour (0x1B1B1B),
+// at power-on and again after a reboot has handed DRAM back zeroed.
+static void fill_fb_background(EmuState *state) {
+    for (size_t i = 0; i < FB_SIZE; i += 4) {
+        state->fb_ptr[i + 0] = 0x1B; // B
+        state->fb_ptr[i + 1] = 0x1B; // G
+        state->fb_ptr[i + 2] = 0x1B; // R
+        state->fb_ptr[i + 3] = 0xFF; // A
+    }
+}
+
 // ==================== Payload Loading ====================
 
 static uint8_t *load_payload(const char *path, size_t *out_size) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = platform_fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "[error] Cannot open payload: %s\n", path);
         return nullptr;
@@ -149,18 +173,19 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
     // through. One contiguous block removes the hole and matches what real
     // hardware presents.
     //
-    // Allocated host-side (calloc, so pages are lazily committed - the full
-    // 2 GB is only ever resident if a payload actually touches all of it) and
-    // kept as a host pointer so soft reboot can memset() it: Nyx loads here
-    // and its file-static SD/eMMC caches would otherwise survive a reboot.
-    err = uc_mem_map_ptr(uc, DRAM_BASE, DRAM_WINDOW_SIZE, UC_PROT_ALL,
-                         (state->dram_low_ptr = (uint8_t *)calloc(1, DRAM_WINDOW_SIZE)));
+    // Allocated host-side as demand-zero pages (zeroed_alloc), so the full
+    // 2 GB is only ever resident if a payload actually touches all of it, and
+    // kept as a host pointer so a soft reboot can hand it back zeroed: Nyx
+    // loads here and its file-static SD/eMMC caches would otherwise survive.
+    state->dram_low_ptr = zeroed_alloc(DRAM_WINDOW_SIZE);
     if (!state->dram_low_ptr) {
         fprintf(stderr, "[error] Failed to allocate %zu MB DRAM host buffer\n",
                 (size_t)(DRAM_WINDOW_SIZE / (1024 * 1024)));
         uc_close(uc);
         return nullptr;
     }
+    err = uc_mem_map_ptr(uc, DRAM_BASE, DRAM_WINDOW_SIZE, UC_PROT_ALL,
+                         state->dram_low_ptr);
     if (err != UC_ERR_OK) {
         fprintf(stderr, "[error] Failed to map DRAM: %s\n", uc_strerror(err));
         uc_close(uc);
@@ -178,13 +203,7 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
 
     // ---- Map Framebuffer pointer ----
     state->fb_ptr = state->dram_low_ptr + (FB_BASE - DRAM_BASE);
-    // Fill with hekate background color (0x1B1B1B)
-    for (size_t i = 0; i < FB_SIZE; i += 4) {
-        state->fb_ptr[i + 0] = 0x1B; // B
-        state->fb_ptr[i + 1] = 0x1B; // G
-        state->fb_ptr[i + 2] = 0x1B; // R
-        state->fb_ptr[i + 3] = 0xFF; // A
-    }
+    fill_fb_background(state);
     state->fb_addr = FB_BASE;
     printf("[emu] Defined FB:   0x%08llX - 0x%08llX (%u MB)\n",
            (unsigned long long)FB_BASE,
@@ -193,8 +212,20 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
 
     // ---- Map low memory (16MB @ 0x0) ----
     // hekate seems to do a memset(0, ...) for clear screen if some ptr is NULL.
-    uint8_t *low_ptr = (uint8_t *)calloc(1, 0x01000000);
-    uc_mem_map_ptr(uc, 0, 0x01000000, UC_PROT_ALL, low_ptr);
+    // This covers the iROM range (0x100000, 96 KB) too, as zero-filled RAM:
+    // there are no BootROM contents to show, and Hekate's "Bootrom Info" /
+    // "Dump Bootrom" read it without faulting. (A read-only iROM map on top
+    // of this used to be attempted as well; it overlapped, so it always
+    // failed, unnoticed - and a read-only iROM would fault the NULL-pointer
+    // clear above.)
+    g_low_ptr = (uint8_t *)calloc(1, 0x01000000);
+    err = g_low_ptr ? uc_mem_map_ptr(uc, 0, 0x01000000, UC_PROT_ALL, g_low_ptr)
+                    : UC_ERR_NOMEM;
+    if (err != UC_ERR_OK) {
+        fprintf(stderr, "[error] Failed to map low memory: %s\n", uc_strerror(err));
+        uc_close(uc);
+        return nullptr;
+    }
 
     // ---- Nyx Storage (16MB @ 0xED000000) ----
     // Already mapped as part of 2GB DRAM chunk
@@ -204,13 +235,11 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
     // which only worked because MMIO was a pair of address-range hooks over
     // whatever happened to be mapped.
 
-    // BootROM (iROM) at 0x100000, 96 KB. We don't have the real BootROM
-    // contents, but mapping the region as zero-filled lets Hekate's "Bootrom
-    // Info" / "Dump Bootrom" features read it without faulting. The IPATCH
-    // CAM at 0x6001DC00 is also zero-mapped so the ipatches table renders
-    // empty (which matches an unpatched SoC).
-    uc_mem_map(uc, 0x00100000, 0x18000, UC_PROT_READ | UC_PROT_EXEC); // iROM
-    uc_mem_map(uc, 0x6001D000, 0x1000,  UC_PROT_ALL);                 // IPATCH CAM page
+    // The IPATCH CAM at 0x6001DC00 is zero-mapped so the ipatches table
+    // renders empty (which matches an unpatched SoC).
+    err = uc_mem_map(uc, 0x6001D000, 0x1000, UC_PROT_ALL);
+    if (err != UC_ERR_OK)
+        fprintf(stderr, "[warn] IPATCH page not mapped: %s\n", uc_strerror(err));
 
     // ---- heap region (32MB @ 0x90000000) ----
     // Already mapped as part of 2GB DRAM chunk
@@ -374,8 +403,14 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "--auto-te-script") == 0) auto_te_script = true;
         // Generic scripted button input, for menu-driven payloads that can't
         // be driven any other way from a headless / CI run.
-        else if (strcmp(argv[i], "--input-script") == 0 && i + 1 < argc)
-            input_script_load(argv[++i]);
+        else if (strcmp(argv[i], "--input-script") == 0 && i + 1 < argc) {
+            // A script that does not parse would leave a CI run idling until
+            // its timeout with nothing pressed; stop here instead.
+            if (!input_script_load(argv[++i])) {
+                fprintf(stderr, "[error] --input-script could not be loaded\n");
+                return 1;
+            }
+        }
     }
 
     // Default to sd.img in the working directory when --sd is not given, so the
@@ -464,31 +499,52 @@ int main(int argc, char *argv[]) {
         // re-prime the WDT cookie so Hekate's early boot skips Minerva again.
         if (state.reboot_requested.exchange(false)) {
             uc_emu_stop(uc);
+            bool cold = state.reboot_cold.exchange(false);
             // The SoC resets as a whole: CPU0 back into reset, the PCIe root
-            // complex back to power-on, the clock's half-counted block gone.
-            mmio_soft_reset(&state);
+            // complex and every other block back to power-on, the clock's
+            // half-counted block gone. A power cycle resets the PMIC too.
+            mmio_soft_reset(&state, cold);
             bpmp_clock_reset();
-            // One contiguous block now; dram_ptr is a view into it.
-            memset(state.dram_low_ptr, 0, DRAM_WINDOW_SIZE);
+            // Fresh zero pages rather than a memset, which made all 2 GB
+            // resident.
+            zeroed_reset(state.dram_low_ptr, DRAM_WINDOW_SIZE);
+            fill_fb_background(&state);
             size_t reload = state.payload_len;
             if (reload > IRAM_SIZE - (IPL_LOAD_ADDR - IRAM_BASE))
                 reload = IRAM_SIZE - (IPL_LOAD_ADDR - IRAM_BASE);
             uc_mem_write(uc, IPL_LOAD_ADDR, state.payload_ptr, reload);
             uint32_t wdt_magic = 0x544457;
             uc_mem_write(uc, 0x4003FF18, &wdt_magic, sizeof(wdt_magic));
+            // Neither the zeroed DRAM nor uc_mem_write() reaches the engine's
+            // code cache, so what the last run translated - a payload it
+            // chainloaded over this one's load address, Nyx in DRAM - would
+            // run again in place of the fresh bytes. Drop those translations.
+            // (Not UC_CTL_TB_FLUSH: on Unicorn 2.0 that memsets the whole
+            // 1 GB code buffer, seconds and a gigabyte of RSS per reboot.)
+            uc_ctl_remove_cache(uc, 0, 0x01000000);
+            uc_ctl_remove_cache(uc, IRAM_BASE, IRAM_BASE + IRAM_SIZE);
+            uc_ctl_remove_cache(uc, DRAM_BASE, DRAM_BASE + DRAM_WINDOW_SIZE);
+            // Mode first, as at power-on: SVC, ARM state, IRQ/FIQ/async
+            // aborts masked. SP is banked, so it is written in that mode.
+            uint32_t reset_cpsr = 0x1D3;
             uint32_t reset_pc = IPL_LOAD_ADDR;
             uint32_t reset_sp = IPL_STACK_ADDR;
-            uint32_t reset_cpsr = 0; // ARM mode, all flags clear
-            uc_reg_write(uc, UC_ARM_REG_PC,   &reset_pc);
-            uc_reg_write(uc, UC_ARM_REG_SP,   &reset_sp);
             uc_reg_write(uc, UC_ARM_REG_CPSR, &reset_cpsr);
+            uc_reg_write(uc, UC_ARM_REG_SP,   &reset_sp);
+            uc_reg_write(uc, UC_ARM_REG_PC,   &reset_pc);
             state.fb_addr = FB_BASE; // re-point display at the FB base
             state.emu_usec   = 0;
             state.insn_count = 0;
             state.bpmp_slept_us = 0;
             state.touch_phase = 0;
             state.paused = false;
-            printf("[emu] Soft reboot complete (DRAM wiped)\n");
+            state.btn_power = false;
+            state.btn_vol_up = false;
+            state.btn_vol_down = false;
+            g_auto = AutoScripts();
+            input_script_restart(state);
+            printf("[emu] Soft reboot complete (%s, DRAM wiped)\n",
+                   cold ? "power cycle" : "SoC reset");
         }
 
         if (!state.paused) {
@@ -508,8 +564,8 @@ int main(int argc, char *argv[]) {
             // idle so recover_pin's final btn_wait blocks on us — keeps the
             // result text visible in the framebuffer when the run times out.
             if (auto_pin_recovery) {
-                static int pin_stage = 0;
-                static uint64_t pin_t = 0;
+                int &pin_stage = g_auto.pin_stage;
+                uint64_t &pin_t = g_auto.pin_t;
                 auto press_release = [&](std::atomic<bool> *btn,
                                           uint64_t hold_us,
                                           uint64_t cooldown_us) {
@@ -528,7 +584,7 @@ int main(int argc, char *argv[]) {
                     printf("[emu] Auto PIN recovery armed at emu_usec=%llu\n",
                            (unsigned long long)state.emu_usec);
                 }
-                static int last_logged_stage = -1;
+                int &last_logged_stage = g_auto.pin_logged_stage;
                 if (pin_stage != last_logged_stage) {
                     printf("[emu] Auto PIN stage %d at emu_usec=%llu\n", pin_stage,
                            (unsigned long long)state.emu_usec);
@@ -590,7 +646,7 @@ int main(int argc, char *argv[]) {
                     {22850000, 'P', true},  {23020000, 'P', false},
                 };
                 static const size_t te_n = sizeof(te_events)/sizeof(te_events[0]);
-                static size_t te_idx = 0;
+                size_t &te_idx = g_auto.te_idx;
                 while (te_idx < te_n && state.emu_usec >= te_events[te_idx].at_us) {
                     const InputEv &ev = te_events[te_idx];
                     std::atomic<bool> *btn = (ev.btn == 'P') ? &state.btn_power
@@ -605,6 +661,10 @@ int main(int argc, char *argv[]) {
                     te_idx++;
                     if (te_idx == te_n)
                         printf("[auto-te] sequence complete; idling for output\n");
+                    // A time jump (FLOW_CTLR sleep) can make the release due
+                    // in the same tick; the payload must see the press first.
+                    if (ev.down)
+                        break;
                 }
             }
 
@@ -629,8 +689,28 @@ int main(int argc, char *argv[]) {
             // to the same emulated time. Scripted input and the display are
             // still serviced once per full batch, as before.
             uint64_t batch_end = state.insn_count + BATCH_INSTRUCTIONS;
+            uint64_t parked_left = BATCH_INSTRUCTIONS;
             while (state.running && !state.paused &&
                    state.insn_count < batch_end) {
+                if (state.bpmp_halted) {
+                    // The BPMP parked itself for good after handing off to
+                    // CPU0. It retires nothing; time runs on for CPU0 at the
+                    // rate the BPMP's clock would have advanced it.
+                    if (!ccplex_cpu0_running()) {
+                        printf("[emu] BPMP halted and CPU0 stopped, shutting down emulator\n");
+                        state.running = false;
+                        break;
+                    }
+                    if (parked_left < CPU0_QUANTUM_INSTRUCTIONS)
+                        break;
+                    parked_left -= CPU0_QUANTUM_INSTRUCTIONS;
+                    state.emu_usec += CPU0_QUANTUM_INSTRUCTIONS / 10;
+                    state.bpmp_slept_us += CPU0_QUANTUM_INSTRUCTIONS / 10;
+                    ccplex_run(&state, state.emu_usec);
+                    if (state.reboot_requested.load())
+                        break;
+                    continue;
+                }
                 uint64_t budget = batch_end - state.insn_count;
                 if (ccplex_cpu0_running() && budget > CPU0_QUANTUM_INSTRUCTIONS)
                     budget = CPU0_QUANTUM_INSTRUCTIONS;
@@ -690,8 +770,9 @@ int main(int argc, char *argv[]) {
     uc_close(uc);
 
     free(state.iram_ptr);
+    free(g_low_ptr);
     // dram_ptr is a view into dram_low_ptr's block; only free the base once.
-    free(state.dram_low_ptr);
+    zeroed_free(state.dram_low_ptr, DRAM_WINDOW_SIZE);
     free(state.payload_ptr);
     // fb_ptr points inside dram_ptr; do not free separately.
 

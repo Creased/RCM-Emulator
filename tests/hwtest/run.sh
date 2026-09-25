@@ -7,7 +7,9 @@
 # soon as the dump's last line appears (with a hard timeout behind it).
 EMU=${1:-./rcm_emu}
 BIN=${2:-build-hwtest/hwtest-rcm/build/hwtest.bin}
-shift 2 2>/dev/null
+# Anything after the two positional arguments goes to the emulator. (A bare
+# `shift 2` with fewer than two arguments makes dash exit on the spot.)
+[ $# -ge 2 ] && shift 2 || set --
 LOG=${LOG:-tests/hwtest/out.log}
 LIMIT=${LIMIT:-300}
 

@@ -67,7 +67,10 @@ constexpr uint64_t I2C2_BASE = 0x7000C400; // GEN2_I2C, Rohm BH1730 ALS at slave
 constexpr uint64_t I2C2_SIZE = 0x100;
 constexpr uint64_t I2C3_BASE = 0x7000C500; // GEN3_I2C, used by STMFTS touchscreen at slave 0x49
 constexpr uint64_t I2C5_BASE = 0x7000D000;
-constexpr uint64_t I2C_SIZE  = 0x1000;
+constexpr uint64_t I2C_SIZE  = 0x1000;   // the MMIO page: I2C5, I2C6, SPI2B
+constexpr uint64_t I2C_CTRL_SIZE = 0x100; // one controller's registers
+constexpr uint64_t I2C4_BASE = 0x7000C700;
+constexpr uint64_t I2C6_BASE = 0x7000D100;
 constexpr uint64_t I2C3_SIZE = 0x100;
 
 // PWM
@@ -203,12 +206,13 @@ constexpr uint64_t XUSB_PADCTL_SIZE = 0x1000;
 // bdk's MMU table defines DRAM and IRAM entries only and leaves the fallback
 // entry RWX, so PCIe space is reachable and uncached.
 //
-// Only the windows a payload actually touches are mapped: 16 KiB covering
-// both root ports plus PADS and AFI, 128 KiB of configuration aperture (bus
-// 0 and bus 1 are all that exist), and one 4 KiB page of downstream memory
-// for the endpoint's BAR0 register window. Mapping the architectural sizes
-// (256 MiB of config, 208 MiB of memory) would cost the host gigabytes for
-// address ranges nothing ever reads.
+// These are MMIO windows (callbacks, no backing memory), so they are mapped
+// at their architectural sizes: the whole 256 MiB configuration aperture -
+// extended registers sit at AXI[27:24] - and the non-prefetchable memory
+// window to the end of PCIE_A2, wherever software places the endpoint's BARs.
+// A smaller map left a CPU0 access to, say, config offset 0x100 or BAR0 +
+// 0x2000 unmapped: nothing answered and the core wedged, where silicon
+// returns data or all-ones.
 constexpr uint64_t PCIE_RP0_BASE  = 0x01000000;  // root port 0 registers
 constexpr uint64_t PCIE_RP1_BASE  = 0x01001000;  // root port 1 registers
 constexpr uint64_t PCIE_PADS_BASE = 0x01003000;
@@ -216,9 +220,9 @@ constexpr uint64_t PCIE_AFI_BASE  = 0x01003800;
 constexpr uint64_t PCIE_BLOCK_BASE = 0x01000000;
 constexpr uint64_t PCIE_BLOCK_SIZE = 0x4000;
 constexpr uint64_t PCIE_CS_BASE   = 0x02000000;  // type-1 extended config
-constexpr uint64_t PCIE_CS_MODEL_SIZE = 0x20000; // buses 0 and 1 only
+constexpr uint64_t PCIE_CS_MODEL_SIZE = 0x10000000; // all of it: 256 MiB
 constexpr uint64_t PCIE_MEM_BASE  = 0x13000000;  // non-prefetchable window
-constexpr uint64_t PCIE_MEM_MODEL_SIZE = 0x1000;
+constexpr uint64_t PCIE_MEM_MODEL_SIZE = 0x0D000000; // up to the end of A2
 
 // TSEC (Falcon control regs are in the 0x1000–0x11FF window within TSEC_BASE)
 constexpr uint64_t TSEC_BASE = 0x54500000;

@@ -45,4 +45,10 @@ uint32_t bpmp_timerus_read(EmuState *state);
 // halt): whatever poll loop was being paced is over.
 void   bpmp_clock_jumped();
 
+// End the current batch at the next block boundary - a clean stop, unlike
+// uc_emu_stop() from an MMIO callback, which abandons the block in flight
+// with the PC back at its start. Used when CPU0 is released, so its first
+// slice starts now rather than a whole batch later.
+void   bpmp_yield();
+
 #endif // T210_BPMP_H

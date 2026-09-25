@@ -44,13 +44,17 @@ void     mmio_bus_write(EmuState *state, uint64_t addr, unsigned size,
                         uint64_t value);
 
 // Reset the per-run peripheral state that a soft reboot must not carry over.
-void mmio_soft_reset(EmuState *state);
+// `power_cycle`: the PMIC reset too (its register files return to their
+// seeds); otherwise only the SoC reset (PMC MAIN_RST) and the PMIC keeps
+// its rails.
+void mmio_soft_reset(EmuState *state, bool power_cycle);
 
 // PMC power-partition state (APBDEV_PMC_PWRGATE_STATUS bit `part`).
 bool pmc_partition_on(int part);
 
-// FLOW_CTLR_RAM_REPAIR has been requested (the fast cluster's RAMs repaired).
-bool flow_ram_repair_done();
+// APBDEV_PMC_SECURE_SCRATCH`n` (n = 0..7), written by hardware: the SE
+// deposits its context-save key there.
+void pmc_secure_scratch_write(unsigned n, uint32_t value);
 
 // True when the CCPLEX CPU rail is up: the MAX77621 on Erista (enabled, and
 // its EN pin driven by MAX77620 GPIO5), the MAX77812 M4 phase on Mariko.

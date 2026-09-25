@@ -27,6 +27,12 @@ expect 'powered: magic=50434945'             'CPU0 ran the blob and wrote the ma
 expect 'el=0000000C'                         'CPU0 came up at EL3'
 expect 'CPU0 stopped (held in reset)'        'RST_CPUG_CMPLX_SET stops the core'
 expect 'MAX77620 PWR_OFF received'           'the payload ran to its power-off'
+if [ "$status" -eq 0 ]; then
+    echo "  ok    the emulator exited cleanly"
+else
+    echo "  FAIL  the emulator exited with status $status (124 = timed out)"
+    fail=1
+fi
 
 # TIMERUS as CPU0 saw it must have moved across its busy loop.
 dt=$(sed -n 's/.*dt=\([0-9A-F]*\).*/\1/p' "$LOG" | head -1)

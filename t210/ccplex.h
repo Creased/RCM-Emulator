@@ -44,6 +44,13 @@ void     ccplex_sb_write(EmuState *state, uint32_t offset, uint32_t val);
 void     ccplex_partition_changed(EmuState *state, int part, bool on);
 void     ccplex_rail_changed(EmuState *state);
 
+// Something CPU0 needs in order to run changed (MSELECT reset released, ...):
+// a core already out of reset but refused starts if nothing is missing now.
+void     ccplex_preconditions_changed(EmuState *state);
+
+// CPU0's own clock, in emulated microseconds: what TIMERUS reads from CPU0.
+uint64_t ccplex_now_us();
+
 // Called by the MMIO front-end for every access CPU0 makes: charges the bus
 // latency to CPU0's clock before the access is dispatched.
 void     ccplex_bus_tick(EmuState *state);

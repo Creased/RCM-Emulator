@@ -131,28 +131,42 @@ of the spec is modelled for the Hekate, Lockpick and TE init paths:
 
 Models the SE (Security Engine) register block at `0x70012000`. Supports:
 
-- **AES-128 ECB, CBC, CTR, CMAC.** The compact public-domain TinyAES core
-  ([kokke/tiny-AES-c](https://github.com/kokke/tiny-AES-c)) drives one block
-  at a time, with chaining state taken from `IV_ORIGINAL` or `IV_UPDATED` per
-  slot and `xor_pos` from `CRYPTO_CONFIG`.
-- **SHA-256.** Implemented because the TE function `save_process_header`
-  validates the save container hash. Without it, `readsave()` returns
-  `Error: Save header is invalid!`. Oneshot only: one IN_LL buffer at a time,
-  written into the `HASH_RESULT` registers as 8 big-endian dwords (the BDK
-  driver byte-swaps on read).
-- **DST_KEYTABLE unwrap path.** When the destination is another keyslot, the
-  result of a single block is written into the destination `KEYS_0_3` or
-  `KEYS_4_7` register pair.
+- **AES-128 ECB, CBC, OFB, CTR, CMAC.** The compact public-domain TinyAES
+  core ([kokke/tiny-AES-c](https://github.com/kokke/tiny-AES-c)) drives one
+  block at a time through the SE's datapath: `INPUT_SEL` picks memory, the
+  previous AES output (OFB) or the linear counter (CTR); `XOR_POS` puts the
+  vector RAM before the core (CBC encrypt) or the vector / the memory data
+  after it (CBC decrypt, OFB, CTR); `VCTRAM_SEL` says what the vector becomes
+  next. The vector starts from the slot's `IV_ORIGINAL` or `IV_UPDATED`, and
+  a chaining mode leaves its final value in `IV_UPDATED`, which is how bdk
+  continues a chain into a trailing partial block and feeds the last block of
+  a CMAC. Checked against OpenSSL for every mode bdk uses, including
+  multi-block CMAC and partial blocks.
+- **SHA-256**, one-shot and in parts. `SHA_INIT_HASH` starts from the
+  standard state, `SHA_CONTINUE` from the one the last part left in
+  `HASH_RESULT` (8 big-endian dwords; the BDK driver byte-swaps on read), and
+  the part is padded only when `SHA_MSG_LEFT` says it is the last.
+  Implemented because the TE function `save_process_header` validates the
+  save container hash.
+- **DST_KEYTABLE unwrap path.** The result of a single block is written into
+  the destination slot's selected word quad.
+- **Context save** (`SE_OP_CTX_SAVE`), as bdk's `se_aes_ctx_get_keys()` uses
+  it to read keyslots back: an RNG op seeds a secure random key (fixed, for
+  reproducibility), each saved keyslot quad is written out encrypted under it
+  in one CBC chain, and saving the SRK deposits it in PMC `SECURE_SCRATCH4..7`
+  for the driver to decrypt with.
 - **`--prod-keys` BIS override.** When Lockpick writes the last word of a
   derived BIS (Boot Image Storage) key into slots 0..5, the value from the
   user-supplied key file is substituted. This sidesteps the
   TSEC-firmware to `master_kek` to `master_key` derivation chain that is not
-  fully modelled. For other keyslots, the SE behaves normally.
+  fully modelled. Clearing a slot and loading the context-save SRK are left
+  alone. For other keyslots, the SE behaves normally.
 
 The 16 keyslots are stored in a flat `Keyslot ks_table[16]` with
-`key[32] / iv_orig[16] / iv_upd[16]`. RSA, RNG, and chunked SHA are stubbed.
-They return `OP_DONE` without producing data, which is enough for current
-payloads.
+`key[32] / iv_orig[16] / iv_upd[16]`. RSA and RNG output are stubbed: they
+return `OP_DONE` without producing data. Block counts are bounded by what one
+linked-list entry can describe (16 MiB), and an operation whose buffers are
+unreachable finishes with `SE_INT_ERR_STAT` instead of computing on zeros.
 
 ### Touchscreen (`t210/i2c3.cpp`)
 
@@ -185,10 +199,26 @@ down or reset are caught by `t210/mmio.cpp`:
   caught on both the small CMD\_DATA1 path and the packet-mode TX_FIFO path
   -- stops emulation and exits cleanly.
 - Same register with `SFT_RST` (bit 7) set requests a payload soft-reboot
-  via `state->reboot_requested`.
+  via `state->reboot_requested`, as a power cycle (`reboot_cold`).
 - `APBDEV_PMC_CNTRL` (`0x00`) bit 4 (MAIN_RST) -- written by Hekate's
   `power_set_state(REBOOT_RCM)` -- also requests a soft-reboot, so the user
   can iterate on a payload without restarting `rcm_emu`.
+
+Either request stops the BPMP on the spot: `power_set_state()` follows the
+write with `bpmp_halt()`, which would otherwise end the run first.
+
+**What a reboot resets** (`mmio_soft_reset`). Everything on the SoC: the
+register cache (GPIO, pinmux, clocks), UART modes and receive FIFOs, the I2C
+controllers, the PMC's partitions, pad DPD and registers, CAR, the flow
+controller, the SE (back to the `--prod-keys` preload), touch, SDMMC (the
+eMMC back in its user area), the display controller, ACTMON, VIC, DSI, the
+PCIe root complex and CPU0. What survives is what survives on hardware: PMC
+SCRATCH0 and RST_STATUS, the RTC (still counting), and - unless the reboot
+is a power cycle - the PMIC with its rails and the external regulators. DRAM
+comes back as fresh zero pages (not a memset, which made all 2 GB resident),
+the BPMP's translations of IRAM, DRAM and low memory are dropped so the old
+run's code cannot run in place of the reloaded payload, the CPSR returns to
+its power-on SVC mode, scripted input restarts and every button is released.
 
 ### I²C-attached chips (battery, charger, thermal, USB-PD, PMIC ID)
 
@@ -359,6 +389,14 @@ needed. The 64 KB TX log trim happens in-place during the write hook.
 - **Timer and RTC.** Backed by `EmuState::emu_usec`, derived from retired
   instructions (see [Determinism](#determinism-and-the-auto-script-flag)), so
   timing is identical across runs. The auto-script feature relies on this.
+  RTC SECONDS counts and is writable, and a MILLI_SECONDS read snapshots it
+  into SHADOW_SECONDS. TMR0..9 record when they were armed, so bdk's
+  `timer_usleep()` - TMR8 plus `FLOW_MODE_STOP_UNTIL_IRQ` - sleeps to the
+  timer's expiry.
+- **Flow controller.** `HALT_COP_EVENTS` MODE 0/1 do not halt; a timed
+  WAITEVENT advances the clock; STOP_UNTIL_IRQ wakes on the first armed
+  timer; an untimed halt ends the run - unless CPU0 is running, in which case
+  the BPMP stays parked and CPU0 runs on (fusee's and hekate's L4T handoff).
 - **Probe-magic constants.** Several reads return fixed values, not because
   they are tweakable but because the chip-detection code expects exact
   cookies: `MAX17050.DevName=0x00AC`, `BQ24193.VendorPart=0x2F`, the BM92T36
@@ -426,10 +464,13 @@ ch.19: MSELECT is CCPLEX hardware, the BPMP-Lite is an AHB master), so it
 copies an AArch64 stub to DRAM, boots CPU0 at it, and supervises through a
 mailbox while the stub trains the link and enumerates the CYW4356.
 
-**Release.** The model shadows the registers the boot sequence writes and
-starts the core when `RST_CPUG_CMPLX_CLR` clears the last of CPU0's reset bits
-(CPURESET0, DBGRESET0, CORERESET0, bit 30, NONCPURESET) - but only if the core
-could actually run:
+**Release.** The model shadows the registers the boot sequence writes.
+`RST_CPUG_CMPLX` starts at its TRM reset value, `0x2000feef`, and the core
+runs once CPURESET0 (bit 0), CORERESET0 (16), L2RESET (24) and NONCPURESET
+(29) are all clear. (bdk also clears PRESETDBG, bit 30, which only resets the
+CoreSight debug logic; bits 15:4 are reserved on this SoC.) It must also be
+able to run; a release that is refused is looked at again whenever one of
+these changes, since silicon starts the moment the last one arrives:
 
 | Precondition | Where it comes from |
 | --- | --- |
@@ -437,7 +478,6 @@ could actually run:
 | CRAIL, C0NC, CE0 ungated | PMC PWRGATE_STATUS bits 0, 15, 14 |
 | CPUG clock on, PLLX up if CCLK uses it | CLK_ENB_V bit 0, CCLK_BURST_POLICY, PLLX_BASE |
 | MSELECT clocked and out of reset | CLK_ENB_V bit 3, RST_DEV_V bit 3 |
-| RAM repair requested | FLOW_CTLR_RAM_REPAIR |
 | An AArch64 vector in IRAM/DRAM | SB_AA64_RESET_LOW bit 0 + address, SB_AA64_RESET_HIGH |
 
 A release that misses one prints `[ccplex] CPU0 released from reset but
@@ -450,7 +490,7 @@ builds its ARM64 core at EL1 and cannot be moved: a PSTATE write does not
 rebuild the translator's cached `hflags`, and Unicorn never delivers guest
 exceptions, so no SMC can carry it up either. ERET can: its helper takes the
 current EL from PSTATE and rebuilds `hflags` for the target. So each boot
-creates a fresh engine (no stale translations of a rewritten stub), writes
+creates a fresh engine, writes
 PSTATE = SPSR_EL3 = EL3h with DAIF masked and ELR_EL3 = ELR_EL1 = the vector,
 and starts it on a one-instruction `eret` trampoline in a page at 1 TiB that
 only CPU0 maps.
@@ -460,18 +500,33 @@ as the BPMP's and the same MMIO windows. `g_bus_master` says who is issuing an
 access; the PCIe model refuses the BPMP (`0xFFFFFFFF`, and one warning
 explaining why) and serves CPU0. MSELECT reads its TRM reset value
 `0x07FF4020`, AFI_PCIE_CONFIG `0x00103025`, and LNKSTA `0x3011` once the link
-is up - the values hwtest's healthy-console capture shows. An access CPU0
-makes to an address nothing decodes wedges it, as on silicon; the BPMP's
-watchdog on the mailbox heartbeat is what reports it.
+is up - the values hwtest's healthy-console capture shows. The whole config
+aperture and non-prefetchable window are decoded (extended registers read 0,
+unclaimed addresses all-ones, BARs wherever software puts them), and
+MSELECT_CONFIG.ENABLE_PCIE_APERTURE gates them. An access CPU0 makes to an
+address nothing decodes wedges it, as on silicon; the BPMP's watchdog on the
+mailbox heartbeat is what reports it.
+
+**Code the BPMP rewrites.** Stores from one engine never reach the other's
+translation cache, so a stub loaded for a new job at the address of the last
+one would run the old code. The pages CPU0 executes from are remembered with
+a copy of their bytes, and before each slice any that changed have their
+translations dropped (`uc_ctl_remove_cache`). A full `UC_CTL_TB_FLUSH` would
+be simpler, but on Unicorn 2.0 it memsets the whole 1 GB code buffer.
 
 **Time.** CPU0 keeps its own clock: 1 ns per retired instruction (PLLX runs
 the A57 at ~1 GHz) plus 250 ns per bus access (MSELECT, the APC bridge, APB).
 While it runs, the main loop cuts the BPMP's batch into 250 us slices and runs
 CPU0 up to the BPMP's time after each - lockstep at a finer grain than the
 500 us the BPMP polls the mailbox at. During a CPU0 slice `emu_usec` is CPU0's
-clock, so every register model timestamps with the right core's time. WFE /
-WFI park the core to the end of the slice: the stub's final `for(;;) wfe;`
-would otherwise spin through a billion instructions per emulated second.
+clock, so every register model timestamps with the right core's time - a
+model timing CPU0's PERST#-after-refclk sequence must use the clock CPU0
+waits on. CPU0 trails the BPMP by up to a slice, so a model both cores touch
+(ACTMON, the Bluetooth chip) compares times rather than subtracting them.
+Releasing CPU0 ends the BPMP's batch at the next block, so the first slice
+starts at once. WFE / WFI park the core to the end of the slice: the stub's
+final `for(;;) wfe;` would otherwise spin through a billion instructions per
+emulated second.
 
 `make test` runs `tests/ccplex/`, a self-contained payload that checks the
 refusal, the EL3 entry, the mailbox, WFE parking and the reset.

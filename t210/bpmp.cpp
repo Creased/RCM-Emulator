@@ -153,7 +153,16 @@ uint32_t count_insns(uc_engine *uc, const EmuState *s, uint64_t addr,
 // A payload that jumps into zeroed memory executes `movs r0, r0` (Thumb
 // 0x0000) or `andeq r0, r0, r0` (ARM) until it hits something. No compiler
 // emits sixteen zero bytes at the start of a block, so that is the signal.
-bool nop_slide(const EmuState *s, uint64_t addr) {
+// The low 16 MB (a null function pointer lands there; the iROM has no
+// contents) is zero-filled RAM too, read through the engine as it is not
+// one of the host views.
+bool nop_slide(uc_engine *uc, const EmuState *s, uint64_t addr) {
+  static const uint8_t zero[16] = {0};
+  if (addr < 0x01000000) {
+    uint8_t buf[16];
+    return uc_mem_read(uc, addr, buf, sizeof(buf)) == UC_ERR_OK &&
+           memcmp(buf, zero, sizeof(zero)) == 0;
+  }
   bool in_range = (addr >= 0x40030000 && addr < IRAM_BASE + IRAM_SIZE) ||
                   (addr >= DRAM_BASE && addr < DRAM_BASE + DRAM_WINDOW_SIZE);
   if (!in_range)
@@ -161,7 +170,6 @@ bool nop_slide(const EmuState *s, uint64_t addr) {
   const uint8_t *p = code_ptr(s, addr, 16);
   if (!p)
     return false;
-  static const uint8_t zero[16] = {0};
   return memcmp(p, zero, sizeof(zero)) == 0;
 }
 
@@ -178,7 +186,7 @@ void hook_block(uc_engine *uc, uint64_t address, uint32_t size, void *ud) {
     return;
   }
 
-  if (nop_slide(s, address)) {
+  if (nop_slide(uc, s, address)) {
     if (!clk.nop_slide_reported) {
       clk.nop_slide_reported = true;
       printf("\n[emu] NOP-slide detected at 0x%08llX (zeroed memory being "
@@ -220,7 +228,11 @@ uc_err bpmp_run(uc_engine *uc, EmuState *state, uint64_t begin,
                 uint64_t max_insns) {
   clk.limit = state->insn_count + (max_insns ? max_insns : 1);
   clk.pending = 0;
-  uc_err err = uc_emu_start(uc, begin, 0, 0, 0);
+  // `until` must be an address the core can never reach. 0 is not one: a
+  // null function pointer took the BPMP there, and from then on every start
+  // returned at once without running anything - the main loop spun forever
+  // waiting for instructions to retire. The PC is 32 bits wide.
+  uc_err err = uc_emu_start(uc, begin, 1ULL << 32, 0, 0);
   // If something other than the budget ended the run (an MMIO handler
   // calling uc_emu_stop, a fault), the block in flight has still run to its
   // end - Unicorn only checks for a stop between blocks - so credit it.
@@ -243,4 +255,8 @@ uint32_t bpmp_timerus_read(EmuState *state) {
 
 void bpmp_clock_jumped() {
   clk.polling = false;
+}
+
+void bpmp_yield() {
+  clk.limit = 0;
 }

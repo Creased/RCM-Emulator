@@ -217,11 +217,13 @@ bool config_window_save_ini_impl(const EmuState *s, const char *path) {
     fprintf(f, "radio=%s\n", wifi_radio_name(s->wifi_radio.load()));
 
     // Fuses are dumped wholesale — small enough (256 × 4 bytes) and keeps the
-    // load path branch-free.
+    // load path branch-free. Zero words too: loading layers the file over
+    // init_fuse_defaults(), so a fuse cleared in the UI and left out here
+    // came back at its default on the next start.
     fprintf(f, "\n[fuses]\n");
     for (size_t i = 0; i < EmuState::FUSE_WORDS; i++) {
         uint32_t v = s->fuse_word[i].load();
-        if (v) fprintf(f, "0x%03X=0x%08X\n", (unsigned)(i * 4), v);
+        fprintf(f, "0x%03X=0x%08X\n", (unsigned)(i * 4), v);
     }
 
     fclose(f);
@@ -889,6 +891,7 @@ void build_ui(EmuState *state) {
         }
         ImGui::SameLine();
         if (ImGui::Button("Reboot")) {
+            state->reboot_cold = true;  // the user's reset is a power cycle
             state->reboot_requested.store(true);
         }
         ImGui::Text("emu_usec:    %llu", (unsigned long long)state->emu_usec);

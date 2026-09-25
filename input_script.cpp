@@ -280,6 +280,10 @@ void input_script_tick(EmuState &state) {
       printf("[input-script] %s down @%llu us (%zu/%zu)\n", key_name(ev.key),
              (unsigned long long)now, i + 1, g_events.size());
       fflush(stdout);
+      // Even if the release is already due - a FLOW_CTLR sleep can jump the
+      // clock past it within one batch - the payload has to run with the
+      // button down at least once, or it never sees the press.
+      break;
     }
     if (ev.pressed && !ev.released && now >= ev.until_us) {
       btn->store(false);
@@ -292,4 +296,13 @@ void input_script_tick(EmuState &state) {
     }
     if (!ev.released) break; // keep this event current until it's let go
   }
+}
+
+void input_script_restart(EmuState &state) {
+  for (Event &ev : g_events)
+    ev.pressed = ev.released = false;
+  g_done = 0;
+  state.btn_power = false;
+  state.btn_vol_up = false;
+  state.btn_vol_down = false;
 }
