@@ -48,26 +48,23 @@ same peripheral models through one dispatch (see [CCPLEX CPU0](#ccplex-cpu0)).
 ## Boot flow (Hekate as the example)
 
 1. The payload is loaded into IRAM (Internal RAM) at `0x40010000` via
-   `uc_mem_write`. We also pre-write the 4-byte cookie `0x544457` ("WDT") at
-   IRAM offset `0x4003FF18`. Hekate reads that location during early boot.
-   When the cookie is present, it takes the `goto skip_lp0_minerva_config`
-   branch and skips loading `libsys_lp0.bso` and training the DRAM with the
-   Minerva module, as it does on hardware after a watchdog reset. The EMC
-   model runs Minerva (see [EMC and DRAM clock](#emc-and-dram-clock)), and
-   Nyx trains the DRAM itself when it starts; the cookie only spares a
-   minimal SD image the IPL's "missing lib" errors and shortens the boot.
-   The matching exception-enable cookie at `0x4003FF1C` stays zero, so the
-   "hang detected" warning is suppressed.
+   `uc_mem_write`. Nothing else is planted: IRAM holds what it holds after a
+   cold boot.
 2. PC is set to `0x40010000`, SP to `IPL_STACK_ADDR`. CPSR enters ARM mode.
 3. The IPL (Initial Program Loader) initialises clocks, fuses, the DRAM
-   (`sdram_init`, at 204 MHz) and the display, then continues into the boot
-   menu without loading LP0 or Minerva.
+   (`sdram_init`, at 204 MHz) and the display, mounts the SD card, loads
+   `bootloader/sys/libsys_lp0.bso` (it saves the LP0 SDRAM config to PMC
+   scratch) and trains the DRAM with Minerva
+   (`bootloader/sys/libsys_minerva.bso`) at 204, 800 and 1600 MHz, all as on
+   hardware (see [EMC and DRAM clock](#emc-and-dram-clock)). An SD image
+   without those modules gets hekate's "Missing LP0 (sleep) lib! / Missing
+   Minerva lib!" screen, which waits for a key press before the menu.
 4. Hekate self-relocates into DRAM (`0xC0000000+`) and continues. It points
    DC (Display Controller) window A at its portrait framebuffer and draws its
    boot logo and menus there, sideways, for the landscape-mounted panel.
-5. Nyx (the LVGL GUI) loads Minerva, trains the DRAM at 204, 800 and
-   1600 MHz, and from then on alternates 1600 and 800 MHz on every GUI loop
-   to save power. It draws landscape into a second framebuffer and has VIC
+5. Nyx (the LVGL GUI) takes over the trained Minerva context and from then
+   on alternates the DRAM between 1600 and 800 MHz on every GUI loop to save
+   power. It draws landscape into a second framebuffer and has VIC
    turn every frame into the portrait surface that window A scans out. The
    display follows the DC's windows, whatever they point at (see Display
    pipeline).
@@ -194,9 +191,9 @@ frequency-switching module, depend on:
 - **Status.** `EMC_EMC_STATUS` otherwise reports timing updates done, the
   DRAM active and the state machines idle.
 
-With the stock `bootloader/` folder, Nyx trains 204, 800 and 1600 MHz and
-then switches between 800 and 1600 MHz on every GUI loop, each switch a full
-handshake with a CCFIFO replay.
+With the stock `bootloader/` folder, hekate's IPL trains 204, 800 and
+1600 MHz, and Nyx then switches between 800 and 1600 MHz on every GUI loop,
+each switch a full handshake with a CCFIFO replay.
 
 ### Security Engine (`t210/se_engine.cpp`)
 
@@ -652,13 +649,16 @@ don't repeat the diagnosis:
 - **Minerva DRAM training** hangs in a `PLL_BASE.LOCK` poll. Fix: report
   LOCK once the PLL is enabled.
 - **Minerva hung Nyx** (hekate 6.5.3 with the stock `bootloader/` folder
-  never reached its GUI). Nyx trains the DRAM itself, and Minerva spun on
+  never reached its GUI). The emulator planted hekate's "watchdog fired"
+  cookie in IRAM so the IPL would skip Minerva; Nyx then trained the DRAM
+  itself, and Minerva spun on
   `PLLMB_BASE.LOCK` (the CAR model had no PLLMB and read it as 0). Behind
   that it would have spun on the DLL-enable bit it writes to
   `EMC_CFG_DIG_DLL` and on `EMC_DIG_DLL_STATUS` lock, timed out on the
   clock-change handshake, and divided by a zero MR18/MR19 oscillator count,
   because every EMC register but three read 0. Fix: PLLMB, and the EMC
-  model described in [EMC and DRAM clock](#emc-and-dram-clock).
+  model described in [EMC and DRAM clock](#emc-and-dram-clock). With
+  Minerva working, the cookie is gone too, and hekate boots as on hardware.
 - **`kfuse_wait_ready`** loops on `STATE.DONE`. Fix: stub `DONE | CRCPASS`.
 - **AMS keygen** retries `tsec_query` 15 times until timeout. Fix: stub
   `STATUS = 0xB0B0B0B0`.

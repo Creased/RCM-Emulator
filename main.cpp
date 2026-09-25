@@ -151,20 +151,6 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
            (unsigned long long)(IRAM_BASE + IRAM_SIZE),
            (unsigned)(IRAM_SIZE / 1024));
 
-    // Pre-set Hekate's "watchdog fired" magic at IRAM 0x4003FF18 (cookie "WDT")
-    // so its early boot does `goto skip_lp0_minerva_config`, skipping both
-    // libsys_lp0.bso and the IPL's Minerva DRAM training - the same path
-    // Hekate takes on hardware after a WDT reset. The matching EXCP_EN_ADDR
-    // (0x4003FF1C) is intentionally left zeroed so ERR_EXCEPTION is *not* set
-    // and the user doesn't see a "hang detected" warning screen. The EMC
-    // model runs Minerva fine (Nyx trains the DRAM itself when it starts);
-    // this only spares a minimal SD image the IPL's "missing lib" errors and
-    // shortens the boot.
-    {
-        uint32_t wdt_magic = 0x544457; // "WDT"
-        uc_mem_write(uc, 0x4003FF18, &wdt_magic, sizeof(wdt_magic));
-    }
-
     // ---- Map DRAM as one contiguous region ----
     // 0x80000000 .. 0x100000000, i.e. the whole 32-bit-addressable DRAM window
     // the BPMP can reach. This used to be two islands (256 MB at 0x80000000
@@ -495,8 +481,7 @@ int main(int argc, char *argv[]) {
         if (!sdl_display_poll_events(&state, uc)) break;
 
         // Soft reboot: re-write the payload to IRAM, wipe DRAM (so Nyx and
-        // the bootloader's file-static caches reset), reset PC/SP/clock and
-        // re-prime the WDT cookie so Hekate's IPL skips LP0/Minerva again.
+        // the bootloader's file-static caches reset) and reset PC/SP/clock.
         if (state.reboot_requested.exchange(false)) {
             uc_emu_stop(uc);
             bool cold = state.reboot_cold.exchange(false);
@@ -513,8 +498,6 @@ int main(int argc, char *argv[]) {
             if (reload > IRAM_SIZE - (IPL_LOAD_ADDR - IRAM_BASE))
                 reload = IRAM_SIZE - (IPL_LOAD_ADDR - IRAM_BASE);
             uc_mem_write(uc, IPL_LOAD_ADDR, state.payload_ptr, reload);
-            uint32_t wdt_magic = 0x544457;
-            uc_mem_write(uc, 0x4003FF18, &wdt_magic, sizeof(wdt_magic));
             // Neither the zeroed DRAM nor uc_mem_write() reaches the engine's
             // code cache, so what the last run translated - a payload it
             // chainloaded over this one's load address, Nyx in DRAM - would

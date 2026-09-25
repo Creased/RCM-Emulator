@@ -642,7 +642,7 @@ bool sdl_display_poll_events(EmuState *state, uc_engine *uc) {
       case SDLK_r: {
         if (!ctrl) {
           // Plain R: soft reboot. Same path as the config window's "Reboot"
-          // button — re-prime IRAM payload + WDT cookie, wipe DRAM, reset PC.
+          // button — reload the payload into IRAM, wipe DRAM, reset PC.
           state->reboot_cold = true;  // the user's reset is a power cycle
           state->reboot_requested = true;
           printf("[diag] Reboot requested (R)\n");
