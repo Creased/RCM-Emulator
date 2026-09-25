@@ -535,6 +535,8 @@ needed. The 64 KB TX log trim happens in-place during the write hook.
   start at the TRM reset values (bank U at a real console's reading), so at
   RCM entry the display is unclocked and `display_init()` does not begin
   with a panel teardown.
+- **USB PLL.** `UTMIPLL_HW_PWRDN_CFG0.LOCK` is set unless software holds
+  the PLL in IDDQ (the reset state), for bdk's `clock_enable_utmipll()`.
 - **PINMUX (`APB_MISC` pad config) and PWM controller (`0x7000A000`).**
   No active behaviour, but reads return whatever the payload last wrote
   via the global `mmio_regs` cache. Hwtest's "Display backlight & PWM"
@@ -547,7 +549,9 @@ needed. The 64 KB TX log trim happens in-place during the write hook.
   payload programs them (PLLM up but unlocked on Erista, the rest down),
   then read back what was written, dividers included, with LOCK set
   whenever ENABLE is. That includes PLLMB, which Minerva moves the EMC onto
-  for a frequency change.
+  for a frequency change, and PLLC4, which clocks the eMMC at HS200/HS400
+  (not while its IDDQ bit is set); PLLC2, PLLC3, PLLDP and PLLA1 lock the
+  same way.
 - **KFUSE.** `STATE` returns `DONE | CRCPASS` immediately so the BDK function
   `kfuse_wait_ready` doesn't hang.
 - **TSEC.** `DMATRFCMD_IDLE` is reported set, and the keygen status word is
@@ -714,6 +718,11 @@ don't repeat the diagnosis:
 
 - **Minerva DRAM training** hangs in a `PLL_BASE.LOCK` poll. Fix: report
   LOCK once the PLL is enabled.
+- **TegraExplorer hung on the eMMC.** Switching SDMMC4 to HS200 enables
+  PLLC4, and TegraExplorer's bdk waits for `PLLC4_BASE.LOCK` with no
+  timeout; the CAR model had no PLLC4, so Erista hung at the key dump and
+  both SoCs at "Browse EMMC". (hekate's newer bdk times the wait out, which
+  hid it.) Fix: PLLC4 locks once enabled, out of IDDQ.
 - **Every payload began with a display teardown.** `CLK_OUT_ENB_L` read a
   real console's value taken after a payload had brought the display up, so
   `display_init()` found DISP1 already clocked at RCM entry. Fix: the bank

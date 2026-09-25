@@ -3329,10 +3329,11 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
   }
   // PLL_BASE registers (per Hekate bdk/soc/clock.h): each PLL has an _BASE
   // register where bit 30 = ENABLE and bit 27 = LOCK. After enabling a PLL
-  // the boot code polls bit 27 until set. Real silicon locks within ~1ms; we
-  // simulate "always locked + always enabled" so the polls return immediately.
+  // the boot code polls bit 27 until set. Real silicon locks within ~1ms;
+  // here a PLL is locked as soon as it is enabled.
   // Offsets: PLLC=0x80, PLLM=0x90, PLLP=0xA0, PLLA=0xB0, PLLU=0xC0, PLLD=0xD0,
-  //          PLLX=0xE0, PLLE=0xE8, PLLD2=0x4B8, PLLREFE=0x4C4.
+  //          PLLX=0xE0, PLLE=0xE8, PLLD2=0x4B8, PLLREFE=0x4C4, PLLC2=0x4E8,
+  //          PLLC3=0x4FC, PLLDP=0x590, PLLC4=0x5A4, PLLMB=0x5E8, PLLA1=0x6A4.
   bool mariko = state && state->pmic_otp.load() == 0x53;
 
   // On a real console in RCM most PLLs are DOWN - measured on a Mariko, only
@@ -3360,11 +3361,25 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
   if (offset == 0xE8 || offset == 0x4C4)
     return mmio_regs.get(addr);
   switch (offset) {
-  case 0x80: case 0xB0: case 0xE0: case 0x4B8: {
-    uint32_t w = mmio_regs.get(addr);
-    if (w & (1u << 30))
-      return w | (1u << 27);          // payload brought it up -> locked
-    return w;                          // measured: down on both
+  case 0x80: case 0xB0: case 0xE0: case 0x4B8: case 0x4E8: case 0x4FC:
+  case 0x590: case 0x5A4: case 0x6A4: {
+    // PLLC, PLLA, PLLX, PLLD2 (measured down on both), PLLC2, PLLC3,
+    // PLLDP, PLLC4 and PLLA1: locked once the payload enables them (bit
+    // 30). Bit 27 is LOCK or FREQ_LOCK on all of them; PLLA1 also has LOCK
+    // in 26, and PLLDP and PLLC4 FREQLOCK in 28 and a LOCK_OVERRIDE in 24
+    // (TRM 5.2). PLLC4 does not run in IDDQ (bit 18): bdk clears that,
+    // enables it for the eMMC's HS200/HS400 clock and waits for the lock
+    // with no timeout.
+    uint32_t lock = 1u << 27;
+    if (offset == 0x6A4)
+      lock |= 1u << 26;
+    if (offset == 0x590 || offset == 0x5A4)
+      lock |= 1u << 28;
+    uint32_t w = mmio_regs.get(addr) & ~lock;
+    bool on = (w & (1u << 30)) && !(offset == 0x5A4 && (w & (1u << 18)));
+    if ((offset == 0x590 || offset == 0x5A4) && (w & (1u << 24)))
+      on = true;
+    return on ? w | lock : w;
   }
   case 0x90: { // PLLM
     // Until the payload programs it: Erista leaves PLLM enabled but
@@ -3395,6 +3410,14 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
     if ((w & (1u << 30)) || (misc1 & (1u << 18)))
       w |= 3u << 26;
     return w;
+  }
+  case 0x52C: { // UTMIPLL_HW_PWRDN_CFG0 (TRM 5.2.202), reset 0x0000000F
+    // UTMIPLL_LOCK (bit 31) and SEQ_STATE (27:26) are read-only. The USB
+    // PLL locks unless software holds it in IDDQ (IDDQ_SWCTL with
+    // IDDQ_OVERRIDE_VALUE, the reset state); bdk's usb code clears the
+    // override, then clock_enable_utmipll() waits for the lock.
+    uint32_t w = mmio_regs.get(addr, 0x0000000F) & ~(1u << 31 | 3u << 26);
+    return (w & 3) == 3 ? w : w | (1u << 31);
   }
   case 0x5EC: // PLLMB_MISC1, reset 0x00010000 (EN_LCKDET)
     return mmio_regs.get(addr, 0x00010000);
