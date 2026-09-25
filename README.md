@@ -296,7 +296,7 @@ flowchart LR
     t210 --> se["se_engine.{h,cpp}<br/>AES-128, SHA-256"]
     t210 --> i2c["i2c3.{h,cpp}<br/>STMFTS / FTS4 touch"]
 
-    display --> sdl["sdl_display.{h,cpp}<br/>block-linear de-swizzle<br/>+ SDL2"]
+    display --> sdl["sdl_display.{h,cpp}<br/>DC window scan-out<br/>+ SDL2"]
 ```
 
 For implementation details, see [DESIGN.md](DESIGN.md).

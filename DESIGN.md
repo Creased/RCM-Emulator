@@ -14,7 +14,7 @@ flowchart TB
     main -->|ccplex_run| a57["<b>t210/ccplex</b><br/>2nd Unicorn engine, AArch64<br/>CCPLEX CPU0 (Cortex-A57)"]
     a57 -->|MMIO callbacks| mmio
     a57 -.->|shares| uc
-    main -->|sdl_display_*| sdl["<b>display/sdl_display</b><br/>block-linear de-swizzle<br/>rotate, blit"]
+    main -->|sdl_display_*| sdl["<b>display/sdl_display</b><br/>DC window scan-out<br/>blend, turn, blit"]
     main -->|config_window_*| cfg["<b>display/config_window</b><br/>2nd SDL window + ImGui<br/>live hardware tweaks"]
     main -->|console_window_*| con["<b>display/console_window</b><br/>3rd SDL window + ImGui<br/>per-port UART TX log + RX inject"]
 
@@ -25,7 +25,8 @@ flowchart TB
     mmio --> i2c["<b>i2c3</b><br/>STMFTS / FTS4 touch"]
     mmio --> i2c1["<b>I2C_1 slaves</b> (inline)<br/>MAX17050, TMP451,<br/>BQ24193, BM92T36"]
     mmio --> i2c5["<b>I2C_5 slaves</b> (inline)<br/>MAX77620, MAX77621"]
-    mmio --> stubs["<b>inline stubs</b><br/>GPIO, PMC, TSEC, KFUSE,<br/>PWM, DC, CLK, TMR, FUSE, UART"]
+    mmio --> dc["<b>DC + VIC</b> (inline)<br/>window registers A-D<br/>VIC compose, flip/transpose"]
+    mmio --> stubs["<b>inline stubs</b><br/>GPIO, PMC, TSEC, KFUSE,<br/>PWM, CLK, TMR, FUSE, UART"]
     mmio --> pcie["<b>pcie</b><br/>AFI, root ports, CYW4356<br/>(CPU-complex master only)"]
 
     cfg -.->|writes atomics| state["<b>EmuState</b><br/>(emu_state.h)"]
@@ -58,11 +59,13 @@ same peripheral models through one dispatch (see [CCPLEX CPU0](#ccplex-cpu0)).
 2. PC is set to `0x40010000`, SP to `IPL_STACK_ADDR`. CPSR enters ARM mode.
 3. The IPL (Initial Program Loader) initialises clocks, fuses and the display,
    then continues straight into the boot menu without loading LP0 or Minerva.
-4. Hekate self-relocates into DRAM (`0xC0000000+`) and continues. The display
-   pipeline resamples its DRAM-side framebuffer parameters.
-5. Nyx (the LVGL graphics stack) initialises and draws into a separate FB. The
-   DC (Display Controller) `WINDOW_HEADER` register tracks the currently
-   primary surface. The display code follows that pointer.
+4. Hekate self-relocates into DRAM (`0xC0000000+`) and continues. It points
+   DC (Display Controller) window A at its portrait framebuffer and draws its
+   boot logo and menus there, sideways, for the landscape-mounted panel.
+5. Nyx (the LVGL GUI) draws landscape into a second framebuffer and has VIC
+   turn every frame into the portrait surface that window A scans out. The
+   display follows the DC's windows, whatever they point at (see Display
+   pipeline).
 
 ## Memory map
 
@@ -326,25 +329,61 @@ do not auto-creep into the build.
 
 ### Display pipeline (`display/sdl_display.cpp`)
 
-Hekate and Nyx draw into a block-linear surface. One block-height row covers
-16 GOBs (Group Of Bytes, NVIDIA's 64 by 8 pixel tile). The display thread:
+The display controller is modelled as the registers of its four windows,
+A-D (TRM 24.10-24.11), in `t210/mmio.cpp`. Payloads reach a window through
+the indirect window pages (0x700-0x83F), which write every window
+`DC_CMD_DISPLAY_WINDOW_HEADER` selects, or through a window's direct range
+(A 0xB80, B 0xD80, C 0xF80). Writes land in the window's assembly copy, and
+`WIN_x_ACT_REQ` in `DC_CMD_STATE_CONTROL` copies that into the active copy,
+so a half-programmed window never shows. Reads return what was written.
+`STATE_CONTROL` reads 0 (every request has completed), and `INT_STATUS`
+reports a frame end and a vblank, which bdk polls before DSI commands.
 
-1. Reads DC `WINDOW_HEADER` to follow the active surface (Window A, B, C or
-   D).
-2. Looks up the FB pointer, stride and GOB block height latched from
-   `DC_WIN_x_SURFACE_KIND`.
-3. De-swizzles into a linear RGBA buffer using a per-pixel address calc.
-4. Optionally rotates 0, 90, 180 or 270 degrees to match the panel orientation
-   detected from window dimensions, with an `R` or `Shift+R` manual override.
-5. Blits to an SDL_Texture at the host window current size.
+Each display tick builds the picture the panel would receive, 720x1280 and
+portrait, the way the DC builds it:
 
-The de-swizzle is the hottest path. It is inlined and operates on `u32`
-units. The surface is read straight from the host memory behind emulated DRAM,
-and a frame whose bytes and layout `(addr, w, h, stride, sw, bh, rot)` match
-the previous one skips the de-swizzle and the texture upload entirely. No
-renderer uses `PRESENTVSYNC`: the CPU runs on the same thread, the loop
-already paces redraws to ~60 Hz, and a vsync'd present could stall the
-emulated CPU for a whole frame.
+1. Every enabled window's surface is fetched at `START_ADDR`. The layout
+   comes from `SURFACE_KIND`: pitch, 16x16 tiled, or block linear with
+   2^`BLOCK_HEIGHT` GOBs (Groups of Bytes, 64x8-byte tiles) per block. The
+   line pitch is `LINE_STRIDE`, and pixels are decoded per `COLOR_DEPTH`.
+   Block-linear byte order follows TRM 20.1.2 and Figure 47.
+2. `WIN_OPTIONS` turns the surface: H_DIRECTION and V_DIRECTION mirror it,
+   and SCAN_COLUMN walks its columns (90/270 degrees, TRM Table 122). The
+   result is scaled from `PRESCALED_SIZE` to `SIZE`, nearest-neighbour, and
+   placed at `POSITION`.
+3. The windows are stacked by layer depth (A under D when equal) and blended
+   per `BLEND_LAYER_CONTROL` and `BLEND_MATCH_SELECT`. Hekate's log console
+   (window D, K1 = 200) shows through as it does on the console.
+
+The panel picture is then turned for the host window. When the surface on
+show was turned on its way to the panel, by the DC (SCAN_COLUMN) or by a
+VIC compose (Nyx), the turn is undone. A GUI drawn landscape is then shown
+landscape. A surface drawn straight into portrait (hekate's logo and TUI,
+hwtest) is shown as the panel receives it. `Ctrl+R` / `Ctrl+Shift+R`
+override the turn, and `S` forces pitch or block-linear decoding for
+diagnosis. Until
+the payload first activates a window, the emulator's own framebuffer at
+`FB_BASE` stands in as window A.
+
+A frame whose surfaces' bytes and layout match the previous frame skips the
+rebuild and the texture upload. Surfaces are read straight from the host
+memory behind emulated DRAM. No renderer uses `PRESENTVSYNC`: the CPU runs
+on the same thread, the loop already paces redraws to ~60 Hz, and a vsync'd
+present could stall the emulated CPU for a whole frame.
+
+### VIC (`t210/mmio.cpp`)
+
+bdk drives VIC through the Falcon private-register window. The model keeps
+the config struct's address (`VIC_SC_PRAMBASE`), the slots' source surfaces
+(`VIC_SC_SFC0_BASE_LUMA(n)`) and the target (`VIC_BL_TARGET_BASADR`). On
+`VIC_FC_COMPOSE` it reads bdk's `vic_config_t` from guest memory and draws
+every enabled pitch slot into the target, scaling the source rect onto the
+dest rect, clipped to the target rect, with the output flip X, flip Y and
+transpose applied. The output size is given before the transpose, so a
+transposed target is H x W pixels, which is how the DC then reads it. The
+compose also records the target address and the turn applied, which the
+display uses to undo it. Nyx's 270-degree rotation is flip X then transpose.
+Block-linear VIC surfaces are not modelled, and nothing in bdk uses them.
 
 ### UART
 
@@ -585,6 +624,15 @@ don't repeat the diagnosis:
   Now `fstat`-derived from `rawnand.bin.00`.
 - **Save header SHA-256** rejected by TE because the SE only modelled AES.
   Hence the SHA-256 path in `se_engine.cpp`.
+- **Display stride and window state.** The DC model took the line stride
+  from `PRESCALED_SIZE` rather than `LINE_STRIDE`, kept one set of window
+  parameters shared by all four windows (window D's 656-pixel width leaked
+  into window A), and the block-linear decoder had two GOB address bits
+  swapped. The renderer compensated with per-address heuristics (a
+  "known menu stride" of 2624, forced block-linear decoding of the IPL
+  carveout, a hard-coded 1280x720 geometry for Nyx's framebuffer). Fix:
+  per-window register files latched on `WIN_x_ACT_REQ`, a TRM-exact
+  scan-out, and a VIC that really rotates. The heuristics are gone.
 - **PINMUX / PWM read-back** silently returned 0, so any probe that read
   back its own pad-mux setting (e.g. hwtest checking `LCD_BL_PWM` is in
   PWM0 mode) saw an unconfigured pin even after a successful write. Fix:

@@ -204,7 +204,6 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
     // ---- Map Framebuffer pointer ----
     state->fb_ptr = state->dram_low_ptr + (FB_BASE - DRAM_BASE);
     fill_fb_background(state);
-    state->fb_addr = FB_BASE;
     printf("[emu] Defined FB:   0x%08llX - 0x%08llX (%u MB)\n",
            (unsigned long long)FB_BASE,
            (unsigned long long)(FB_BASE + FB_SIZE),
@@ -532,7 +531,6 @@ int main(int argc, char *argv[]) {
             uc_reg_write(uc, UC_ARM_REG_CPSR, &reset_cpsr);
             uc_reg_write(uc, UC_ARM_REG_SP,   &reset_sp);
             uc_reg_write(uc, UC_ARM_REG_PC,   &reset_pc);
-            state.fb_addr = FB_BASE; // re-point display at the FB base
             state.emu_usec   = 0;
             state.insn_count = 0;
             state.bpmp_slept_us = 0;

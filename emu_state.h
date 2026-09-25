@@ -91,6 +91,40 @@ inline bool wifi_radio_parse(const char *s, uint8_t *out) {
     return false;
 }
 
+// Tegra DC window registers (TRM 24.10-24.11) as slots in a window's
+// register file: the indirect window page 0x700-0x7FF is slots 0x000-0x0FF,
+// the WINBUF page 0x800-0x83F slots 0x100-0x13F.
+namespace dcwin {
+constexpr uint32_t kRegs        = 0x140;
+constexpr uint32_t OPTIONS      = 0x000; // DC_WIN_WIN_OPTIONS
+constexpr uint32_t COLOR_DEPTH  = 0x003; // DC_WIN_COLOR_DEPTH
+constexpr uint32_t POSITION     = 0x004; // DC_WIN_POSITION
+constexpr uint32_t SIZE         = 0x005; // DC_WIN_SIZE (post-scaling)
+constexpr uint32_t PRESCALED    = 0x006; // DC_WIN_PRESCALED_SIZE (bytes x lines)
+constexpr uint32_t LINE_STRIDE  = 0x00A; // DC_WIN_LINE_STRIDE (bytes)
+constexpr uint32_t BLEND_LAYER  = 0x016; // DC_WINBUF_BLEND_LAYER_CONTROL
+constexpr uint32_t BLEND_MATCH  = 0x017; // DC_WINBUF_BLEND_MATCH_SELECT
+constexpr uint32_t START_ADDR   = 0x100; // DC_WINBUF_START_ADDR
+constexpr uint32_t SURFACE_KIND = 0x10B; // DC_WINBUF_SURFACE_KIND
+
+// WIN_OPTIONS bits.
+constexpr uint32_t H_DIRECTION = 1u << 0;
+constexpr uint32_t V_DIRECTION = 1u << 2;
+constexpr uint32_t SCAN_COLUMN = 1u << 4;
+constexpr uint32_t WIN_ENABLE  = 1u << 30;
+
+// BLEND_LAYER_CONTROL resets to BLEND_BYPASS (TRM 24.10.12).
+constexpr uint32_t BLEND_LAYER_RESET = 0x01000000;
+
+// A picture turn, as flip-then-transpose: the source is mirrored left-right
+// (XF_FLIP_X) and/or top-bottom (XF_FLIP_Y), then rows become columns
+// (XF_TRANSPOSE). DC WIN_OPTIONS (H_DIRECTION, V_DIRECTION, SCAN_COLUMN) and
+// VIC's OutputFlipX/FlipY/Transpose both follow this convention.
+constexpr uint32_t XF_FLIP_X    = 1u << 0;
+constexpr uint32_t XF_FLIP_Y    = 1u << 1;
+constexpr uint32_t XF_TRANSPOSE = 1u << 2;
+} // namespace dcwin
+
 struct EmuState {
     uc_engine *uc = nullptr;
     // Button state (updated by SDL keyboard events).
@@ -139,24 +173,21 @@ struct EmuState {
     std::atomic<uint32_t> last_out_w{1280};
     std::atomic<uint32_t> last_out_h{720};
 
-    // Display state.
-    uint64_t fb_addr = 0, pre_addr = 0;
-    uint32_t fb_width = 720, pre_w = 720;
-    uint32_t fb_height = 1280, pre_h = 1280;
-    uint32_t fb_stride = 2880, pre_stride = 2880;
-    uint32_t fb_swizzle = 0, pre_sw = 0;
-    uint32_t fb_rotation = 0, pre_rot = 0;
-    uint32_t pre_bh = 0; // block height in GOBs from DC surface-kind (0 = unset)
-    uint32_t fb_sw_gobs = 80;
-    uint32_t fb_bh = 0; // 0 = use display code default until DC surface-kind latches
-
-    // DC window selection: tracks DC_CMD_DISPLAY_WINDOW_HEADER.
-    // Bit 4 = Window A, Bit 5 = Window B, Bit 6 = Window C, Bit 7 = Window D.
-    uint32_t dc_window_sel = 0x10; // Default: Window A
-    // Saved Window A parameters (primary display surface).
-    uint64_t winA_addr = 0;
-    uint32_t winA_w = 720, winA_h = 1280, winA_stride = 2880;
-    uint32_t winA_sw = 0, winA_rot = 0, winA_bh = 0;
+    // Display controller windows A-D (t210/mmio.cpp, Display). Each window
+    // has a register file indexed by dcwin:: slot. The CPU writes the
+    // assembly copy; DC_CMD_STATE_CONTROL's WIN_x_ACT_REQ copies it into the
+    // active copy, which is what the scan-out (display/sdl_display.cpp)
+    // decodes.
+    uint32_t dc_win[4][dcwin::kRegs] = {};
+    uint32_t dc_win_active[4][dcwin::kRegs] = {};
+    uint32_t dc_window_header = 0; // DC_CMD_DISPLAY_WINDOW_HEADER
+    // False from reset until the payload first activates a window. Until
+    // then the scan-out shows the emulator's own framebuffer (FB_BASE).
+    bool dc_programmed = false;
+    // Where the last VIC compose wrote, and how it turned the picture on the
+    // way (dcwin::XF_* bits). The scan-out undoes that turn for display.
+    uint64_t vic_out_addr = 0;
+    uint32_t vic_out_xform = 0;
     std::atomic<bool> display_dirty{false};
     std::atomic<bool> display_initialized{false};
     int32_t           manual_offset = 0;

@@ -1570,112 +1570,132 @@ void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
 }
 
 // ==================== Display ====================
+//
+// The display controller's windows (TRM 24.10-24.11) are modelled as one
+// register file per window, A-D. The CPU reaches them either through the
+// indirect window pages (0x700-0x7FF, 0x800-0x83F), which write every window
+// DC_CMD_DISPLAY_WINDOW_HEADER selects and read back the lowest selected one,
+// or through a window's own direct range (A: 0xB80/0xBC0, B: 0xD80/0xDC0,
+// C: 0xF80/0xFC0). Writes go to the assembly copy. WIN_x_ACT_REQ in
+// DC_CMD_STATE_CONTROL promotes window x to the active copy that the scan-out
+// (display/sdl_display.cpp) decodes, so a half-programmed window never shows.
+// (The hardware stages this twice, UPDATE then ACT_REQ; every payload writes
+// both back to back, so one step is enough.)
+//
+// The rest of the DC is plain read-back storage, except the two words that
+// payloads poll: STATE_CONTROL (requests complete at once) and INT_STATUS
+// (a frame has always just ended).
+
+static constexpr uint32_t kDcCmdIntStatus     = 0x037;
+static constexpr uint32_t kDcCmdStateControl  = 0x041;
+static constexpr uint32_t kDcCmdWindowHeader  = 0x042;
+static constexpr uint32_t kDcIntFrameEndVBlank = (1u << 1) | (1u << 2);
+
+// Resolve a DC word index to the windows it addresses and the register-file
+// slot. False for anything that is not a window register.
+static bool dc_window_reg(const EmuState *state, uint32_t index,
+                          uint32_t *mask, uint32_t *slot) {
+  if (index >= 0x700 && index < 0x800) {
+    *mask = (state->dc_window_header >> 4) & 0xF;
+    *slot = index - 0x700;
+    return true;
+  }
+  if (index >= 0x800 && index < 0x840) {
+    *mask = (state->dc_window_header >> 4) & 0xF;
+    *slot = 0x100 + (index - 0x800);
+    return true;
+  }
+  static const uint32_t kDirect[3] = {0xB80, 0xD80, 0xF80};
+  for (uint32_t w = 0; w < 3; w++) {
+    uint32_t base = kDirect[w];
+    if (index >= base && index < base + 0x80) {
+      *mask = 1u << w;
+      *slot = index < base + 0x40 ? index - base : 0x100 + (index - base - 0x40);
+      return true;
+    }
+  }
+  return false;
+}
+
+static void dc_reset(EmuState *state) {
+  memset(state->dc_win, 0, sizeof(state->dc_win));
+  memset(state->dc_win_active, 0, sizeof(state->dc_win_active));
+  for (int w = 0; w < 4; w++)
+    state->dc_win[w][dcwin::BLEND_LAYER] =
+        state->dc_win_active[w][dcwin::BLEND_LAYER] = dcwin::BLEND_LAYER_RESET;
+  state->dc_window_header = 0;
+  state->dc_programmed = false;
+  state->vic_out_addr = 0;
+  state->vic_out_xform = 0;
+}
+
+// One line per window whose picture changed (not for moves: bdk slides its
+// log window in 16 pixels at a time).
+static void dc_log_window(int w, const uint32_t *r) {
+  if (!(r[dcwin::OPTIONS] & dcwin::WIN_ENABLE)) {
+    printf("[display] window %c off\n", 'A' + w);
+    return;
+  }
+  static const char *const kKind[4] = {"pitch", "tiled", "block", "?"};
+  uint32_t kind = r[dcwin::SURFACE_KIND];
+  printf("[display] window %c: %ux%u @ 0x%08X, %s", 'A' + w,
+         r[dcwin::SIZE] & 0x1FFF, (r[dcwin::SIZE] >> 16) & 0x1FFF,
+         r[dcwin::START_ADDR], kKind[kind & 3]);
+  if ((kind & 3) == 2)
+    printf(" (%u-GOB blocks)", 1u << ((kind >> 4) & 7));
+  printf(", stride %u, depth 0x%X, options 0x%X\n",
+         r[dcwin::LINE_STRIDE] & 0xFFFF, r[dcwin::COLOR_DEPTH] & 0x7F,
+         r[dcwin::OPTIONS]);
+}
 
 uint32_t display_read(EmuState *state, uint64_t addr) {
-  uint32_t offset = (uint32_t)(addr - DISPLAY_A_BASE);
-  if (offset == 0x800 * 4 || offset == 0x2000)
-    return (uint32_t)state->fb_addr;
-  return 0;
+  uint32_t index = (uint32_t)(addr - DISPLAY_A_BASE) / 4;
+  uint32_t mask, slot;
+  if (dc_window_reg(state, index, &mask, &slot)) {
+    for (int w = 0; w < 4; w++)
+      if (mask & (1u << w))
+        return state->dc_win[w][slot];
+    return 0;
+  }
+  switch (index) {
+  case kDcCmdIntStatus:    return kDcIntFrameEndVBlank;
+  case kDcCmdStateControl: return 0;
+  case kDcCmdWindowHeader: return state->dc_window_header;
+  default:                 return mmio_regs.get(addr);
+  }
 }
 
 void display_write(EmuState *state, uint64_t addr, uint32_t val) {
-  if (addr < 0x54200000 || addr >= 0x54240000)
+  uint32_t index = (uint32_t)(addr - DISPLAY_A_BASE) / 4;
+  uint32_t mask, slot;
+  if (dc_window_reg(state, index, &mask, &slot)) {
+    for (int w = 0; w < 4; w++)
+      if (mask & (1u << w))
+        state->dc_win[w][slot] = val;
     return;
-  uint32_t offset = (uint32_t)(addr - 0x54200000);
-  uint32_t index = offset / 4;
-
-  // DC_CMD_DISPLAY_WINDOW_HEADER (offset 0x042*4 = 0x108).
-  // Tracks which window's registers are currently selected.
-  if (offset == 0x108)
-    state->dc_window_sel = val;
-
-  if (offset >= 0x1C00 && offset < 0x1E00) {
-    uint32_t win_off = offset - 0x1C00;
-    if (win_off == 0x00)
-      state->pre_rot = val;
-    if (win_off == 0x14) {
-      state->pre_w = (val & 0x1FFF);
-      state->pre_h = ((val >> 16) & 0x1FFF);
+  }
+  if (index == kDcCmdWindowHeader) {
+    state->dc_window_header = val;
+  } else if (index == kDcCmdStateControl) {
+    uint32_t req = (val >> 1) & 0xF; // WIN_A..D_ACT_REQ
+    for (int w = 0; w < 4; w++) {
+      if (!(req & (1u << w)))
+        continue;
+      uint32_t *act = state->dc_win_active[w];
+      const uint32_t *asm_ = state->dc_win[w];
+      static const uint32_t kShown[] = {
+          dcwin::OPTIONS, dcwin::COLOR_DEPTH, dcwin::SIZE, dcwin::LINE_STRIDE,
+          dcwin::START_ADDR, dcwin::SURFACE_KIND};
+      bool changed = !state->dc_programmed;
+      for (uint32_t r : kShown)
+        changed |= act[r] != asm_[r];
+      memcpy(act, asm_, sizeof(state->dc_win_active[w]));
+      if (changed)
+        dc_log_window(w, act);
     }
-    if (win_off == 0x18)
-      state->pre_stride = val & 0xFFFF;
-    if (win_off == 0x2C) {
-      state->pre_sw = ((val & 0x7) == 2) ? 2 : 0;
-      // Tegra DC surface kind: tile in low bits; bits 4–7 = log2(block height in
-      // GOBs) for block-linear (values 1..5 → 2,4,8,16,32 GOBs).
-      unsigned log2bh = (val >> 4) & 0xF;
-      if (log2bh >= 1 && log2bh <= 5)
-        state->pre_bh = 1u << log2bh;
-      else
-        state->pre_bh = 0;
-    }
-  } else if (offset >= 0x2000 && offset < 0x2100) {
-    uint32_t buf_off = offset - 0x2000;
-    if (buf_off == 0x00) {
-      state->pre_addr = val;
-      if (val == 0xF6200000) {
-        printf("[display] WARNING: Guest wrote 0xF6200000 to pre_addr!\n");
-        // Print the guest PC to see where this comes from
-        uint32_t pc = 0;
-        uc_reg_read(state->uc, UC_ARM_REG_PC, &pc);
-        printf("[display] Guest PC: 0x%X\n", pc);
-        uint8_t code[16] = {0};
-        if (uc_mem_read(state->uc, pc - 8, code, 16) == UC_ERR_OK) {
-          printf("[display] Code: ");
-          for (int i=0; i<16; i++) printf("%02X ", code[i]);
-          printf("\n");
-        }
-      }
-    }
-    if (buf_off == 0x2C) {
-      state->pre_sw = ((val & 0x7) == 2) ? 2 : 0;
-      unsigned log2bh = (val >> 4) & 0xF;
-      if (log2bh >= 1 && log2bh <= 5)
-        state->pre_bh = 1u << log2bh;
-      else
-        state->pre_bh = 0;
-    }
-  } else if (index == 0x85) { // SIZE legacy
-    state->pre_w = (val & 0x1FFF);
-    state->pre_h = ((val >> 16) & 0x1FFF);
-  } else if (index == 0x41 || offset == 0x104) { // DC_CMD_STATE_CONTROL
-    // Latch when activation request bits are set (WIN_A_ACT_REQ=bit1,
-    // GENERAL_ACT_REQ=bit0)
-    if (val & 0x3) {
-      bool is_window_a = (state->dc_window_sel & 0x10) != 0; // Bit 4 = Window A
-      bool is_window_d = (state->dc_window_sel & 0x80) != 0; // Bit 7 = Window D
-
-      if (is_window_a && state->pre_addr) {
-        // Save Window A parameters as primary display surface.
-        state->winA_addr = state->pre_addr;
-        state->winA_w = state->pre_w;
-        state->winA_h = state->pre_h;
-        state->winA_stride = state->pre_stride;
-        state->winA_sw = state->pre_sw;
-        state->winA_rot = state->pre_rot;
-        state->winA_bh = state->pre_bh;
-      }
-
-      // Always latch to fb_* for display — but prefer Window A over Window D
-      // since Window D is just a transparent overlay in Hekate.
-      if (is_window_a || !is_window_d) {
-        state->fb_addr = state->pre_addr;
-        state->fb_width = state->pre_w;
-        state->fb_height = state->pre_h;
-        state->fb_stride = state->pre_stride;
-        state->fb_swizzle = state->pre_sw;
-        state->fb_rotation = state->pre_rot;
-        if (state->pre_bh)
-          state->fb_bh = state->pre_bh;
-      }
-      // If Window D is latched alone, don't override — keep Window A's surface.
-
+    if (req) {
+      state->dc_programmed = true;
       state->display_dirty = true;
-      printf("[display] LATCH (ACT_REQ): 0x%llX (%dx%d), WinSel: 0x%X, Sw: %d, "
-             "Str: %d\n",
-             (unsigned long long)state->fb_addr, state->fb_width,
-             state->fb_height, state->dc_window_sel, state->fb_swizzle,
-             state->fb_stride);
     }
   }
 }
@@ -3481,93 +3501,179 @@ static void se_write(EmuState *state, uint64_t addr, uint32_t val) {
 
 // ==================== MMIO Hook Callbacks ====================
 
-static uint64_t vic_src_addr = 0;
-static uint64_t vic_dst_addr = 0;
+// ==================== VIC ====================
+//
+// bdk (vic.c) drives VIC through the Falcon private-register window:
+// VIC(0x1000 + (priv >> 6)) = data. PVIC_FALCON_ADDR supplies the low bits
+// for registers that need them; none of the ones modelled here do. The model
+// keeps what a compose needs - the config struct's address (PRAMBASE), the
+// slots' source surfaces and the target surface - and, on COMPOSE_START,
+// reads the config struct from guest memory and draws the enabled pitch
+// slots into the target with the output flip/transpose. That is what Nyx
+// relies on: its 1280x720 GUI is turned into the panel's 720x1280 portrait
+// framebuffer by a 270-degree VIC rotation (flip X, then transpose).
+//
+// Config struct layout (bdk vic_config_t; all fields little-endian u64
+// bitfields):
+//   0x10 OutputConfig         u64 0: FlipX b48, FlipY b49, Transpose b50
+//                             u64 1: TargetRect L b0, R b16, T b32, B b48
+//   0x20 OutputSurfaceConfig  u64 0: format b0, BlkKind b11, W-1 b32, H-1 b46
+//   0x90 + n * 0xB0  slot n:  u64 0: SlotEnable b0
+//                             u64 4/5: SourceRect L|R, T|B (16.16, b0/b32)
+//                             u64 6: DestRect L b0, R b16, T b32, B b48
+//        + 0x40 SlotSurfaceConfig: as OutputSurfaceConfig
+// Rects are inclusive. The output surface size is given pre-transpose, so a
+// transposed target is (H x W) pixels, which is how the DC reads it back.
+
+static constexpr uint32_t kVicPramBase  = 0x1500; // VIC_SC_PRAMBASE      0x14000
+static constexpr uint32_t kVicSfcBase0  = 0x150C; // VIC_SC_SFC0_BASE_LUMA 0x14300 + n * 0x100
+static constexpr uint32_t kVicTarget    = 0x1880; // VIC_BL_TARGET_BASADR 0x22000
+static constexpr uint32_t kVicCompose   = 0x1400; // VIC_FC_COMPOSE       0x10000
+
+struct VicRegs {
+  uint64_t cfg = 0;         // config struct address
+  uint64_t sfc[8] = {};     // slot n luma surface
+  uint64_t target = 0;      // output surface
+};
+static VicRegs vic;
 
 static uint32_t vic_read(EmuState *state, uint64_t addr) {
   (void)state;
   (void)addr;
+  return 0; // PVIC_FALCON_IDLESTATE: composes finish at once
+}
+
+// Bytes per pixel of a VIC pixel format (bdk vic.h), 0 if not modelled.
+static uint32_t vic_bpp(uint32_t fmt) {
+  if (fmt == 1)
+    return 1; // L8
+  if (fmt >= 21 && fmt <= 24)
+    return 2; // X1B5G5R5 .. B5G5R5X1
+  if (fmt >= 31 && fmt <= 38)
+    return 4; // A8B8G8R8 .. R8G8B8X8
   return 0;
 }
 
-// VIC registers using Falcon PA translated offsets (1000 + untranslated >> 6)
-// VIC registers using Falcon PA translated offsets (1000 + untranslated >> 6)
-static uint64_t vic_config_addr = 0;
-static uint32_t vic_config_size = 0;
-static uint32_t vic_last_falcon_addr = 0;
-
-struct vic_out_config_struct {
-  uint32_t raw[2];
-};
-
-struct vic_out_sfc_config_struct {
-  uint32_t raw[2];
-};
-
-static void vic_write_internal(EmuState *state, uint32_t translated_off,
-                               uint32_t val);
-
-static void vic_write(EmuState *state, uint64_t addr, uint32_t val) {
-  uint32_t offset = (uint32_t)(addr - VIC_BASE);
-
-  if (offset == 0x10AC) { // PVIC_FALCON_ADDR
-    vic_last_falcon_addr = val;
-  } else if (offset == 0x10B0) { // PVIC_FALCON_DATA
-    uint32_t translated_off = (vic_last_falcon_addr >> 6) + 0x1000;
-    vic_write_internal(state, translated_off, val);
-  } else {
-    vic_write_internal(state, offset, val);
-  }
+// A host pointer to [addr, addr + len) of emulated DRAM, or null.
+static uint8_t *vic_dram(EmuState *state, uint64_t addr, uint64_t len) {
+  if (!state->dram_low_ptr || addr < DRAM_BASE ||
+      addr + len > DRAM_BASE + DRAM_WINDOW_SIZE)
+    return nullptr;
+  return state->dram_low_ptr + (addr - DRAM_BASE);
 }
 
-static void vic_write_internal(EmuState *state, uint32_t offset, uint32_t val) {
+static void vic_compose(EmuState *state) {
+  uint64_t c[0x610 / 8];
+  if (!vic.cfg || uc_mem_read(state->uc, vic.cfg, c, sizeof(c)) != UC_ERR_OK)
+    return;
+  auto bits = [](uint64_t v, unsigned lo, unsigned n) {
+    return (uint32_t)((v >> lo) & ((1ull << n) - 1));
+  };
 
-  if (offset == 0x1500) { // VIC_SC_PRAMBASE
-    vic_config_addr = (uint64_t)val << 8;
-  } else if (offset == 0x1504) { // VIC_SC_PRAMSIZE
-    vic_config_size = val << 6;
-  } else if (offset == 0x150C) { // VIC_SC_SFC0_BASE_LUMA
-    vic_src_addr = (uint64_t)val << 8;
-  } else if (offset == 0x1880) { // VIC_BL_TARGET_BASADR
-    vic_dst_addr = (uint64_t)val << 8;
-  } else if ((offset == 0x1400 || offset == 0x1440) &&
-             val == 1) { // VIC_FC_COMPOSE
-    if (vic_src_addr >= 0x40000000 && vic_dst_addr >= 0x40000000) {
-      uint32_t sfc[2] = {0};
-      uc_mem_read(state->uc, vic_config_addr + 0x18, sfc, 8);
+  bool flip_x = bits(c[2], 48, 1), flip_y = bits(c[2], 49, 1);
+  bool transpose = bits(c[2], 50, 1);
+  uint32_t tl = bits(c[3], 0, 14), tr = bits(c[3], 16, 14);
+  uint32_t tt = bits(c[3], 32, 14), tb = bits(c[3], 48, 14);
+  uint32_t ofmt = bits(c[4], 0, 7), okind = bits(c[4], 11, 4);
+  uint32_t ow = bits(c[4], 32, 14) + 1, oh = bits(c[4], 46, 14) + 1;
+  uint32_t bpp = vic_bpp(ofmt);
 
-      uint32_t dw = (sfc[1] & 0x3FFF), dh = ((sfc[1] >> 14) & 0x3FFF);
-      bool fb_fb = false;
-      if (dw < 16 || dh < 16 || dw > 2048 || dh > 2048) {
-        dw = state->fb_width;
-        dh = state->fb_height;
-        fb_fb = true;
-        if (dw < 16)
-          dw = 720;
-        if (dh < 16)
-          dh = 1280;
-      }
+  static uint64_t logged = ~0ull;
+  auto log_once = [&](const char *what) {
+    uint64_t key = vic.target ^ ((uint64_t)ofmt << 40) ^ ((uint64_t)okind << 48);
+    if (logged != key) {
+      logged = key;
+      printf("[vic] compose skipped: %s\n", what);
+    }
+  };
+  if (!bpp || okind != 0)
+    return log_once("output surface not pitch or format not modelled");
 
-      printf("[vic] Compose: 0x%llX -> 0x%llX (%dx%d) %s\n",
-             (unsigned long long)vic_src_addr, (unsigned long long)vic_dst_addr,
-             dw, dh, fb_fb ? "(FALLBACK)" : "");
+  uint32_t out_pitch = (transpose ? oh : ow) * bpp;
+  uint64_t out_len = (uint64_t)out_pitch * (transpose ? ow : oh);
+  uint8_t *dst = vic_dram(state, vic.target, out_len);
+  if (!dst)
+    return log_once("target outside DRAM");
+  if (tr >= ow)
+    tr = ow - 1;
+  if (tb >= oh)
+    tb = oh - 1;
 
-      // Hekate configures VIC with SlotBlkKind=PITCH, OutBlkKind=PITCH.
-      // This is a straight pitch-to-pitch copy (possibly with rotation/flip
-      // handled by the real VIC FCE microcode, but we just copy here).
-      size_t sz = (size_t)dw * dh * 4;
-      if (sz > 32 * 1024 * 1024)
-        return;
-      std::vector<uint8_t> buf(sz);
-      if (uc_mem_read(state->uc, vic_src_addr, buf.data(), sz) == UC_ERR_OK) {
-        uc_mem_write(state->uc, vic_dst_addr, buf.data(), sz);
-
-
-        state->display_dirty = true;
+  for (int n = 0; n < 8; n++) {
+    const uint64_t *sl = &c[(0x90 + n * 0xB0) / 8];
+    if (!(sl[0] & 1) || !vic.sfc[n])
+      continue;
+    uint32_t sfmt = bits(sl[8], 0, 7), skind = bits(sl[8], 11, 4);
+    uint32_t sw = bits(sl[8], 32, 14) + 1, sh = bits(sl[8], 46, 14) + 1;
+    if (skind != 0 || vic_bpp(sfmt) != bpp) {
+      log_once("slot surface not pitch or not the output's size of pixel");
+      continue;
+    }
+    const uint8_t *src = vic_dram(state, vic.sfc[n], (uint64_t)sw * sh * bpp);
+    if (!src)
+      continue;
+    uint32_t sl_l = bits(sl[4], 16, 14), sl_r = bits(sl[4], 48, 14);
+    uint32_t sl_t = bits(sl[5], 16, 14), sl_b = bits(sl[5], 48, 14);
+    uint32_t dl = bits(sl[6], 0, 14), dr = bits(sl[6], 16, 14);
+    uint32_t dt = bits(sl[6], 32, 14), db = bits(sl[6], 48, 14);
+    if (sl_r < sl_l || sl_b < sl_t || dr < dl || db < dt)
+      continue;
+    uint32_t x0 = std::max(dl, tl), x1 = std::min(dr, tr);
+    uint32_t y0 = std::max(dt, tt), y1 = std::min(db, tb);
+    if (x0 > x1 || y0 > y1)
+      continue;
+    // Nearest-neighbour scaling from the source rect onto the dest rect;
+    // the column map is worked out once per compose, not per pixel.
+    static std::vector<uint32_t> sxs;
+    sxs.resize(x1 - x0 + 1);
+    for (uint32_t tx = x0; tx <= x1; tx++)
+      sxs[tx - x0] = sl_l + (uint32_t)((uint64_t)(tx - dl) *
+                                       (sl_r - sl_l + 1) / (dr - dl + 1));
+    uint32_t src_pitch = sw * bpp;
+    for (uint32_t ty = y0; ty <= y1; ty++) {
+      uint32_t sy = sl_t + (uint32_t)((uint64_t)(ty - dt) * (sl_b - sl_t + 1) /
+                                      (db - dt + 1));
+      if (sy >= sh)
+        continue;
+      const uint8_t *srow = src + (uint64_t)sy * src_pitch;
+      uint32_t fy = flip_y ? oh - 1 - ty : ty;
+      for (uint32_t tx = x0; tx <= x1; tx++) {
+        uint32_t sx = sxs[tx - x0];
+        if (sx >= sw)
+          continue;
+        uint32_t fx = flip_x ? ow - 1 - tx : tx;
+        uint64_t o = transpose ? (uint64_t)fx * out_pitch + (uint64_t)fy * bpp
+                               : (uint64_t)fy * out_pitch + (uint64_t)fx * bpp;
+        if (bpp == 4)
+          memcpy(dst + o, srow + (uint64_t)sx * 4, 4);
+        else
+          memcpy(dst + o, srow + (uint64_t)sx * bpp, bpp);
       }
     }
   }
-  printf("[vic] W: 0x%08X = 0x%08X\n", offset, val);
+
+  uint32_t xf = (flip_x ? dcwin::XF_FLIP_X : 0) |
+                (flip_y ? dcwin::XF_FLIP_Y : 0) |
+                (transpose ? dcwin::XF_TRANSPOSE : 0);
+  if (state->vic_out_addr != vic.target || state->vic_out_xform != xf)
+    printf("[vic] compose: %ux%u -> 0x%08llX%s%s%s\n", ow, oh,
+           (unsigned long long)vic.target, flip_x ? ", flip X" : "",
+           flip_y ? ", flip Y" : "", transpose ? ", transpose" : "");
+  state->vic_out_addr = vic.target;
+  state->vic_out_xform = xf;
+  state->display_dirty = true;
+}
+
+static void vic_write(EmuState *state, uint64_t addr, uint32_t val) {
+  uint32_t offset = (uint32_t)(addr - VIC_BASE);
+  if (offset == kVicPramBase)
+    vic.cfg = (uint64_t)val << 8;
+  else if (offset >= kVicSfcBase0 && offset < kVicSfcBase0 + 8 * 4)
+    vic.sfc[(offset - kVicSfcBase0) / 4] = (uint64_t)val << 8;
+  else if (offset == kVicTarget)
+    vic.target = (uint64_t)val << 8;
+  else if (offset == kVicCompose && (val & 1))
+    vic_compose(state);
 }
 
 // ==================== APE audio hub: I2S, ADMAIF, ADMA ====================
@@ -4516,6 +4622,7 @@ void mmio_init(uc_engine *uc, EmuState *state) {
   ccplex_reset(state);
   sdhci_reset_regs(sdhci_regs[0]);
   sdhci_reset_regs(sdhci_regs[1]);
+  dc_reset(state);
 
   uc_hook_add(uc, &h_unmapped,
               UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED,
@@ -4585,8 +4692,7 @@ void mmio_soft_reset(EmuState *state, bool power_cycle) {
   g_dsi_pending_dcs_cmd = 0;
   memset(g_dsi_rx_fifo, 0, sizeof(g_dsi_rx_fifo));
   g_dsi_rx_count = g_dsi_rx_pos = 0;
-  vic_src_addr = vic_dst_addr = vic_config_addr = 0;
-  vic_config_size = vic_last_falcon_addr = 0;
+  vic = VicRegs();
   for (auto &d : actmon_dev)
     d = ActmonDev();
   actmon_glb_period = 0;
@@ -4616,23 +4722,8 @@ void mmio_soft_reset(EmuState *state, bool power_cycle) {
   else
     emmc_ext_csd_card_reset();
 
-  // Display controller back to its defaults (emu_state.h).
-  state->pre_addr = 0;
-  state->fb_width = state->pre_w = 720;
-  state->fb_height = state->pre_h = 1280;
-  state->fb_stride = state->pre_stride = 2880;
-  state->fb_swizzle = state->pre_sw = 0;
-  state->fb_rotation = state->pre_rot = 0;
-  state->pre_bh = 0;
-  state->fb_sw_gobs = 80;
-  state->fb_bh = 0;
-  state->dc_window_sel = 0x10;
-  state->winA_addr = 0;
-  state->winA_w = 720;
-  state->winA_h = 1280;
-  state->winA_stride = 2880;
-  state->winA_sw = state->winA_rot = state->winA_bh = 0;
-
+  // Display controller and VIC back to their defaults.
+  dc_reset(state);
 
   state->bpmp_halted = false;
 }
