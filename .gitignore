@@ -3,6 +3,7 @@ rcm_emu
 rcm_emu.exe
 *.o
 *.d
+*.elf
 
 # Runtime captures
 last_fb.rgba
@@ -26,5 +27,6 @@ last_audio*.wav
 __pycache__/
 *.pyc
 backup/
+build-hwtest/
 imgui.ini
 rcm_emu.ini

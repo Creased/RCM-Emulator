@@ -59,7 +59,7 @@ WIN_CXXFLAGS = -Wall -g -O2 -std=c++17 -MMD -MP -I. -I$(IMGUI_DIR)              
 WIN_LIBS = -lmingw32 -lSDL2main -lSDL2 -lunicorn -lpthread            -lwinmm -limm32 -lole32 -loleaut32 -lversion -lsetupapi -lcfgmgr32            -lcomdlg32 -lgdi32 -lrpcrt4 -lws2_32 -luuid -lshell32 -ladvapi32 -luser32
 WIN_LDFLAGS = -static -static-libgcc -static-libstdc++
 
-.PHONY: all clean windows
+.PHONY: all clean windows test
 
 all: $(OUTPUT)
 
@@ -84,5 +84,24 @@ $(OUTPUT): $(OBJS)
 # (or after `make clean`) since the files don't exist yet.
 -include $(OBJS:.o=.d)
 
+# ---- Regression tests --------------------------------------------------------
+#
+# `make test` boots the emulator headless on small self-contained payloads and
+# checks what they report. Needs arm-none-eabi-gcc for the BPMP side (the
+# AArch64 side of the CCPLEX test is pre-assembled words in the source).
+TEST_CC      = arm-none-eabi-gcc
+TEST_OBJCOPY = arm-none-eabi-objcopy
+TEST_CFLAGS  = -marm -march=armv4t -O2 -ffreestanding -nostdlib -fno-builtin \
+               -Wall -Wextra
+
+tests/ccplex/payload.bin: tests/ccplex/payload.c tests/ccplex/link.ld
+	$(TEST_CC) $(TEST_CFLAGS) -T tests/ccplex/link.ld -o tests/ccplex/payload.elf $<
+	$(TEST_OBJCOPY) -O binary tests/ccplex/payload.elf $@
+
+test: $(OUTPUT) tests/ccplex/payload.bin
+	sh tests/ccplex/run.sh ./$(OUTPUT) tests/ccplex/payload.bin
+
 clean:
-	rm -f $(OUTPUT) $(OBJS) $(OBJS:.o=.d) \n	      $(WIN_OUT) $(WIN_OBJS) $(WIN_OBJS:.o=.d)
+	rm -f $(OUTPUT) $(OBJS) $(OBJS:.o=.d) \
+	      tests/ccplex/payload.elf tests/ccplex/payload.bin tests/ccplex/out.log \
+	      $(WIN_OUT) $(WIN_OBJS) $(WIN_OBJS:.o=.d)

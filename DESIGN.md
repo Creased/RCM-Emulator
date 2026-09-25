@@ -10,12 +10,15 @@ them. Read [README.md](README.md) first for usage.
 flowchart TB
     main["<b>main.cpp</b><br/>arg parsing, payload load, CLI<br/>emulation loop, auto-script state"]
 
-    main -->|uc_emu_start| uc["<b>Unicorn Engine</b><br/>ARM32, T210<br/>IRAM / DRAM / MMIO"]
+    main -->|bpmp_run| uc["<b>Unicorn Engine</b><br/>ARM32 BPMP<br/>IRAM / DRAM / MMIO"]
+    main -->|ccplex_run| a57["<b>t210/ccplex</b><br/>2nd Unicorn engine, AArch64<br/>CCPLEX CPU0 (Cortex-A57)"]
+    a57 -->|MMIO callbacks| mmio
+    a57 -.->|shares| uc
     main -->|sdl_display_*| sdl["<b>display/sdl_display</b><br/>block-linear de-swizzle<br/>rotate, blit"]
     main -->|config_window_*| cfg["<b>display/config_window</b><br/>2nd SDL window + ImGui<br/>live hardware tweaks"]
     main -->|console_window_*| con["<b>display/console_window</b><br/>3rd SDL window + ImGui<br/>per-port UART TX log + RX inject"]
 
-    uc -->|MMIO trap| mmio["<b>t210/mmio.cpp</b><br/>central read/write dispatch<br/>by address range"]
+    uc -->|MMIO callbacks| mmio["<b>t210/mmio.cpp</b><br/>mmio_bus_read / mmio_bus_write<br/>shared by both masters"]
 
     mmio --> sdmmc["<b>sdmmc</b><br/>SDMMC1 / SDMMC4<br/>CMD0..18, EXT_CSD, ADMA2"]
     mmio --> se["<b>se_engine</b><br/>AES-128, SHA-256<br/>BIS keyslot override"]
@@ -23,6 +26,7 @@ flowchart TB
     mmio --> i2c1["<b>I2C_1 slaves</b> (inline)<br/>MAX17050, TMP451,<br/>BQ24193, BM92T36"]
     mmio --> i2c5["<b>I2C_5 slaves</b> (inline)<br/>MAX77620, MAX77621"]
     mmio --> stubs["<b>inline stubs</b><br/>GPIO, PMC, TSEC, KFUSE,<br/>PWM, DC, CLK, TMR, FUSE, UART"]
+    mmio --> pcie["<b>pcie</b><br/>AFI, root ports, CYW4356<br/>(CPU-complex master only)"]
 
     cfg -.->|writes atomics| state["<b>EmuState</b><br/>(emu_state.h)"]
     con -.->|RX inject / TX log| state
@@ -34,6 +38,11 @@ flowchart TB
 touchscreen atomics, framebuffer parameters from the display controller, file
 descriptors for SD and eMMC images, and a deterministic `emu_usec` counter used
 for auto-script timing.
+
+Two processors can execute: the BPMP, which every RCM payload runs on, and -
+once a payload boots it - CPU0 of the CCPLEX. Each is its own Unicorn engine;
+both map the same host memory for IRAM, DRAM and TZRAM, and both reach the
+same peripheral models through one dispatch (see [CCPLEX CPU0](#ccplex-cpu0)).
 
 ## Boot flow (Hekate as the example)
 
@@ -65,10 +74,27 @@ Mapped explicitly in `setup_emulation()`:
 | `0x80000000 – 0x90000000`   | 256 MB  | DRAM low                            |
 | `0xC0000000 – 0xFFFFFFFF`   | 1 GB    | DRAM high (covers FB at 0xF5A00000) |
 | `0x00000000 – 0x01000000`   | 16 MB   | low scratch (some null derefs)      |
-| Various MMIO pages          | 4 KB ea | trapped via UC hooks                |
+| `0x7C010000 – 0x7C020000`   | 64 KB   | TZRAM (shared with CPU0)            |
+| Peripheral windows          | 4 KB ea | `uc_mmio_map` callbacks             |
 
-MMIO (Memory-Mapped I/O) ranges are added as plain mapped pages with read and
-write hooks. The actual register modelling lives in `t210/mmio.cpp`.
+MMIO (Memory-Mapped I/O) windows are `uc_mmio_map()` regions: Unicorn calls
+`mmio_cb_read` / `mmio_cb_write`, which forward to `mmio_bus_read` /
+`mmio_bus_write` in `t210/mmio.cpp`, where the register models live. The list
+of windows is `kRegions` in the same file; it is flattened to 4 KiB pages and
+mapped as contiguous runs, once per engine.
+
+They used to be plain RAM pages with `UC_HOOK_MEM_READ` / `UC_HOOK_MEM_WRITE`
+hooks, a read's result written into the page with `uc_mem_write` before the
+load completed. Unicorn sends every guest load and store through its slow path
+while any memory hook exists, so ordinary IRAM/DRAM traffic paid for MMIO's
+hooks, and each MMIO read cost a walk of Unicorn's region list on top. An
+unmapped access in the peripheral band now gets an MMIO page of its own on the
+fly (`hook_unmapped`), so the generic register cache still sees it.
+
+The "read back what was written" behaviour of simple registers (PINMUX, PWM,
+UART LCR, CLK_SOURCE_* ...) comes from `mmio_regs`, a `RegCache`
+(`t210/regcache.h`): flat 4 KiB pages with a presence bitmap and a last-page
+cache, replacing a `std::map` that was a measurable share of all MMIO time.
 
 ## Subsystems
 
@@ -252,8 +278,12 @@ Hekate and Nyx draw into a block-linear surface. One block-height row covers
 5. Blits to an SDL_Texture at the host window current size.
 
 The de-swizzle is the hottest path. It is inlined and operates on `u32`
-units. A blit cache keys on `(addr, w, h, stride, sw, rot, bh)` so identical
-frames don't re-touch the surface.
+units. The surface is read straight from the host memory behind emulated DRAM,
+and a frame whose bytes and layout `(addr, w, h, stride, sw, bh, rot)` match
+the previous one skips the de-swizzle and the texture upload entirely. No
+renderer uses `PRESENTVSYNC`: the CPU runs on the same thread, the loop
+already paces redraws to ~60 Hz, and a vsync'd present could stall the
+emulated CPU for a whole frame.
 
 ### UART
 
@@ -326,9 +356,9 @@ needed. The 64 KB TX log trim happens in-place during the write hook.
 - **TSEC.** `DMATRFCMD_IDLE` is reported set, and the keygen status word is
   hardcoded to `0xB0B0B0B0` (the success magic from AMS, the Atmosphère
   keygen). No firmware is actually executed.
-- **Timer and RTC.** Backed by `EmuState::emu_usec`, incremented per CPU
-  batch by a fixed amount so timing is deterministic across runs. The
-  auto-script feature relies on this.
+- **Timer and RTC.** Backed by `EmuState::emu_usec`, derived from retired
+  instructions (see [Determinism](#determinism-and-the-auto-script-flag)), so
+  timing is identical across runs. The auto-script feature relies on this.
 - **Probe-magic constants.** Several reads return fixed values, not because
   they are tweakable but because the chip-detection code expects exact
   cookies: `MAX17050.DevName=0x00AC`, `BQ24193.VendorPart=0x2F`, the BM92T36
@@ -338,9 +368,33 @@ needed. The 64 KB TX log trim happens in-place during the write hook.
 
 ## Determinism and the auto-script flag
 
-`emu_usec` advances by a constant per Unicorn batch, never by host wall-clock.
+`emu_usec` is derived from retired BPMP instructions, never from host
+wall-clock: `emu_usec = skipped_us + insn_count / 10`, where `skipped_us` is
+whatever a FLOW_CTLR timed halt (`bpmp_usleep` / `bpmp_msleep`) jumped over.
 That makes the entire run reproducible: a payload at PC X always sees timer
 value Y, regardless of how busy the host machine is.
+
+The count comes from a `UC_HOOK_BLOCK` callback in `t210/bpmp.cpp`, not from
+a callback on every instruction (which kept Unicorn off its fast path for all
+code). Each translated block's instructions are counted once from its bytes
+(Thumb: a halfword with top bits `0b11101`/`0b11110`/`0b11111` opens a 32-bit
+instruction, which includes the Thumb-1 BL pair), cached per block, and
+credited when the block has run. Totals match per-instruction counting
+exactly; inside a block an MMIO read sees the time at the block's start. A
+batch ends by stopping the engine from the block hook, which Unicorn honours
+*before* running that block, so no instruction is ever counted twice or lost.
+
+**TIMERUS poll pacing.** Ten instructions per microsecond is a deliberate
+dilation - real silicon retires a few hundred - and it is what makes busy-waits
+cheap. It is harmless for `while (now - start < us)`, but not for a wait that
+must *see* a value. bdk's `fan_get_speed()` is one: `int timer = get_tmr_us() +
+2000000; while ((timer - get_tmr_us()) > 0)` is unsigned arithmetic, i.e.
+`!= 0`, and compiles to `cmp; bne`. Its ~30-instruction body is 0.1 us on
+hardware and 3 us here, so the counter stepped past the deadline and the loop
+spun until TIMERUS wrapped. So while TIMERUS reads come at most 200
+instructions apart (under a microsecond at real speed), the clock advances at
+most 1 us between them. Only increments are capped, so time stays monotonic for
+every observer and a wait still ends at the emulated time it asked for.
 
 The `--auto-pin-recovery` and `--auto-te-script` flags exploit this. A real
 interactive run was captured by logging every keyboard up and down event with
@@ -362,6 +416,67 @@ while (te_idx < n && state.emu_usec >= te_events[te_idx].at_us) {
 Because `emu_usec` is deterministic, the same timestamps land at the same UI
 states across runs. Adding a new automated flow is "press the buttons once
 with `[input]` logging on, copy the timestamps".
+
+## CCPLEX CPU0
+
+`t210/ccplex.cpp` models CPU0 of the main CPU cluster, enough for a payload to
+hand work to it the way bdk's `ccplex_boot_cpu0()` does. hwtest-rcm's Wi-Fi
+probe is the driving case: PCIe answers a CPU-complex master only (TRM ch.16 /
+ch.19: MSELECT is CCPLEX hardware, the BPMP-Lite is an AHB master), so it
+copies an AArch64 stub to DRAM, boots CPU0 at it, and supervises through a
+mailbox while the stub trains the link and enumerates the CYW4356.
+
+**Release.** The model shadows the registers the boot sequence writes and
+starts the core when `RST_CPUG_CMPLX_CLR` clears the last of CPU0's reset bits
+(CPURESET0, DBGRESET0, CORERESET0, bit 30, NONCPURESET) - but only if the core
+could actually run:
+
+| Precondition | Where it comes from |
+| --- | --- |
+| CPU rail up | Erista: MAX77621 @ I2C5 0x1B VOUT_EN and its EN pin, MAX77620 GPIO5 driven high. Mariko: MAX77812 EN_CTRL.EN_M4 |
+| CRAIL, C0NC, CE0 ungated | PMC PWRGATE_STATUS bits 0, 15, 14 |
+| CPUG clock on, PLLX up if CCLK uses it | CLK_ENB_V bit 0, CCLK_BURST_POLICY, PLLX_BASE |
+| MSELECT clocked and out of reset | CLK_ENB_V bit 3, RST_DEV_V bit 3 |
+| RAM repair requested | FLOW_CTLR_RAM_REPAIR |
+| An AArch64 vector in IRAM/DRAM | SB_AA64_RESET_LOW bit 0 + address, SB_AA64_RESET_HIGH |
+
+A release that misses one prints `[ccplex] CPU0 released from reset but
+cannot run: <reason>` and the core stays dark, which is what silicon does,
+minus the explanation. Asserting a reset bit, gating a partition or dropping
+the rail stops a running core.
+
+**Entry at EL3.** A real A57 leaves reset at EL3, AArch64, MMU off. Unicorn
+builds its ARM64 core at EL1 and cannot be moved: a PSTATE write does not
+rebuild the translator's cached `hflags`, and Unicorn never delivers guest
+exceptions, so no SMC can carry it up either. ERET can: its helper takes the
+current EL from PSTATE and rebuilds `hflags` for the target. So each boot
+creates a fresh engine (no stale translations of a rewritten stub), writes
+PSTATE = SPSR_EL3 = EL3h with DAIF masked and ELR_EL3 = ELR_EL1 = the vector,
+and starts it on a one-instruction `eret` trampoline in a page at 1 TiB that
+only CPU0 maps.
+
+**Bus.** CPU0's engine maps IRAM, DRAM and TZRAM from the same host memory
+as the BPMP's and the same MMIO windows. `g_bus_master` says who is issuing an
+access; the PCIe model refuses the BPMP (`0xFFFFFFFF`, and one warning
+explaining why) and serves CPU0. MSELECT reads its TRM reset value
+`0x07FF4020`, AFI_PCIE_CONFIG `0x00103025`, and LNKSTA `0x3011` once the link
+is up - the values hwtest's healthy-console capture shows. An access CPU0
+makes to an address nothing decodes wedges it, as on silicon; the BPMP's
+watchdog on the mailbox heartbeat is what reports it.
+
+**Time.** CPU0 keeps its own clock: 1 ns per retired instruction (PLLX runs
+the A57 at ~1 GHz) plus 250 ns per bus access (MSELECT, the APC bridge, APB).
+While it runs, the main loop cuts the BPMP's batch into 250 us slices and runs
+CPU0 up to the BPMP's time after each - lockstep at a finer grain than the
+500 us the BPMP polls the mailbox at. During a CPU0 slice `emu_usec` is CPU0's
+clock, so every register model timestamps with the right core's time. WFE /
+WFI park the core to the end of the slice: the stub's final `for(;;) wfe;`
+would otherwise spin through a billion instructions per emulated second.
+
+`make test` runs `tests/ccplex/`, a self-contained payload that checks the
+refusal, the EL3 entry, the mailbox, WFE parking and the reset.
+`tests/hwtest/` builds hwtest-rcm with distro toolchains and runs its whole
+sweep; CI runs both.
 
 ## Bug history
 
@@ -398,13 +513,38 @@ don't repeat the diagnosis:
   `APBDEV_PMC_CNTRL.MAIN_RST`, then exit or flip
   `state->reboot_requested`.
 
+- **A hwtest sweep never finished.** It stalled in the fan spin-up test:
+  bdk's `fan_get_speed()` waits for TIMERUS to *equal* a deadline, and the
+  dilated clock stepped past it. Fix: TIMERUS poll pacing (see
+  [Determinism](#determinism-and-the-auto-script-flag)).
+- **Per-instruction hooks.** Three `UC_HOOK_CODE` callbacks (one registered
+  twice), one doing a `uc_mem_read` per instruction for a NOP-slide check
+  whose counter never reset, plus memory hooks forcing every load and store
+  onto Unicorn's slow path, and a display path that re-converted and
+  re-allocated every frame. Reaching hwtest's fan test took 2.7 s; it takes
+  0.8 s now, and the whole sweep about 3 s. Fix: block-level clock,
+  `uc_mmio_map` windows, a change-detecting display path.
+- **MAX77621 writes were dropped**, so after bdk's `hw_init()` disabled the
+  Erista CPU/GPU bucks a payload still read them as on. Fix: register files
+  for MAX77621 and MAX77812.
+- **Mariko's MAX77812 was unreachable through bdk.** bdk picks its address
+  from `FUSE_RESERVED_ODM28_B01` bit 0; left clear it talked to the NAK'd
+  PHASE31 address 0x31. Fix: a Mariko reads the bit set (retail PHASE211,
+  0x33).
+- **Windows image I/O ran in text mode.** MinGW's `open()` defaults to it,
+  so `_read()` rewrote CR LF and stopped at 0x1A inside SD/eMMC sectors, and
+  its 32-bit `st_size` could not size a 4 GiB rawnand chunk. Fix: `O_BINARY`
+  and `_fstati64` (`platform.h`).
+
 See `git log` for the commit-by-commit diagnosis trail if you want more
 detail on any of them.
 
 ## Adding a new peripheral
 
-1. Decide on an MMIO range and add a new `else if` branch in `mmio_read` or
-   `mmio_write` (or a dedicated module like `i2c3.cpp`).
+1. Decide on an MMIO range, make sure it is covered by `kRegions`, and add a
+   branch in `mmio_bus_read` / `mmio_bus_write` (or a dedicated module like
+   `i2c3.cpp`). Both processors reach it; check `g_bus_master` if the real
+   block answers only one of them.
 2. If the device participates in the boot fence (status registers polled by
    the BDK), make sure the read returns the "ready" or "done" state. Silent
    `0` returns are the most common cause of hangs.

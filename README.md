@@ -7,9 +7,10 @@ precompiled `.bin` (Hekate, Lockpick_RCM, TegraExplorer, custom payloads) and
 executes its ARM32 code on an emulated Tegra X1 (T210) environment, with a
 windowed framebuffer and keyboard input mapped to the Switch hardware buttons.
 
-It is **not** a console emulator. Only the BPMP (Boot and Power Management
-Processor) bootloader stage is modelled. You will not boot Horizon, run NSPs,
-or load games. The intended use is payload development and scripted
+It is **not** a console emulator. The BPMP (Boot and Power Management
+Processor) bootloader stage is what is modelled, plus CPU0 of the main CPU
+cluster for payloads that boot it to run bare-metal AArch64 code. You will not
+boot Horizon, run NSPs, or load games. The intended use is payload development and scripted
 verification, plus security research where iterating on real hardware would be
 slow or destructive.
 
@@ -21,6 +22,10 @@ slow or destructive.
   bypasses the parts of the chain that aren't fully modelled.
 - Run **TegraExplorer**, including `.te` script execution from an emulated SD
   card.
+- Run **hwtest-rcm**'s complete hardware sweep in a few seconds, including its
+  Wi-Fi probe, which boots **CPU0** (Cortex-A57, AArch64) to bring up PCIe and
+  enumerate the CYW4356 - PCIe answers a CPU-complex master only. See
+  [CCPLEX CPU0](#ccplex-cpu0).
 - Replay deterministic button sequences via `--auto-pin-recovery` or
   `--auto-te-script`, so a payload flow can be exercised from a CI run or a
   one-shot script.
@@ -141,6 +146,45 @@ Audio goes to WASAPI on Windows and ALSA/PulseAudio on Linux; SDL picks the
 backend, so nothing in the emulator cares which. `RCM_EMU_NO_AUDIO=1` skips
 playback entirely, which is what CI uses since a runner has no sound device.
 
+## CCPLEX CPU0
+
+A payload can boot the first Cortex-A57 exactly as bdk's `ccplex_boot_cpu0()`
+does - CPU rail, PLLX, CCLK, the CRAIL/C0NC/CE0 partitions, RAM repair, the
+AArch64 vector in `SB_AA64_RESET_LOW/HIGH`, then `RST_CPUG_CMPLX_CLR` - and the
+emulator runs it: AArch64, entered at EL3 with the MMU off at the vector,
+sharing IRAM, DRAM and every peripheral with the BPMP, in lockstep with it on
+the emulated clock. Output is prefixed `[ccplex]`:
+
+```
+[ccplex] CPU0 released: AArch64 EL3, MMU off, entry 0xA0000000 (boot #1)
+[pcie] root port 1: link UP, gen1 x1 (healthy WLAN)
+[uartB]   CPU0          : ran to completion (hb=613)
+[uartB]   AFI (CPU)     : cfg=00103025 witness=A5A50000 -> APERTURE LIVE
+[uartB]   RP1 link      : UP, DL active (LNKSTA=3011 gen1 x1)
+[uartB]   EP config     : 14E4:43EC Broadcom BCM/CYW4356 WLAN
+[uartB]   Result        : WLAN core enumerated on the PCIe bus
+[ccplex] CPU0 stopped (held in reset) after 19402985 instructions, 4846717 bus accesses
+```
+
+A release with something missing does not run the core - silicon would not -
+and says what was missing, e.g. `[ccplex] CPU0 released from reset but cannot
+run: CPU rail off (MAX77621 VOUT_EN / MAX77620 GPIO5 EN pin)`. PCIe and
+MSELECT answer CPU0 only; the BPMP reads all ones from them, as measured on
+real consoles. Details in [DESIGN.md](DESIGN.md#ccplex-cpu0).
+
+## Tests
+
+```bash
+make test                                   # CCPLEX regression payload (needs arm-none-eabi-gcc)
+tests/hwtest/build.sh build-hwtest          # build hwtest-rcm (+ gcc-aarch64-linux-gnu)
+tests/hwtest/run.sh ./rcm_emu build-hwtest/hwtest-rcm/build/hwtest.bin
+```
+
+The first boots CPU0 from a small self-contained payload and checks the
+refusal of an unpowered release, the EL3 entry, the mailbox, WFE parking and
+the reset. The second runs hwtest-rcm's whole hardware sweep headless and
+checks that the CPU0-driven Wi-Fi probe enumerates the endpoint. CI runs both.
+
 ## Live hardware tweaks
 
 Press `M` in the main window to open a second window that exposes the values
@@ -232,7 +276,7 @@ needed.
 | `--prod-keys`         | `prod.keys`   | Override BIS keys from a Lockpick-style key file.         |
 | `--oem`               | `erista` \| `mariko` | Switch SoC generation. Drives `APB_MISC_GP_HIDREV` so Hekate's `h_cfg.t210b01` matches and pkg1 identification skips the right OEM header. Default `erista`. |
 | `--bt-radio`          | `healthy` \| `faulty` \| `absent` | Broadcom CYW4356 behaviour on UART-D. `healthy` powers up on the `BT_REG_ON` edge, holds `BT_HOST_WAKE` high, asserts `RTS_N` and answers HCI; `faulty` reproduces the 2110-1118 console (module fitted, never leaves POR); `absent` additionally leaves `BT_UART_RXD` in a break condition. Overrides `[bluetooth] radio` in the ini. Default `healthy`. |
-| `--wifi-radio`        | `healthy` \| `faulty` \| `absent` | The WLAN half of the same CYW4356: a PCI Express endpoint on root port 1. `healthy` trains the link, enumerates as `14E4:43EC` and answers a ChipCommon ChipID read with `0x4356`; `faulty` still trains and enumerates but reads all ones on the backplane (live PCIe front-end, dead radio die); `absent` never leaves detect. The model also enforces the datasheet's power-up ordering, so a payload that releases PERST# too early gets a link that stays down and a `[pcie]` line naming the reason. Overrides `[wifi] radio` in the ini. Default `healthy`. |
+| `--wifi-radio`        | `healthy` \| `faulty` \| `absent` | The WLAN half of the same CYW4356: a PCI Express endpoint on root port 1, reachable only from CPU0 (the BPMP reads all ones, as on silicon). `healthy` trains the link, enumerates as `14E4:43EC` and answers a ChipCommon ChipID read with `0x4356`; `faulty` still trains and enumerates but reads all ones on the backplane (live PCIe front-end, dead radio die); `absent` never leaves detect. The model also enforces the datasheet's power-up ordering, so a payload that releases PERST# too early gets a link that stays down and a `[pcie]` line naming the reason. Overrides `[wifi] radio` in the ini. Default `healthy`. |
 | `--auto-pin-recovery` | (none)        | Drive the Lockpick PIN-recovery menu without user input.  |
 | `--auto-te-script`    | (none)        | Drive `recover_pin.te` in TegraExplorer without input.    |
 
@@ -244,9 +288,11 @@ flowchart LR
     root --> top["main.cpp<br/>emu_state.h<br/>Makefile<br/>Dockerfile<br/>README.md / DESIGN.md"]
     root --> t210["t210/<br/>(SoC peripheral models)"]
     root --> display["display/"]
+    root --> tests["tests/<br/>ccplex/, hwtest/"]
 
-    t210 --> mmio["mmio.{h,cpp}<br/>memory_map.h<br/>tegra_bl.h"]
-    t210 --> sdmmc["sdmmc.{h,cpp}<br/>SDMMC1 / SDMMC4"]
+    t210 --> mmio["mmio.{h,cpp}<br/>memory_map.h<br/>regcache.h, tegra_bl.h"]
+    t210 --> cpus["bpmp.{h,cpp} BPMP clock<br/>ccplex.{h,cpp} CPU0 (A57)"]
+    t210 --> pcie["pcie.{h,cpp}<br/>root complex + CYW4356"]
     t210 --> se["se_engine.{h,cpp}<br/>AES-128, SHA-256"]
     t210 --> i2c["i2c3.{h,cpp}<br/>STMFTS / FTS4 touch"]
 
@@ -257,8 +303,10 @@ For implementation details, see [DESIGN.md](DESIGN.md).
 
 ## Limitations
 
-- **BPMP only.** Horizon and Atmosphère need A57 core emulation. This only
-  models the ARM7 bootloader environment.
+- **BPMP plus one A57.** CPU0 runs bare-metal AArch64 handed to it by a
+  payload; there is no GIC, no generic timer, no secondary cores and no guest
+  exception delivery (a fault halts CPU0 and says so). Horizon and Atmosphère
+  are out of reach.
 - **Subset of MMIO (Memory-Mapped I/O).** Peripherals are modelled to the depth
   required by the payloads above. New payloads may exercise registers that fall
   through to the default catch-all and need handlers added.
@@ -267,8 +315,8 @@ For implementation details, see [DESIGN.md](DESIGN.md).
   `--prod-keys` is a pragmatic shortcut: when Lockpick writes a derived BIS
   (Boot Image Storage) key into a keyslot, the value from the user-supplied key
   file is substituted. RSA, RNG, and chunked SHA are stubs.
-- **Single-threaded.** The CPU runs in batches on the main thread between SDL
-  event polls. Tight host CPU loops will starve the display refresh.
+- **Single-threaded.** Both cores run in batches on the main thread between
+  SDL event polls. That is also what keeps them deterministic.
 
 ## Acknowledgements
 
