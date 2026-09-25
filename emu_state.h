@@ -105,6 +105,8 @@ constexpr uint32_t LINE_STRIDE  = 0x00A; // DC_WIN_LINE_STRIDE (bytes)
 constexpr uint32_t BLEND_LAYER  = 0x016; // DC_WINBUF_BLEND_LAYER_CONTROL
 constexpr uint32_t BLEND_MATCH  = 0x017; // DC_WINBUF_BLEND_MATCH_SELECT
 constexpr uint32_t START_ADDR   = 0x100; // DC_WINBUF_START_ADDR
+constexpr uint32_t ADDR_H_OFF   = 0x106; // DC_WINBUF_ADDR_H_OFFSET (bytes)
+constexpr uint32_t ADDR_V_OFF   = 0x108; // DC_WINBUF_ADDR_V_OFFSET (lines)
 constexpr uint32_t SURFACE_KIND = 0x10B; // DC_WINBUF_SURFACE_KIND
 
 // WIN_OPTIONS bits.

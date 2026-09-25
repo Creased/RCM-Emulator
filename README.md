@@ -175,7 +175,7 @@ real consoles. Details in [DESIGN.md](DESIGN.md#ccplex-cpu0).
 ## Tests
 
 ```bash
-make test                                   # CCPLEX regression payload (needs arm-none-eabi-gcc)
+make test                                   # CCPLEX + display regression payloads (arm-none-eabi-gcc, python3)
 tests/hwtest/build.sh build-hwtest          # build hwtest-rcm (+ gcc-aarch64-linux-gnu)
 tests/hwtest/run.sh ./rcm_emu build-hwtest/hwtest-rcm/build/hwtest.bin
 ```

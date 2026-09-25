@@ -2,6 +2,7 @@
 #include "config_window.h"
 #include "console_window.h"
 #include "../emu_state.h"
+#include "../t210/block_linear.h"
 #include "../t210/memory_map.h"
 
 #include <SDL2/SDL.h>
@@ -162,7 +163,9 @@ struct Win {
   int idx = 0;
   uint64_t addr = 0;
   uint32_t depth = 0, bpp = 4, kind = 0, gob_h = 1, stride = 0, gobs = 0;
-  uint32_t src_w = 0, src_h = 0; // the surface, before the DC turns it
+  uint32_t src_w = 0, src_h = 0; // the fetch, before the DC turns it
+  uint32_t x0 = 0, y0 = 0;       // first pixel fetched (ADDR_H/V_OFFSET)
+  uint32_t cols = 0, rows = 0;   // surface extent from START_ADDR
   uint32_t pre_w = 0, pre_h = 0; // PRESCALED_SIZE, in pixels (post-turn)
   uint32_t out_w = 0, out_h = 0; // SIZE
   int32_t x = 0, y = 0;
@@ -179,14 +182,8 @@ inline size_t fetch_off(const Win &w, uint32_t sx, uint32_t sy) {
   case 1: // 16x16-byte tiles, row-major
     return (size_t)(sy / 16) * w.stride * 16 + (xb / 16) * 256 +
            (sy % 16) * 16 + (xb % 16);
-  case 2: { // block linear, TRM 20.1.2 (Figure 47 sector order)
-    uint32_t gob_y = sy / 8;
-    size_t gob = ((size_t)(gob_y / w.gob_h) * w.gobs + xb / 64) * w.gob_h +
-                 gob_y % w.gob_h;
-    uint32_t x = xb % 64, y = sy % 8;
-    return gob * 512 + (x / 32) * 256 + (y / 2) * 64 + ((x % 32) / 16) * 32 +
-           (y % 2) * 16 + (x % 16);
-  }
+  case 2: // block linear
+    return bl_offset(xb, sy, w.gobs, w.gob_h);
   default:
     return (size_t)sy * w.stride + xb;
   }
@@ -236,17 +233,26 @@ bool load_window(EmuState *state, uc_engine *uc, int idx, const uint32_t *r,
   if (!w.stride)
     w.stride = w.src_w * w.bpp;
   w.addr = (uint64_t)r[dcwin::START_ADDR] + (int64_t)state->manual_offset;
+  // The fetch starts at START_ADDR + ADDR_V_OFFSET * LINE_STRIDE +
+  // ADDR_H_OFFSET (TRM 24.11.1): the window's top-left pixel, or top-right
+  // with H_DIRECTION, bottom-left with V_DIRECTION - in surface terms,
+  // before SCAN_COLUMN turns it - and walks away from it.
+  uint64_t start = (uint64_t)r[dcwin::ADDR_V_OFF] * w.stride +
+                   r[dcwin::ADDR_H_OFF];
+  w.y0 = (uint32_t)std::min<uint64_t>(start / w.stride, 0xFFFF);
+  w.x0 = (uint32_t)(start % w.stride) / w.bpp;
+  w.cols = w.stride / w.bpp;
+  w.rows = (w.xf & dcwin::XF_FLIP_Y) ? w.y0 + 1 : w.y0 + w.src_h;
   switch (w.kind) {
   case 2:
     w.gobs = (w.stride + 63) / 64;
-    w.len = (size_t)w.gobs * 512 * w.gob_h *
-            ((w.src_h + 8 * w.gob_h - 1) / (8 * w.gob_h));
+    w.len = bl_size(w.gobs, w.gob_h, w.rows);
     break;
   case 1:
-    w.len = (size_t)w.stride * ((w.src_h + 15) / 16) * 16;
+    w.len = (size_t)w.stride * ((w.rows + 15) / 16) * 16;
     break;
   default:
-    w.len = (size_t)w.stride * w.src_h;
+    w.len = (size_t)w.stride * w.rows;
     break;
   }
   if (w.len == 0 || w.len > 64u * 1024 * 1024)
@@ -308,9 +314,11 @@ void draw_window(const Win &w, std::vector<uint32_t> &panel) {
       uint32_t tx = txs[ox];
       // (tx, ty) is post-turn; walk it back to the surface.
       uint32_t a = column ? ty : tx, b = column ? tx : ty;
-      uint32_t sx = hflip ? w.src_w - 1 - a : a;
-      uint32_t sy = vflip ? w.src_h - 1 - b : b;
-      size_t off = fetch_off(w, sx, sy);
+      int64_t sx = hflip ? (int64_t)w.x0 - a : (int64_t)w.x0 + a;
+      int64_t sy = vflip ? (int64_t)w.y0 - b : (int64_t)w.y0 + b;
+      if (sx < 0 || sy < 0 || sx >= w.cols || sy >= w.rows)
+        continue; // before START_ADDR or past the surface
+      size_t off = fetch_off(w, (uint32_t)sx, (uint32_t)sy);
       if (off + w.bpp > w.len)
         continue;
       uint32_t s = depth_argb(w.mem + off, w.depth);
@@ -356,7 +364,10 @@ void sdl_display_update(EmuState *state, uc_engine *uc) {
     if (load_window(state, uc, i, r, g_swizzle_override, w))
       wins.push_back(std::move(w));
   }
-  // Deeper layers first; equal depths stack A (bottom) to D (top).
+  // The TRM sorts windows by depth into the blend stages (24.3.12) without
+  // saying which way; lower depth nearer the top, as Linux programs later
+  // Tegras (depth = 255 - zpos). Equal depths stack A (bottom) to D (top),
+  // which puts hekate's log window D over A, as its blending expects.
   std::stable_sort(wins.begin(), wins.end(), [](const Win &l, const Win &r) {
     return l.layer > r.layer;
   });
@@ -410,7 +421,7 @@ void sdl_display_update(EmuState *state, uc_engine *uc) {
                  {(uint64_t)w.idx, w.addr, w.len, w.depth, w.kind, w.gob_h,
                   w.stride, (uint64_t)w.pre_w << 32 | w.pre_h,
                   (uint64_t)w.out_w << 32 | w.out_h, w.xf, w.blend_layer,
-                  w.blend_match});
+                  w.blend_match, (uint64_t)w.x0 << 32 | w.y0});
     where.push_back((uint64_t)(uint32_t)w.x << 32 | (uint32_t)w.y);
   }
   static std::vector<uint64_t> last_shape, last_where;

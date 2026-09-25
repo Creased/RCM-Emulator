@@ -45,11 +45,13 @@ jobs:
           grep -q "RCM Payload Emulator" out.txt \
             || { echo "banner missing - binary did not start"; exit 1; }
 
-      - name: CCPLEX regression test
-        # A small self-contained payload boots CPU0 through bdk's
+      - name: CCPLEX and display regression tests
+        # Small self-contained payloads. One boots CPU0 through bdk's
         # ccplex_boot_cpu0() register sequence: an unpowered release must be
         # refused, a powered one must run an AArch64 blob at EL3, and WFE must
-        # park the core.
+        # park the core. The others drive the display controller and VIC in
+        # six scenarios, and the frame the emulator shows must match the
+        # picture drawn, pixel for pixel.
         run: make test
 
       - name: hwtest end to end

@@ -385,18 +385,25 @@ reports a frame end and a vblank, which bdk polls before DSI commands.
 Each display tick builds the picture the panel would receive, 720x1280 and
 portrait, the way the DC builds it:
 
-1. Every enabled window's surface is fetched at `START_ADDR`. The layout
+1. Every enabled window's surface is fetched from `START_ADDR`. The layout
    comes from `SURFACE_KIND`: pitch, 16x16 tiled, or block linear with
    2^`BLOCK_HEIGHT` GOBs (Groups of Bytes, 64x8-byte tiles) per block. The
    line pitch is `LINE_STRIDE`, and pixels are decoded per `COLOR_DEPTH`.
-   Block-linear byte order follows TRM 20.1.2 and Figure 47.
-2. `WIN_OPTIONS` turns the surface: H_DIRECTION and V_DIRECTION mirror it,
-   and SCAN_COLUMN walks its columns (90/270 degrees, TRM Table 122). The
-   result is scaled from `PRESCALED_SIZE` to `SIZE`, nearest-neighbour, and
-   placed at `POSITION`.
-3. The windows are stacked by layer depth (A under D when equal) and blended
-   per `BLEND_LAYER_CONTROL` and `BLEND_MATCH_SELECT`. Hekate's log console
-   (window D, K1 = 200) shows through as it does on the console.
+   Block-linear byte order follows TRM 20.1.2 and Figure 47
+   (`t210/block_linear.h`, shared with VIC).
+2. The fetch starts at `ADDR_V_OFFSET * LINE_STRIDE + ADDR_H_OFFSET` (TRM
+   24.11.1): the window's top-left pixel, top-right with H_DIRECTION,
+   bottom-left with V_DIRECTION, in surface terms. It walks away from there
+   per the direction bits, and SCAN_COLUMN walks columns instead of rows
+   (90/270 degrees, TRM Table 122). Pixels before `START_ADDR` or past the
+   surface are black. The result is scaled from `PRESCALED_SIZE` to `SIZE`,
+   nearest-neighbour, and placed at `POSITION`.
+3. The windows are stacked by layer depth and blended per
+   `BLEND_LAYER_CONTROL` and `BLEND_MATCH_SELECT`. The TRM sorts windows by
+   depth into its blend stages without saying which way; lower depth is
+   nearer the top here, as Linux programs later Tegras, and equal depths
+   stack A under D. Hekate's log console (window D, K1 = 200) shows
+   through as it does on the console.
 
 The panel picture is then turned for the host window. When the surface on
 show was turned on its way to the panel, by the DC (SCAN_COLUMN) or by a
@@ -420,13 +427,14 @@ bdk drives VIC through the Falcon private-register window. The model keeps
 the config struct's address (`VIC_SC_PRAMBASE`), the slots' source surfaces
 (`VIC_SC_SFC0_BASE_LUMA(n)`) and the target (`VIC_BL_TARGET_BASADR`). On
 `VIC_FC_COMPOSE` it reads bdk's `vic_config_t` from guest memory and draws
-every enabled pitch slot into the target, scaling the source rect onto the
+every enabled slot into the target, scaling the source rect onto the
 dest rect, clipped to the target rect, with the output flip X, flip Y and
 transpose applied. The output size is given before the transpose, so a
 transposed target is H x W pixels, which is how the DC then reads it. The
 compose also records the target address and the turn applied, which the
 display uses to undo it. Nyx's 270-degree rotation is flip X then transpose.
-Block-linear VIC surfaces are not modelled, and nothing in bdk uses them.
+Slot and output surfaces are pitch or block linear (BlkKind 1, with
+2^BlkHeight GOBs per block).
 
 ### UART
 
@@ -650,9 +658,14 @@ final `for(;;) wfe;` would otherwise spin through a billion instructions per
 emulated second.
 
 `make test` runs `tests/ccplex/`, a self-contained payload that checks the
-refusal, the EL3 entry, the mailbox, WFE parking and the reset.
-`tests/hwtest/` builds hwtest-rcm with distro toolchains and runs its whole
-sweep; CI runs both.
+refusal, the EL3 entry, the mailbox, WFE parking and the reset, and
+`tests/display/`, one payload built per scenario that drives the display
+controller and VIC the way bdk does (a pitch window; Nyx's VIC turn into
+pitch and into block-linear surfaces; a block-linear VIC source; the DC's
+own column scan with an address offset; a mirrored window with window D
+blended over it). `check.py` compares every pixel of the frame the emulator
+shows with the picture the payload drew. `tests/hwtest/` builds hwtest-rcm
+with distro toolchains and runs its whole sweep; CI runs all three.
 
 ## Bug history
 

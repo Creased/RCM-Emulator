@@ -98,10 +98,19 @@ tests/ccplex/payload.bin: tests/ccplex/payload.c tests/ccplex/link.ld
 	$(TEST_CC) $(TEST_CFLAGS) -T tests/ccplex/link.ld -o tests/ccplex/payload.elf $<
 	$(TEST_OBJCOPY) -O binary tests/ccplex/payload.elf $@
 
-test: $(OUTPUT) tests/ccplex/payload.bin
+DISPLAY_SCENARIOS = 1 2 3 4 5 6
+DISPLAY_PAYLOADS  = $(DISPLAY_SCENARIOS:%=tests/display/payload_%.bin)
+
+tests/display/payload_%.bin: tests/display/payload.c tests/display/link.ld
+	$(TEST_CC) $(TEST_CFLAGS) -DSCENARIO=$* -T tests/display/link.ld -o tests/display/payload_$*.elf $<
+	$(TEST_OBJCOPY) -O binary tests/display/payload_$*.elf $@
+
+test: $(OUTPUT) tests/ccplex/payload.bin $(DISPLAY_PAYLOADS)
 	sh tests/ccplex/run.sh ./$(OUTPUT) tests/ccplex/payload.bin
+	sh tests/display/run.sh ./$(OUTPUT) tests/display
 
 clean:
 	rm -f $(OUTPUT) $(OBJS) $(OBJS:.o=.d) \
 	      tests/ccplex/payload.elf tests/ccplex/payload.bin tests/ccplex/out.log \
+	      tests/display/payload_*.elf tests/display/payload_*.bin \
 	      $(WIN_OUT) $(WIN_OBJS) $(WIN_OBJS:.o=.d)

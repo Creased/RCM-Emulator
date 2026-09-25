@@ -1,4 +1,5 @@
 #include "mmio.h"
+#include "block_linear.h"
 #include "trace.h"
 #include "../emu_state.h"
 #include "../platform.h"
@@ -3737,8 +3738,9 @@ static void se_write(EmuState *state, uint64_t addr, uint32_t val) {
 // for registers that need them; none of the ones modelled here do. The model
 // keeps what a compose needs - the config struct's address (PRAMBASE), the
 // slots' source surfaces and the target surface - and, on COMPOSE_START,
-// reads the config struct from guest memory and draws the enabled pitch
-// slots into the target with the output flip/transpose. That is what Nyx
+// reads the config struct from guest memory and draws the enabled slots
+// into the target with the output flip/transpose. Surfaces are pitch or
+// block linear (BlkKind 1, BlkHeight = log2 GOBs per block). That is what Nyx
 // relies on: its 1280x720 GUI is turned into the panel's 720x1280 portrait
 // framebuffer by a 270-degree VIC rotation (flip X, then transpose).
 //
@@ -3746,7 +3748,8 @@ static void se_write(EmuState *state, uint64_t addr, uint32_t val) {
 // bitfields):
 //   0x10 OutputConfig         u64 0: FlipX b48, FlipY b49, Transpose b50
 //                             u64 1: TargetRect L b0, R b16, T b32, B b48
-//   0x20 OutputSurfaceConfig  u64 0: format b0, BlkKind b11, W-1 b32, H-1 b46
+//   0x20 OutputSurfaceConfig  u64 0: format b0, BlkKind b11, BlkHeight b15,
+//                                    W-1 b32, H-1 b46
 //   0x90 + n * 0xB0  slot n:  u64 0: SlotEnable b0
 //                             u64 4/5: SourceRect L|R, T|B (16.16, b0/b32)
 //                             u64 6: DestRect L b0, R b16, T b32, B b48
@@ -3804,6 +3807,7 @@ static void vic_compose(EmuState *state) {
   uint32_t tl = bits(c[3], 0, 14), tr = bits(c[3], 16, 14);
   uint32_t tt = bits(c[3], 32, 14), tb = bits(c[3], 48, 14);
   uint32_t ofmt = bits(c[4], 0, 7), okind = bits(c[4], 11, 4);
+  uint32_t ogob = 1u << std::min(bits(c[4], 15, 4), 5u);
   uint32_t ow = bits(c[4], 32, 14) + 1, oh = bits(c[4], 46, 14) + 1;
   uint32_t bpp = vic_bpp(ofmt);
 
@@ -3815,11 +3819,16 @@ static void vic_compose(EmuState *state) {
       printf("[vic] compose skipped: %s\n", what);
     }
   };
-  if (!bpp || okind != 0)
-    return log_once("output surface not pitch or format not modelled");
+  // BlkKind 0 is pitch, 1 the Tegra 16Bx2 block-linear layout; BlkHeight is
+  // log2 of the block height in GOBs.
+  if (!bpp || okind > 1)
+    return log_once("output surface format or layout not modelled");
 
-  uint32_t out_pitch = (transpose ? oh : ow) * bpp;
-  uint64_t out_len = (uint64_t)out_pitch * (transpose ? ow : oh);
+  // The output as laid out in memory: a transposed target is oh x ow.
+  uint32_t out_w = transpose ? oh : ow, out_h = transpose ? ow : oh;
+  uint32_t out_pitch = out_w * bpp, out_gobs = (out_pitch + 63) / 64;
+  uint64_t out_len = okind ? bl_size(out_gobs, ogob, out_h)
+                           : (uint64_t)out_pitch * out_h;
   uint8_t *dst = vic_dram(state, vic.target, out_len);
   if (!dst)
     return log_once("target outside DRAM");
@@ -3833,12 +3842,17 @@ static void vic_compose(EmuState *state) {
     if (!(sl[0] & 1) || !vic.sfc[n])
       continue;
     uint32_t sfmt = bits(sl[8], 0, 7), skind = bits(sl[8], 11, 4);
+    uint32_t sgob = 1u << std::min(bits(sl[8], 15, 4), 5u);
     uint32_t sw = bits(sl[8], 32, 14) + 1, sh = bits(sl[8], 46, 14) + 1;
-    if (skind != 0 || vic_bpp(sfmt) != bpp) {
-      log_once("slot surface not pitch or not the output's size of pixel");
+    if (skind > 1 || vic_bpp(sfmt) != bpp) {
+      log_once("slot surface layout not modelled, or not the output's size "
+               "of pixel");
       continue;
     }
-    const uint8_t *src = vic_dram(state, vic.sfc[n], (uint64_t)sw * sh * bpp);
+    uint32_t src_pitch = sw * bpp, src_gobs = (src_pitch + 63) / 64;
+    const uint8_t *src = vic_dram(state, vic.sfc[n],
+                                  skind ? bl_size(src_gobs, sgob, sh)
+                                        : (uint64_t)src_pitch * sh);
     if (!src)
       continue;
     uint32_t sl_l = bits(sl[4], 16, 14), sl_r = bits(sl[4], 48, 14);
@@ -3858,25 +3872,23 @@ static void vic_compose(EmuState *state) {
     for (uint32_t tx = x0; tx <= x1; tx++)
       sxs[tx - x0] = sl_l + (uint32_t)((uint64_t)(tx - dl) *
                                        (sl_r - sl_l + 1) / (dr - dl + 1));
-    uint32_t src_pitch = sw * bpp;
     for (uint32_t ty = y0; ty <= y1; ty++) {
       uint32_t sy = sl_t + (uint32_t)((uint64_t)(ty - dt) * (sl_b - sl_t + 1) /
                                       (db - dt + 1));
       if (sy >= sh)
         continue;
-      const uint8_t *srow = src + (uint64_t)sy * src_pitch;
       uint32_t fy = flip_y ? oh - 1 - ty : ty;
       for (uint32_t tx = x0; tx <= x1; tx++) {
         uint32_t sx = sxs[tx - x0];
         if (sx >= sw)
           continue;
         uint32_t fx = flip_x ? ow - 1 - tx : tx;
-        uint64_t o = transpose ? (uint64_t)fx * out_pitch + (uint64_t)fy * bpp
-                               : (uint64_t)fy * out_pitch + (uint64_t)fx * bpp;
-        if (bpp == 4)
-          memcpy(dst + o, srow + (uint64_t)sx * 4, 4);
-        else
-          memcpy(dst + o, srow + (uint64_t)sx * bpp, bpp);
+        uint32_t col = transpose ? fy : fx, row = transpose ? fx : fy;
+        uint64_t o = okind ? bl_offset(col * bpp, row, out_gobs, ogob)
+                           : (uint64_t)row * out_pitch + (uint64_t)col * bpp;
+        uint64_t i = skind ? bl_offset(sx * bpp, sy, src_gobs, sgob)
+                           : (uint64_t)sy * src_pitch + (uint64_t)sx * bpp;
+        memcpy(dst + o, src + i, bpp);
       }
     }
   }
