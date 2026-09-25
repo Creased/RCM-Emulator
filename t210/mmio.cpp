@@ -1690,6 +1690,355 @@ void     dsi_write(EmuState *state, uint64_t addr, uint32_t val);
 // and the write path share one cursor.
 static uint32_t g_kfuse_keyaddr = 0;
 
+// ---- SD host controller registers beyond the command model ---------------
+//
+// A byte-exact shadow of each controller's 512-byte register block, for what
+// the command/data model below does not own: POWER_CONTROL, CLOCK_CONTROL,
+// SW_RESET, the interrupt enables, HOST_CONTROL2 and the Tegra vendor block
+// at 0x100..0x1FF (TRM 32.9.2). These all read 0 before, whatever was
+// written - and bdk decides the eMMC bus mode from them: POWER_CONTROL
+// reading "off" made _mmc_storage_enable_highspeed fall back to HS52, so the
+// eMMC ran at 51 MHz while claiming HS400. HS200 then needs the tuning
+// handshake, HS400 the tuned tap and a DLL calibration; all three are here.
+struct SdhciRegs {
+  uint8_t  b[0x200];
+  // Hardware tuning (TRM 32.9.2.14): iteration count since EXECUTE_TUNING
+  // was set, the 256-bit per-iteration pass map, the best window found.
+  uint32_t tune_i;
+  uint32_t tune_map[8];
+  uint8_t  win_first, win_last;
+  // A tuning block sent with the card clock stopped, delivered when it runs.
+  bool     tune_pending;
+};
+static SdhciRegs sdhci_regs[2];   // [0] SDMMC1, [1] SDMMC4
+
+// Trimmer taps at which the emulated eMMC's tuning block samples cleanly.
+// At 200 MHz a unit interval is ~70 taps; a healthy part passes over most
+// of one eye. Deterministic, so every run tunes to the same tap.
+static constexpr uint32_t kTunePassFirst = 26, kTunePassLast = 82;
+
+static SdhciRegs &sdhci_of(uint32_t base) {
+  return sdhci_regs[base == SDMMC4_BASE ? 1 : 0];
+}
+static uint32_t sdhci_get32(const SdhciRegs &r, uint32_t off) {
+  return (uint32_t)r.b[off] | ((uint32_t)r.b[off + 1] << 8) |
+         ((uint32_t)r.b[off + 2] << 16) | ((uint32_t)r.b[off + 3] << 24);
+}
+static void sdhci_put32(SdhciRegs &r, uint32_t off, uint32_t v) {
+  for (int i = 0; i < 4; i++)
+    r.b[off + i] = (uint8_t)(v >> (8 * i));
+}
+
+// Power-on state: the standard registers clear, the vendor block at its
+// TRM reset values (the SDMMC2/4 set, which carries the DLL registers).
+static void sdhci_reset_regs(SdhciRegs &r) {
+  memset(&r, 0, sizeof(r));
+  static const struct { uint16_t off; uint32_t val; } kReset[] = {
+      {0x100, 0x0000D02D}, {0x104, 0x38600002}, {0x10C, 0x00000007},
+      {0x11C, 0x00000C80}, {0x120, 0xFFFF0098}, {0x1AC, 0x00000015},
+      {0x1B0, 0x16083504}, {0x1B4, 0x60000000}, {0x1B8, 0x20208780},
+      {0x1BC, 0x10000000}, {0x1C0, 0x74020090}, {0x1C4, 0x00000023},
+      {0x1D0, 0x0000000F}, {0x1D4, 0x00201000}, {0x1D8, 0x00100804},
+      {0x1DC, 0x00000800}, {0x1E0, 0x88000001}, {0x1E4, 0x00010000},
+      {0x1F8, 0x00000032},
+  };
+  for (const auto &e : kReset)
+    sdhci_put32(r, e.off, e.val);
+}
+
+static bool sdhci_shadowed(uint32_t off) {
+  return (off >= 0x28 && off < 0x40) || (off >= 0x100 && off < 0x200);
+}
+
+static uint8_t sdhci_byte(EmuState *s, uint32_t base, uint32_t off) {
+  if (off >= 0x200)
+    return 0;
+  SdhciRegs &r = sdhci_of(base);
+  bool e = base == SDMMC4_BASE;
+  uint32_t nor = e ? s->sdmmc4_norintsts : s->sdmmc_norintsts;
+  uint32_t err = e ? s->sdmmc4_errintsts : s->sdmmc_errintsts;
+  switch (off) {
+  case 0x28:
+    return e ? s->sdmmc4_hostctl : s->sdmmc_hostctl;
+  case 0x2C: {
+    // CLOCK_CONTROL: the internal clock is stable as soon as it is enabled.
+    uint8_t c = r.b[0x2C] & ~0x02;
+    return (c & 0x01) ? (uint8_t)(c | 0x02) : c;
+  }
+  case 0x2F:
+    return 0;                     // SW_RESET: completes at once
+  case 0x30: case 0x31:
+    // NORMAL_INT_STATUS bit 15, ERR_INTERRUPT, is the OR of every error
+    // bit (SDHCI 2.2.18) - what BDK's _sdmmc_check_mask_interrupt tests.
+    return (uint8_t)((nor | (err ? 0x8000u : 0u)) >> (8 * (off - 0x30)));
+  case 0x32: case 0x33:
+    return (uint8_t)(err >> (8 * (off - 0x32)));
+  case 0x3C: case 0x3D:
+    return 0;                     // AUTO_CMD_ERROR_STATUS
+  case 0x1B3:
+    return r.b[off] & 0x7F;       // DLLCAL_CFG.CALIBRATE self-clears
+  case 0x1BF:
+    return r.b[off] & 0x7F;       // DLLCAL_CFG_STA.ACTIVE: calibration done
+  case 0x1C8: case 0x1C9: case 0x1CA: case 0x1CB: {
+    // VENDOR_TUNING_STATUS0: the pass map word TUNING_WORD_SEL selects.
+    uint32_t w = r.tune_map[r.b[0x1C0] & 7];
+    return (uint8_t)(w >> (8 * (off - 0x1C8)));
+  }
+  case 0x1CC: case 0x1CE: return r.win_first;   // start, after / before fine
+  case 0x1CD: case 0x1CF: return r.win_last;    // end,   after / before fine
+  case 0x1E7:
+    return r.b[off] & 0x7F;       // AUTO_CAL_CONFIG.START self-clears
+  case 0x1EC:
+    return 0x01;                  // AUTO_CAL_STATUS: done, pull-up code 1
+  case 0x1ED: case 0x1EE: case 0x1EF:
+    return 0;                     // ...ACTIVE (bit 31) clear
+  default:
+    return r.b[off];
+  }
+}
+
+static uint32_t sdhci_read(EmuState *s, uint32_t base, uint32_t off) {
+  uint32_t v = 0;
+  for (int i = 3; i >= 0; i--)
+    v = (v << 8) | sdhci_byte(s, base, off + (uint32_t)i);
+  return v;
+}
+
+// SW_RESET (0x2F). RESET_ALL puts the standard registers back to power-on
+// and leaves the vendor block's trims alone; RESET_CMD / RESET_DATA clear
+// the status their line owns (SDHCI 2.2.12).
+static void sdhci_sw_reset(EmuState *s, uint32_t base, uint8_t v) {
+  bool e = base == SDMMC4_BASE;
+  uint32_t &nor = e ? s->sdmmc4_norintsts : s->sdmmc_norintsts;
+  uint32_t &err = e ? s->sdmmc4_errintsts : s->sdmmc_errintsts;
+  if (v & 0x01) {
+    SdhciRegs &r = sdhci_of(base);
+    uint8_t vendor[0x100];
+    memcpy(vendor, r.b + 0x100, sizeof(vendor));  // vendor block survives
+    sdhci_reset_regs(r);
+    memcpy(r.b + 0x100, vendor, sizeof(vendor));
+    nor = err = 0;
+    (e ? s->sdmmc4_hostctl : s->sdmmc_hostctl) = 0;
+    return;
+  }
+  if (v & 0x02) {                 // CMD line: command complete, CMD errors
+    nor &= ~0x0001u;
+    err &= ~0x000Fu;
+  }
+  if (v & 0x04) {                 // DAT line: transfer/DMA/buffer, DAT errors
+    nor &= ~0x003Eu;
+    err &= ~0x0270u;
+  }
+}
+
+// A tuning block arriving: BUFFER_READ_READY.
+static void sdhci_deliver_tuning_block(EmuState *s, uint32_t base) {
+  (base == SDMMC4_BASE ? s->sdmmc4_norintsts : s->sdmmc_norintsts) |= 0x0020;
+}
+
+static void sdhci_write(EmuState *s, uint32_t base, uint32_t offset,
+                        uint64_t value, int size) {
+  SdhciRegs &r = sdhci_of(base);
+  for (int i = 0; i < size; i++) {
+    uint32_t off = offset + (uint32_t)i;
+    if (off >= 0x200)
+      break;
+    uint8_t v = (uint8_t)(value >> (8 * i));
+    switch (off) {
+    case 0x28:                                  // HOST_CONTROL: command model
+    case 0x30: case 0x31: case 0x32: case 0x33: // W1C status: command model
+    case 0x3C: case 0x3D:                       // read-only
+    case 0x1BC: case 0x1BD: case 0x1BE: case 0x1BF:
+    case 0x1C8: case 0x1C9: case 0x1CA: case 0x1CB:
+    case 0x1CC: case 0x1CD: case 0x1CE: case 0x1CF:
+    case 0x1EC: case 0x1ED: case 0x1EE: case 0x1EF:
+      break;
+    case 0x2C: {
+      bool was_on = r.b[0x2C] & 0x04;
+      r.b[0x2C] = v;
+      // Tegra sends a tuning command with SD_CLK stopped, resets CMD/DAT,
+      // then restarts the clock: the block comes in now.
+      if (!was_on && (v & 0x04) && r.tune_pending) {
+        r.tune_pending = false;
+        sdhci_deliver_tuning_block(s, base);
+      }
+      break;
+    }
+    case 0x2F:
+      sdhci_sw_reset(s, base, v);
+      break;
+    case 0x3E: {
+      // HOST_CONTROL2 low byte. EXECUTE_TUNING (bit 6) belongs to the
+      // hardware once set: writing 1 starts tuning - clearing the sampling
+      // clock select and the pass map - and only the tuning circuit clears
+      // it again. SAMPLING_CLOCK_SELECT (bit 7) takes what is written.
+      uint8_t cur = r.b[0x3E];
+      uint8_t nv = (uint8_t)((v & ~0x40) | (cur & 0x40));
+      if ((v & 0x40) && !(cur & 0x40)) {
+        nv = (uint8_t)((nv | 0x40) & ~0x80);
+        r.tune_i = 0;
+        memset(r.tune_map, 0, sizeof(r.tune_map));
+        r.win_first = r.win_last = 0;
+      }
+      r.b[0x3E] = nv;
+      break;
+    }
+    default:
+      r.b[off] = v;
+      break;
+    }
+  }
+}
+
+// SEND_TUNING_BLOCK (CMD19 SD, CMD21 eMMC HS200) with the Tegra tuning
+// circuit (TRM 32.9.2.14). With EXECUTE_TUNING set each block is one
+// iteration at the next trimmer tap - START_TAP_VAL plus 2^STEP_SIZE per
+// iteration when TAP_VAL_UPDATED_BY_HW is set, the programmed tap
+// otherwise - and SAMPLING_CLOCK_SELECT reports whether it sampled
+// cleanly. After NUM_TUNING_ITERATIONS blocks the circuit clears
+// EXECUTE_TUNING; in hardware-tap mode it then sets the final tap
+// first_pass + (last_pass - first_pass) * (MUL_M + 1) / 2^DIV_N and
+// leaves SAMPLING_CLOCK_SELECT set if any tap passed.
+static void sdhci_tuning_command(EmuState *s, uint32_t base) {
+  SdhciRegs &r = sdhci_of(base);
+  if (r.b[0x3E] & 0x40) {
+    static const uint16_t kTries[8] = {40, 64, 128, 192, 256, 256, 256, 256};
+    uint32_t tun0 = sdhci_get32(r, 0x1C0), tun1 = sdhci_get32(r, 0x1C4);
+    bool hw_tap = tun0 & (1u << 17);
+    uint32_t tries = kTries[(tun0 >> 13) & 7];
+    bool sdr50 = (r.b[0x3E] & 0x07) == 2;
+    uint32_t step = 1u << (sdr50 ? (tun1 & 7) : ((tun1 >> 4) & 7));
+    uint32_t clk = sdhci_get32(r, 0x100);
+    uint32_t i = r.tune_i;
+    uint32_t tap = hw_tap ? ((((tun0 >> 18) & 0xFF) + i * step) & 0xFF)
+                          : ((clk >> 16) & 0xFF);
+    bool pass = tap >= kTunePassFirst && tap <= kTunePassLast;
+    if (i < 256 && pass)
+      r.tune_map[i / 32] |= 1u << (i % 32);
+    if (hw_tap)
+      sdhci_put32(r, 0x100, (clk & ~0x00FF0000u) | (tap << 16));
+    r.b[0x3E] = (uint8_t)((r.b[0x3E] & ~0x80) | (pass ? 0x80 : 0));
+    r.tune_i = i + 1;
+    if (r.tune_i >= tries) {
+      r.b[0x3E] &= ~0x40;                     // tuning complete
+      if (hw_tap) {
+        int first = -1, last = -1;
+        uint32_t start = (tun0 >> 18) & 0xFF;
+        for (uint32_t k = 0; k < tries && k < 256; k++) {
+          if (!(r.tune_map[k / 32] & (1u << (k % 32))))
+            continue;
+          uint32_t t = (start + k * step) & 0xFF;
+          if (first < 0)
+            first = (int)t;
+          last = (int)t;
+        }
+        if (first >= 0) {
+          uint32_t m = (tun0 >> 6) & 0x7F, n = (tun0 >> 3) & 7;
+          uint32_t fin = (uint32_t)first +
+                         (((uint32_t)(last - first) * (m + 1)) >> n);
+          if (fin > (uint32_t)last)
+            fin = (uint32_t)last;
+          clk = sdhci_get32(r, 0x100);
+          sdhci_put32(r, 0x100, (clk & ~0x00FF0000u) | ((fin & 0xFF) << 16));
+          r.win_first = (uint8_t)first;
+          r.win_last = (uint8_t)last;
+          r.b[0x3E] |= 0x80;
+          printf("[sdmmc] SDMMC%c tuned: %u iterations, pass window taps "
+                 "%d..%d, tap %u\n", base == SDMMC4_BASE ? '4' : '1',
+                 tries, first, last, fin & 0xFF);
+        } else {
+          r.b[0x3E] &= ~0x80;
+          printf("[sdmmc] SDMMC%c tuning failed: no tap passed\n",
+                 base == SDMMC4_BASE ? '4' : '1');
+        }
+        fflush(stdout);
+      }
+    }
+  }
+  if (r.b[0x2C] & 0x04)
+    sdhci_deliver_tuning_block(s, base);
+  else
+    r.tune_pending = true;
+}
+
+// ---- The eMMC's EXT_CSD -----------------------------------------------------
+//
+// The properties segment is fixed; the fields CMD6 SWITCH writes (bus
+// width, HS_TIMING, partition access, ...) keep what was written until the
+// card is reset, so a CMD8 after the bus-mode switches reads them back.
+static uint8_t g_ext_csd[512];
+static bool g_ext_csd_ready = false;
+
+static uint8_t *emmc_ext_csd() {
+  if (g_ext_csd_ready)
+    return g_ext_csd;
+  g_ext_csd_ready = true;
+  uint8_t *x = g_ext_csd;
+  memset(x, 0, 512);
+  x[192] = 7;          // EXT_CSD_REV: eMMC v5.0
+  x[196] = 0x57;       // CARD_TYPE: HS400_1.8V | HS200_1.8V | DDR_1.8V | HS_52 | HS_26
+  // 32GB worth of sectors (BDK only uses sec_cnt for sanity, not for read
+  // addressing).
+  uint32_t sec_cnt = 64 * 1024 * 1024;
+  x[212] = sec_cnt & 0xFF;
+  x[213] = (sec_cnt >> 8) & 0xFF;
+  x[214] = (sec_cnt >> 16) & 0xFF;
+  x[215] = (sec_cnt >> 24) & 0xFF;
+  // BOOT0/BOOT1 and RPMB are 4 MiB each on the Switch's eMMC: 32 x 128 KiB.
+  x[226] = 32;         // BOOT_SIZE_MULT
+  x[168] = 32;         // RPMB_SIZE_MULT
+  // Capability/health bytes a diagnostic payload reports on. Values
+  // measured from the eMMC in a real Mariko; left at 0 these read as
+  // "feature not supported", which looks like a reduced-firmware
+  // replacement part.
+  x[503] = 0x01;       // HPI_FEATURES: supported, CMD13 variant
+  x[231] = 0x55;       // SEC_FEATURE_SUPPORT: secure erase/trim/sanitize
+  x[232] = 0x02;       // TRIM_MULT
+  x[229] = 0x11;       // SEC_TRIM_MULT (measured)
+  x[162] = 0x01;       // RST_N_FUNCTION: permanently enabled
+  x[267] = 0x01;       // PRE_EOL_INFO: normal
+  x[268] = 0x01;       // DEVICE_LIFE_TIME_EST_TYP_A: 0-10%
+  x[269] = 0x01;       // DEVICE_LIFE_TIME_EST_TYP_B: 0-10%
+  return x;
+}
+
+// CMD0 / power-on: back to 1-bit legacy timing, in the user area.
+static void emmc_ext_csd_card_reset() {
+  uint8_t *x = emmc_ext_csd();
+  x[183] = 0;          // BUS_WIDTH
+  x[185] = 0;          // HS_TIMING
+  x[179] &= ~0x07;     // PARTITION_ACCESS
+}
+
+// CMD6 SWITCH, access modes 1 = set bits, 2 = clear bits, 3 = write byte,
+// to the fields a host may change.
+static void emmc_ext_csd_switch(uint32_t arg) {
+  uint32_t access = (arg >> 24) & 3, index = (arg >> 16) & 0xFF;
+  uint8_t value = (uint8_t)(arg >> 8);
+  switch (index) {
+  case 33:  // CACHE_CTRL
+  case 34:  // POWER_OFF_NOTIFICATION
+  case 161: // HPI_MGMT
+  case 163: // BKOPS_EN
+  case 175: // ERASE_GROUP_DEF
+  case 177: // BOOT_BUS_CONDITIONS
+  case 179: // PARTITION_CONFIG
+  case 183: // BUS_WIDTH
+  case 185: // HS_TIMING
+  case 187: // POWER_CLASS
+    break;
+  default:
+    return;
+  }
+  uint8_t *x = emmc_ext_csd();
+  if (access == 1)
+    x[index] |= value;
+  else if (access == 2)
+    x[index] &= (uint8_t)~value;
+  else if (access == 3)
+    x[index] = value;
+}
+
 uint32_t misc_read(EmuState *state, uint64_t addr) {
   // PINMUX (APB_MISC pad config range) — every write lands in the global
   // mmio_regs map at line 1726, so we just hand it back. Returning 0 here
@@ -1878,8 +2227,6 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
 
     uint32_t *rsp =
         (base == SDMMC4_BASE) ? state->sdmmc4_rsp : state->sdmmc_rsp;
-    uint32_t &norintsts = (base == SDMMC4_BASE) ? state->sdmmc4_norintsts
-                                                : state->sdmmc_norintsts;
     uint16_t blksize =
         (base == SDMMC4_BASE) ? state->sdmmc4_blksize : state->sdmmc_blksize;
     uint16_t blkcnt =
@@ -1888,7 +2235,9 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
         (base == SDMMC4_BASE) ? state->sdmmc4_trnmod : state->sdmmc_trnmod;
 
     uint32_t result = 0;
-    if (offset == 0x00)
+    if (sdhci_shadowed(offset))
+      result = sdhci_read(state, base, offset);
+    else if (offset == 0x00)
       result = (base == SDMMC4_BASE) ? state->sdmmc4_sysad : state->sdmmc_sysad;
     else if (offset == 0x04)
       result = (blkcnt << 16) | blksize;
@@ -1909,36 +2258,13 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
       else
         result = 0x01F70000; // CARD_PRESENT | CD_STABLE | CD_LVL | DAT_LINE_LEVEL
     }
-    else if (offset == 0x28) {
-      // HOSTCTL. sdmmc_get_bus_width() reads this register directly to decide
-      // 1 / 4 / 8-bit (SDHCI_CTRL_4BITBUS = BIT(1), SDHCI_CTRL_8BITBUS =
-      // BIT(5)). It had no read handler at all, so every payload saw a 1-bit
-      // bus even after a successful 4-bit SD / 8-bit eMMC negotiation - and an
-      // eMMC HS400-vs-bus-width cross-check would call that a fault.
-      result = (base == SDMMC4_BASE) ? state->sdmmc4_hostctl
-                                     : state->sdmmc_hostctl;
-    }
-    else if (offset == 0x2C)
-      result = 0x0003; // SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_INT_STABLE
     else if (offset == 0x40)
       result =
           0x376CD08C; // Full Tegra capabilities (64-bit, SDMA, ADMA2, etc.)
     else if (offset == 0x44)
       result = 0x10002F73; // CAP1
-    else if (offset == 0x30) {
-      // NORMAL_INT_STATUS bit 15, ERR_INTERRUPT, is the OR of every error
-      // bit (SDHCI 2.2.18) - what BDK's _sdmmc_check_mask_interrupt tests.
-      uint32_t err = base == SDMMC4_BASE ? state->sdmmc4_errintsts
-                                         : state->sdmmc_errintsts;
-      result = (err << 16) | norintsts | (err ? 0x8000u : 0u);
-    }
-    else if (offset == 0x32)
-      result = (base == SDMMC4_BASE) ? state->sdmmc4_errintsts
-                                     : state->sdmmc_errintsts;
     else if (offset >= 0x10 && offset <= 0x1C)
       result = rsp[(offset - 0x10) / 4];
-    else if (offset == 0x1EC)
-      result = 0x00000001; // AUTOCAL_STS
     else if (offset == 0xFE)
       result = 0x0303; // SDHCI Version 4.0
 
@@ -2010,20 +2336,14 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
     uint64_t &adma_addr = (base == SDMMC4_BASE) ? state->sdmmc4_adma_addr
                                                 : state->sdmmc_adma_addr;
 
+    if (sdhci_shadowed(offset))
+      sdhci_write(state, base, offset, value, size);
     if (offset == 0x00)
       sysad = val;
     if (offset == 0x28)
       // 0x3E, not 0x1E: the old mask dropped SDHCI_CTRL_8BITBUS (BIT(5)), so
       // an eMMC 8-bit bus could never be represented.
       hostctl = val & 0x3E;
-    if (offset == 0x2F) {
-      // Software Reset. Clear immediately to signify completion.
-      mmio_regs[base + 0x2C] &= ~(val << 24);
-    }
-    if (offset == 0x2C && size == 4) {
-      // If reset bits were set in 4-byte write, clear them for subsequent reads
-      mmio_regs[base + 0x2C] &= ~0x07000000;
-    }
     if (offset == 0x04) {
       if (size == 4) {
         blksize = val & 0x0FFF;
@@ -2093,8 +2413,15 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
         // GO_IDLE_STATE: the eMMC comes back in its user area (PARTITION_
         // ACCESS = 0). Leaving BOOT0 selected made the next init read the
         // GPT - and write user data - into the boot partition's image.
-        if (base == SDMMC4_BASE)
+        if (base == SDMMC4_BASE) {
           state->emmc_partition = 0;
+          emmc_ext_csd_card_reset();
+        }
+        break;
+      case 19: // SD SEND_TUNING_BLOCK
+      case 21: // eMMC SEND_TUNING_BLOCK_HS200
+        sdhci_tuning_command(state, base);
+        rsp[0] = r1_base | (4 << 9) | (1u << 8);
         break;
       case 8:
         rsp[0] = (base == SDMMC4_BASE) ? 0x00000900 : arg;
@@ -2103,33 +2430,7 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
         // bails with storage->initialized = 0 — which silently breaks all
         // later sdmmc_storage_read calls (returns 0 without issuing CMD18).
         if (base == SDMMC4_BASE) {
-          uint8_t ext_csd[512] = {0};
-          // Set a few fields BDK actually parses (most others can be 0):
-          //   EXT_CSD_REV = 192 (offset 192)
-          //   EXT_CSD_CARD_TYPE = 196 (HS-52 + HS200 + HS400 supported)
-          //   EXT_CSD_SEC_CNT = 212..215 (sector count, little-endian u32)
-          ext_csd[192] = 7;  // eMMC v5.0
-          ext_csd[196] = 0x57; // HS400_1.8V | HS200_1.8V | HS_52 | HS_DDR
-          // 32GB worth of sectors (0x3A380000 = 977MB; for the user's actual
-          // dump size we'd want the real value, but BDK only uses sec_cnt for
-          // sanity, not for read addressing).
-          uint32_t sec_cnt = 64 * 1024 * 1024; // 32GB / 512B = 64M sectors
-          ext_csd[212] = sec_cnt & 0xFF;
-          ext_csd[213] = (sec_cnt >> 8) & 0xFF;
-          ext_csd[214] = (sec_cnt >> 16) & 0xFF;
-          ext_csd[215] = (sec_cnt >> 24) & 0xFF;
-          // Capability/health bytes a diagnostic payload reports on. Values
-          // measured from the eMMC in a real Mariko; left at 0 these read as
-          // "feature not supported", which looks like a reduced-firmware
-          // replacement part.
-          ext_csd[503] = 0x01; // HPI_FEATURES: supported, CMD13 variant
-          ext_csd[231] = 0x55; // SEC_FEATURE_SUPPORT: secure erase/trim/sanitize
-          ext_csd[232] = 0x02; // TRIM_MULT
-          ext_csd[229] = 0x11; // SEC_TRIM_MULT (measured)
-          ext_csd[162] = 0x01; // RST_N_FUNCTION: permanently enabled
-          ext_csd[267] = 0x01; // PRE_EOL_INFO: normal
-          ext_csd[268] = 0x01; // DEVICE_LIFE_TIME_EST_TYP_A: 0-10%
-          ext_csd[269] = 0x01; // DEVICE_LIFE_TIME_EST_TYP_B: 0-10%
+          const uint8_t *ext_csd = emmc_ext_csd();
 
           uint64_t dma_addr = 0;
           // Tegra's SDMMC uses register 0x58 as the SDMA system-address
@@ -2278,10 +2579,9 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
           rsp[0] = r1_base | (4 << 9);
         } else if (base == SDMMC4_BASE) {
           // CMD6: SWITCH (eMMC)
-          uint8_t index = (arg >> 16) & 0xFF;
-          uint8_t val = (arg >> 8) & 0xFF;
-          if (index == 179) { // PARTITION_CONFIG
-            state->emmc_partition = val & 0x7;
+          emmc_ext_csd_switch(arg);
+          if (((arg >> 16) & 0xFF) == 179) { // PARTITION_CONFIG
+            state->emmc_partition = emmc_ext_csd()[179] & 0x7;
             TRACE("[sdmmc] eMMC Partition Switch: %u\n",
                    state->emmc_partition);
           }
@@ -4214,6 +4514,8 @@ void mmio_init(uc_engine *uc, EmuState *state) {
   mmio_map_bus(uc, state);
   pcie_reset(state);
   ccplex_reset(state);
+  sdhci_reset_regs(sdhci_regs[0]);
+  sdhci_reset_regs(sdhci_regs[1]);
 
   uc_hook_add(uc, &h_unmapped,
               UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED,
@@ -4307,6 +4609,12 @@ void mmio_soft_reset(EmuState *state, bool power_cycle) {
   state->sdmmc4_adma_addr = 0;
   state->emmc_partition = 0;
   state->last_cmd_was_55 = state->last_cmd4_was_55 = false;
+  sdhci_reset_regs(sdhci_regs[0]);
+  sdhci_reset_regs(sdhci_regs[1]);
+  if (power_cycle)
+    g_ext_csd_ready = false;
+  else
+    emmc_ext_csd_card_reset();
 
   // Display controller back to its defaults (emu_state.h).
   state->pre_addr = 0;
@@ -4324,6 +4632,7 @@ void mmio_soft_reset(EmuState *state, bool power_cycle) {
   state->winA_h = 1280;
   state->winA_stride = 2880;
   state->winA_sw = state->winA_rot = state->winA_bh = 0;
+
 
   state->bpmp_halted = false;
 }

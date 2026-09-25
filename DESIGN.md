@@ -20,7 +20,7 @@ flowchart TB
 
     uc -->|MMIO callbacks| mmio["<b>t210/mmio.cpp</b><br/>mmio_bus_read / mmio_bus_write<br/>shared by both masters"]
 
-    mmio --> sdmmc["<b>sdmmc</b><br/>SDMMC1 / SDMMC4<br/>CMD0..18, EXT_CSD, ADMA2"]
+    mmio --> sdmmc["<b>sdmmc</b><br/>SDMMC1 / SDMMC4<br/>CMD0..21, EXT_CSD, ADMA2<br/>HS200 tuning, HS400"]
     mmio --> se["<b>se_engine</b><br/>AES-128, SHA-256<br/>BIS keyslot override"]
     mmio --> i2c["<b>i2c3</b><br/>STMFTS / FTS4 touch"]
     mmio --> i2c1["<b>I2C_1 slaves</b> (inline)<br/>MAX17050, TMP451,<br/>BQ24193, BM92T36"]
@@ -106,7 +106,7 @@ of the spec is modelled for the Hekate, Lockpick and TE init paths:
 - CMD0 GO_IDLE, CMD1 SEND_OP_COND, CMD2 ALL_SEND_CID, CMD3 SEND_RELATIVE_ADDR,
   CMD6 SWITCH, CMD7 SELECT_CARD, CMD8 SEND_EXT_CSD (eMMC) or SEND_IF_COND (SD),
   CMD9 SEND_CSD, CMD13 SEND_STATUS, CMD16 SET_BLOCKLEN, CMD17 and CMD18
-  READ_(MULTI_)BLOCK, CMD55 APP_CMD.
+  READ_(MULTI_)BLOCK, CMD19 / CMD21 SEND_TUNING_BLOCK, CMD55 APP_CMD.
 - ADMA2 (Advanced DMA 2) with 64-bit descriptors, multi-block reads chunked
   into the host file IO via `pread`-style calls.
 - `--rawnand` opens the matching `rawnand.bin.NN` chunks and `fstat`s the first
@@ -126,6 +126,37 @@ of the spec is modelled for the Hekate, Lockpick and TE init paths:
   data. The handler synthesises a 512-byte payload (REV=7, CARD_TYPE=0x57, fake
   sec_cnt) and writes it via the configured ADMA2 descriptor before raising
   the IRQ.
+
+#### Host controller registers and HS400
+
+Each controller keeps its SDHCI registers (0x28-0x3F: power, clock, software
+reset, HOST_CONTROL2) and Tegra's vendor block (0x100-0x1FF) in a register
+file with the TRM's reset values, plus the side effects bdk waits on:
+
+- CLOCK_CONTROL reports INTERNAL_CLK_STABLE once INT_CLK_EN is set.
+  SOFTWARE_RESET's bits self-clear. RESET_ALL puts the standard registers
+  back to reset and leaves the vendor block alone.
+- AUTO_CAL_CONFIG.START and DLLCAL_CFG.CALIBRATE self-clear, and the status
+  registers report the calibration done.
+- Setting HOST_CONTROL2.EXEC_TUNING starts tuning. Each CMD19/CMD21 tries one
+  tap: with TAP_VAL_UPDATED_BY_HW the taps step from TUNING_CNTRL0.START_TAP
+  by TUNING_CNTRL1's step size, otherwise the tap in VENDOR_CLOCK_CNTRL is
+  used. A tap passes when it falls in the modelled data eye, taps 26..82.
+  After NUM_TUNING_ITERATIONS commands EXEC_TUNING clears and TUNED_CLK is
+  set. The pass map lands in TUNING_STATUS0, and the chosen tap, first +
+  (last - first) x (MUL_M + 1) / 2^DIV_N (TRM 32.9.2.14), lands in
+  VENDOR_CLOCK_CNTRL. The tuning block's BUFFER_READ_READY is held until the
+  card clock is re-enabled, the order in which bdk's tuning loop waits.
+- EXT_CSD is one 512-byte array that lives for a power cycle. CMD6 SWITCH
+  (write byte, set bits or clear bits) changes the bytes eMMC 5.1 makes
+  writable (BUS_WIDTH, HS_TIMING, PARTITION_CONFIG and a few more). CMD8
+  returns the array and CMD0 puts the card-reset fields back. CARD_TYPE
+  advertises HS400 at 1.8 V, so bdk goes 8-bit, then HS200 (tuned), then
+  HS400, and reports a 199.68 MHz card clock. BOOT0, BOOT1 and RPMB are
+  4 MiB each, as on a Switch.
+
+The SD card stays at High Speed (48 MHz). UHS-I needs ACMD41 to answer with
+S18A and a CMD11 voltage switch, which the SD model does not do.
 
 ### Security Engine (`t210/se_engine.cpp`)
 

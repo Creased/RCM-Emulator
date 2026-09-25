@@ -47,5 +47,7 @@ expect 'RP1 link      : UP, DL active (LNKSTA=3011'  'root port 1 trained'
 expect 'EP config     : 14E4:43EC'                   'the CYW4356 endpoint enumerated'
 expect 'CPU0          : powergated'                  'the cluster was powergated again'
 expect 'Wireless       : pass'                       'the Wireless verdict passed'
+expect '\[sdmmc\] SDMMC4 tuned: 128 iterations'      'the eMMC passed HS200 tuning'
+expect 'card_clock   : 199.68 MHz'                    'the eMMC runs at HS400 speed'
 
 [ $fail -eq 0 ] && echo "hwtest: PASS" || { echo "hwtest: FAIL - see $LOG"; exit 1; }
