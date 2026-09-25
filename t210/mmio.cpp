@@ -3187,22 +3187,42 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
     return w;                          // measured: down on both
   }
   case 0x90: { // PLLM
+    // Until the payload programs it: Erista leaves PLLM enabled but
+    // unlocked at this point, Mariko has it off. Once written, it reads
+    // back what was written - the dividers too, before ENABLE is set.
+    if (!mmio_regs.count(addr))
+      return mariko ? 0u : (1u << 30);
     uint32_t w = mmio_regs.get(addr);
-    if (w & (1u << 30))
-      return w | (1u << 27);
-    // Erista leaves PLLM enabled but unlocked at this point; Mariko has it off.
-    return mariko ? 0u : (1u << 30);
+    return (w & (1u << 30)) ? w | (1u << 27) : w;
   }
   case 0xC0: { // PLLU
+    if (!mmio_regs.count(addr))
+      return mariko ? 0u : ((1u << 30) | (1u << 27));
     uint32_t w = mmio_regs.get(addr);
-    if (w & (1u << 30))
-      return w | (1u << 27);
-    return mariko ? 0u : ((1u << 30) | (1u << 27));
+    return (w & (1u << 30)) ? w | (1u << 27) : w;
   }
   case 0xA0: // PLLP_BASE - same value on both
     return 0x48115408u;
   case 0xD0: // PLLD_BASE - up on both
     return (1u << 30) | (1u << 27);
+  case 0x5E8: { // PLLMB_BASE (TRM 5.2.230), reset 0x00002A02: down
+    // Minerva moves the EMC onto PLLMB for a DRAM frequency change and
+    // spins on PLLMB_LOCK after enabling it. LOCK and FREQ_LOCK (bits 27,
+    // 26) are read-only: set once the PLL is enabled, or forced by
+    // PLLMB_MISC1.LOCK_OVERRIDE.
+    uint32_t w = mmio_regs.get(addr, 0x00002A02) & ~(3u << 26);
+    uint32_t misc1 = mmio_regs.get(CLK_RST_BASE + 0x5EC, 0x00010000);
+    if ((w & (1u << 30)) || (misc1 & (1u << 18)))
+      w |= 3u << 26;
+    return w;
+  }
+  case 0x5EC: // PLLMB_MISC1, reset 0x00010000 (EN_LCKDET)
+    return mmio_regs.get(addr, 0x00010000);
+  case 0x19C: // CLK_SOURCE_EMC, reset 0x60180000 (TRM 5.2.73)
+    return mmio_regs.get(addr, 0x60180000);
+  case 0x664: // CLK_SOURCE_EMC_DLL, reset 0x60000000
+  case 0x724: // CLK_SOURCE_EMC_SAFE, reset 0x60000000
+    return mmio_regs.get(addr, 0x60000000);
   }
 
   // Informational clock registers, measured on a real Mariko. These read back
@@ -3297,12 +3317,16 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
   return 0;
 }
 
+// A CLK_SOURCE_EMC write is the CAR/EMC clock-change handshake (EMC below).
+static void emc_clock_source_write(EmuState *state, uint32_t val);
+
 void clk_rst_write(EmuState *state, uint64_t addr, uint32_t val) {
   (void)state;
   uint32_t offset = (uint32_t)(addr - CLK_RST_BASE);
-  // Only the _U pair is live so far; everything else stays a no-op, and the
-  // generic mmio_regs cache in the write hook still serves the CLK_SOURCE_*
-  // read-backs. bdk reaches these through the SET/CLR aliases exclusively.
+  // The _U pair is live (bdk reaches it through the SET/CLR aliases), and
+  // CLK_SOURCE_EMC starts an EMC clock change. Everything else only lands
+  // in the write hook's mmio_regs cache, which clk_rst_read consults for
+  // the registers it reads back (CLK_SOURCE_UARTD, the EMC clock sources).
   switch (offset) {
   case 0x00C: car_rst_u  =  val; break; // RST_DEVICES_U, direct write
   case 0x018: car_enb_u  =  val; break; // CLK_OUT_ENB_U, direct write
@@ -3310,6 +3334,7 @@ void clk_rst_write(EmuState *state, uint64_t addr, uint32_t val) {
   case 0x314: car_rst_u &= ~val; break; // RST_DEV_U_CLR
   case 0x330: car_enb_u |=  val; break; // CLK_ENB_U_SET
   case 0x334: car_enb_u &= ~val; break; // CLK_ENB_U_CLR
+  case 0x19C:   emc_clock_source_write(state, val); break; // CLK_SOURCE_EMC
   default: break;
   }
   // The PCIe root complex depends on PLLE, PLLREFE and the PCIE/AFI/
@@ -3361,61 +3386,234 @@ void fuse_write(EmuState *state, uint64_t addr, uint32_t val) {
   if (offset == 0x04) g_fuse_ctrl_addr = val; // FUSE_ADDR
 }
 
-// ==================== EMC (DRAM mode register reads) ====================
+// ==================== EMC ====================
 //
-// Hekate's HW-info screen calls sdram_read_mrx(MRx), which:
-//   1. writes EMC(EMC_MRR) with (rank << 30) | (mrx << 16) on the broadcast
-//      bank at EMC_BASE,
-//   2. polls EMC(EMC_EMC_STATUS) bit 20 (MRR_DIVLD) until set,
-//   3. reads EMC_CH0(EMC_MRR) and EMC_CH1(EMC_MRR) from the per-channel
-//      banks at EMC0_BASE / EMC1_BASE.
+// A register file - reads return what was written - with the controller's
+// own behaviour on top (TRM 18.11):
 //
-// We capture the requested mode register on the EMC_MRR write and route the
-// per-channel reads back to the matching EmuState atomic.
+//   Banks. EMC_BASE is the broadcast bank: a write there reaches both
+//   channels. EMC0_BASE / EMC1_BASE address one channel each. mmio_regs
+//   holds every bank's words (the write hook stores the raw address), and a
+//   broadcast write is mirrored into both channel banks.
+//
+//   Mode registers. EMC_MRW and EMC_MRW2..15 send an MRW to the DRAM.
+//   EMC_MRR sends an MRR, after which the channel's EMC_MRR holds the answer
+//   (both x16 dies' bytes, bits 15:0) and its EMC_EMC_STATUS.MRR_DIVLD stays
+//   set until that data is read. MR4 reports the normal-temperature refresh
+//   rate, MR5-8 the configured DRAM ID, MR18/MR19 the DQS interval
+//   oscillator count, and any other mode register what was last written.
+//
+//   Digital DLL. It locks as soon as it is (re)started: EMC_DIG_DLL_STATUS
+//   reports DLL_LOCK and DLL_PRIV_UPDATED. The DLL code itself (DLL_OUT) is
+//   not modelled and reads 0.
+//
+//   Clock change. A new source or divisor in CAR CLK_SOURCE_EMC starts the
+//   CAR/EMC clock-change handshake: the EMC replays the writes queued in its
+//   clock-change FIFO (EMC_CCFIFO_DATA, then EMC_CCFIFO_ADDR) and raises
+//   CLKCHANGE_COMPLETE in EMC_INTSTATUS (sticky, write 1 to clear).
+//
+//   EMC_EMC_STATUS otherwise reports timing updates done, the DRAM active
+//   (not powered down, not in self-refresh) and the state machines idle.
+//
+// bdk's sdram_read_mrx needs the MRR path. Minerva, hekate's DRAM training
+// and frequency-switching module, needs the rest: it spins on DLL lock and
+// on the DLL-enable bit it writes, waits for the clock-change handshake,
+// and divides by the oscillator count.
 
-static constexpr uint32_t EMC_ADR_CFG       = 0x010;
-static constexpr uint32_t EMC_MRR           = 0x0EC;
-static constexpr uint32_t EMC_EMC_STATUS    = 0x2B4;
-static constexpr uint32_t EMC_FBIO_CFG7     = 0x584;
-static constexpr uint32_t EMC_STATUS_MRR_DIVLD = 1u << 20;
+static constexpr uint32_t EMC_INTSTATUS      = 0x000;
+static constexpr uint32_t EMC_MRW            = 0x0E8;
+static constexpr uint32_t EMC_MRR            = 0x0EC;
+static constexpr uint32_t EMC_EMC_STATUS     = 0x2B4;
+static constexpr uint32_t EMC_CFG_DIG_DLL    = 0x2BC;
+static constexpr uint32_t EMC_DIG_DLL_STATUS = 0x2C4;
+static constexpr uint32_t EMC_CCFIFO_ADDR    = 0x3E8;
+static constexpr uint32_t EMC_CCFIFO_DATA    = 0x3EC;
+static constexpr uint32_t EMC_CCFIFO_STATUS  = 0x3F0;
+static constexpr uint32_t EMC_FBIO_CFG7      = 0x584;
 
-static uint32_t g_last_mrr_mrx = 5;
+static constexpr uint32_t EMC_INT_CLKCHANGE_COMPLETE = 1u << 4;
+static constexpr uint32_t EMC_INT_MRR_DIVLD          = 1u << 5;
+static constexpr uint32_t EMC_INT_CCFIFO_OVERFLOW    = 1u << 8;
+static constexpr uint32_t EMC_STATUS_MRR_DIVLD       = 1u << 20;
+// The TRM calls the clock-change FIFO 32 deep, but CCFIFO_COUNT is 7 bits
+// and NVIDIA's own DVFS sequence (which Minerva ports) queues up to 65
+// entries per change, so the model takes as many as the count can report.
+static constexpr size_t   kEmcCcfifoDepth            = 127;
 
-static uint8_t emc_mrx_value(EmuState *state, uint32_t mrx) {
-  switch (mrx) {
-  case 5: return state->dram_vendor.load();
-  case 6: return state->dram_rev_id1.load();
-  case 7: return state->dram_rev_id2.load();
-  case 8: return state->dram_density.load();
-  default: return 0;
+// CAR CLK_SOURCE_EMC (TRM 5.2.73). A clock change starts when
+// EMC_2X_CLK_SRC, MC_EMC_SAME_FREQ or EMC_2X_CLK_DIVISOR changes, or on
+// FORCE_CC_TRIGGER; rewriting the same value does nothing.
+static constexpr uint32_t CAR_CLK_SOURCE_EMC       = 0x19C;
+static constexpr uint32_t CAR_CLK_SOURCE_EMC_RESET = 0x60180000; // CLK_M
+static constexpr uint32_t CAR_EMC_CC_FIELDS        = 0xE00100FF;
+static constexpr uint32_t CAR_EMC_FORCE_CC_TRIGGER = 1u << 27;
+
+// The LPDDR4's DQS-to-DQ delay, what the DQS interval oscillator measures.
+// JEDEC allows 200-800 ps; this is mid-range.
+static constexpr uint32_t kDramTdqs2dqPs = 400;
+
+struct EmcState {
+  uint8_t  mr[256] = {};          // mode registers, as last written by MRW
+  uint32_t mrr_ma[2] = {5, 5};    // per channel: MA of the last MRR
+  bool     mrr_valid[2] = {};     // per channel: MRR_DIVLD
+  uint32_t intstatus = 0;
+  uint32_t ccfifo_data = 0;
+  std::vector<std::pair<uint32_t, uint32_t>> ccfifo; // (offset, data)
+  uint32_t clk_source = CAR_CLK_SOURCE_EMC_RESET;    // CAR, as last applied
+};
+static EmcState emc;
+
+static bool emc_is_mrw(uint32_t offset) {
+  switch (offset) {
+  case 0x0E8: case 0x134: case 0x138: case 0x13C: // MRW, MRW2-4
+  case 0x4A0: case 0x4A4: case 0x4A8: case 0x4AC: // MRW5-8
+  case 0x4B0: case 0x4B4: case 0x4B8: case 0x4BC: // MRW9-12
+  case 0x4C0: case 0x4C4: case 0x4D0:             // MRW13-15
+    return true;
+  default:
+    return false;
   }
+}
+
+// The EMC clock, from CAR. EMC_2X_CLK_SRC picks the input; the _UD inputs
+// bypass the 7.1 EMC_2X_CLK_DIVISOR. The PLLs run at
+// 38.4 MHz / DIVM * DIVN / (DIVP + 1), as Minerva's own table computes.
+static uint32_t emc_rate_khz() {
+  auto pll = [](uint32_t off) -> uint32_t {
+    uint32_t b = mmio_regs.get(CLK_RST_BASE + off);
+    uint32_t m = b & 0xFF, n = (b >> 8) & 0xFF, p = (b >> 20) & 0x1F;
+    return m ? (uint32_t)(38400ull * n / m / (p + 1)) : 0;
+  };
+  uint32_t src = emc.clk_source, in = 0;
+  bool ud = false;
+  switch (src >> 29) {
+  case 0: in = pll(0x090); break;             // PLLM_OUT0
+  case 1: in = pll(0x080); break;             // PLLC_OUT0
+  case 2: in = 408000; break;                 // PLLP_OUT0
+  case 3: in = 38400; break;                  // CLK_M
+  case 4: in = pll(0x090); ud = true; break;  // PLLM_UD
+  case 5: in = pll(0x5E8); ud = true; break;  // PLLMB_UD
+  case 6: in = pll(0x5E8); break;             // PLLMB_OUT0
+  case 7: in = 408000; ud = true; break;      // PLLP_UD
+  }
+  return ud ? in : (uint32_t)(in * 2ull / ((src & 0xFF) + 2));
+}
+
+// MR18/MR19: the DQS interval oscillator count, run time / (2 x tDQS2DQ)
+// (JEDEC LPDDR4). The run time is MR23's setting in clocks (16 x OP up to
+// 63, then 2048, 4096 or 8192) at the current DRAM clock. MR23 = 0 means
+// "stopped by MPC"; that is counted as the 2048-clock setting.
+static uint32_t emc_dqs_osc_count() {
+  uint32_t op = emc.mr[23];
+  uint32_t clocks = op == 0 ? 2048 : op < 64 ? 16 * op
+                  : op < 128 ? 2048 : op < 192 ? 4096 : 8192;
+  uint32_t khz = emc_rate_khz();
+  if (!khz)
+    khz = 204000;
+  uint64_t tck_ps = 1000000000ull / khz;
+  uint64_t count = clocks * tck_ps / (2 * kDramTdqs2dqPs);
+  return (uint32_t)std::min<uint64_t>(std::max<uint64_t>(count, 1), 0xFFFF);
+}
+
+static uint32_t emc_mr_value(EmuState *state, uint32_t ma) {
+  uint32_t v;
+  switch (ma) {
+  case 4:  v = 0x03; break;                        // refresh 1x: normal temp
+  case 5:  v = state->dram_vendor.load(); break;
+  case 6:  v = state->dram_rev_id1.load(); break;
+  case 7:  v = state->dram_rev_id2.load(); break;
+  case 8:  v = state->dram_density.load(); break;
+  case 18: v = emc_dqs_osc_count() & 0xFF; break;
+  case 19: v = emc_dqs_osc_count() >> 8; break;
+  default: v = emc.mr[ma & 0xFF]; break;
+  }
+  return (v & 0xFF) << 8 | (v & 0xFF);            // both dies answer
+}
+
+// Which bank an address is in: -1 broadcast, 0 / 1 a channel.
+static int emc_bank(uint64_t addr) {
+  return addr >= EMC1_BASE ? 1 : addr >= EMC0_BASE ? 0 : -1;
 }
 
 uint32_t emc_read(EmuState *state, uint64_t addr) {
   uint32_t offset = (uint32_t)(addr & 0xFFF);
-  bool per_channel = (addr >= EMC0_BASE);
-
-  if (per_channel) {
-    if (offset == EMC_MRR)
-      return emc_mrx_value(state, g_last_mrr_mrx);
-    return 0;
-  }
-
+  int ch = std::max(emc_bank(addr), 0);   // a broadcast read sees channel 0
   switch (offset) {
-  case EMC_ADR_CFG:    return 0;                          // single rank
-  case EMC_FBIO_CFG7:  return (1u << 1) | (1u << 2);      // ch0 + ch1 enabled
-  case EMC_EMC_STATUS: return EMC_STATUS_MRR_DIVLD;       // MRR data always valid
-  case EMC_MRR:        return emc_mrx_value(state, g_last_mrr_mrx);
-  default:             return 0;
+  case EMC_INTSTATUS:
+    return emc.intstatus;
+  case EMC_MRR:
+    emc.mrr_valid[ch] = false;
+    return emc_mr_value(state, emc.mrr_ma[ch]);
+  case EMC_EMC_STATUS: {
+    // ACPD/DSR FSMs idle (27:24), ZQ FSM idle (22), no outstanding
+    // transactions (2), request FIFO empty (0).
+    uint32_t v = (0xFu << 24) | (1u << 22) | (1u << 2) | (1u << 0);
+    return emc.mrr_valid[ch] ? v | EMC_STATUS_MRR_DIVLD : v;
+  }
+  case EMC_CFG_DIG_DLL:
+    // Bits 31, 30, 26, 4 and 1 are write-1 triggers; they read 0.
+    return mmio_regs.get(addr) & ~0xC4000012u;
+  case EMC_DIG_DLL_STATUS:
+    return (1u << 17) | (1u << 15);        // DLL_PRIV_UPDATED | DLL_LOCK
+  case EMC_CCFIFO_STATUS:
+    return (uint32_t)emc.ccfifo.size();
+  case EMC_FBIO_CFG7:
+    return mmio_regs.get(addr, (1u << 1) | (1u << 2)); // both channels
+  default:
+    return mmio_regs.get(addr);
   }
 }
 
 void emc_write(EmuState *state, uint64_t addr, uint32_t val) {
   (void)state;
   uint32_t offset = (uint32_t)(addr & 0xFFF);
-  if (offset == EMC_MRR && addr < EMC0_BASE) {
-    g_last_mrr_mrx = (val >> 16) & 0xFF;
+  int bank = emc_bank(addr);
+  switch (offset) {
+  case EMC_INTSTATUS:
+    emc.intstatus &= ~val;                 // write 1 to clear
+    return;
+  case EMC_MRR:
+    for (int c = 0; c < 2; c++) {
+      if (bank < 0 || bank == c) {
+        emc.mrr_ma[c] = (val >> 16) & 0xFF;
+        emc.mrr_valid[c] = true;
+      }
+    }
+    emc.intstatus |= EMC_INT_MRR_DIVLD;
+    break;
+  case EMC_CCFIFO_DATA:
+    emc.ccfifo_data = val;
+    break;
+  case EMC_CCFIFO_ADDR:
+    if (emc.ccfifo.size() < kEmcCcfifoDepth)
+      emc.ccfifo.emplace_back(val & 0xFFFF, emc.ccfifo_data);
+    else
+      emc.intstatus |= EMC_INT_CCFIFO_OVERFLOW;
+    break;
+  default:
+    if (emc_is_mrw(offset))
+      emc.mr[(val >> 16) & 0xFF] = (uint8_t)val;
+    break;
   }
+  mmio_regs[addr] = val;
+  if (bank < 0) {
+    mmio_regs[EMC0_BASE + offset] = val;
+    mmio_regs[EMC1_BASE + offset] = val;
+  }
+}
+
+// CAR CLK_SOURCE_EMC was written (clk_rst_write).
+static void emc_clock_source_write(EmuState *state, uint32_t val) {
+  bool change = ((val ^ emc.clk_source) & CAR_EMC_CC_FIELDS) ||
+                (val & CAR_EMC_FORCE_CC_TRIGGER);
+  emc.clk_source = val;
+  if (!change)
+    return;
+  std::vector<std::pair<uint32_t, uint32_t>> fifo;
+  fifo.swap(emc.ccfifo);
+  for (const auto &e : fifo)
+    emc_write(state, EMC_BASE + (e.first & 0xFFF), e.second);
+  emc.intstatus |= EMC_INT_CLKCHANGE_COMPLETE;
 }
 
 // ==================== DSI (display panel ID over MIPI-DSI) ====================
@@ -4688,7 +4886,7 @@ void mmio_soft_reset(EmuState *state, bool power_cycle) {
   car_rst_u = CAR_RST_U_RCM;
   car_enb_u = CAR_ENB_U_RCM;
   g_fuse_ctrl_addr = 0;
-  g_last_mrr_mrx = 5;
+  emc = EmcState();
   g_dsi_pending_dcs_cmd = 0;
   memset(g_dsi_rx_fifo, 0, sizeof(g_dsi_rx_fifo));
   g_dsi_rx_count = g_dsi_rx_pos = 0;

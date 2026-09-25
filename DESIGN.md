@@ -51,18 +51,23 @@ same peripheral models through one dispatch (see [CCPLEX CPU0](#ccplex-cpu0)).
    `uc_mem_write`. We also pre-write the 4-byte cookie `0x544457` ("WDT") at
    IRAM offset `0x4003FF18`. Hekate reads that location during early boot.
    When the cookie is present, it takes the `goto skip_lp0_minerva_config`
-   branch and skips loading both `libsys_lp0.bso` and the Minerva
-   DRAM-training module. Real DRAM training would touch the EMC (External
-   Memory Controller) and MC (Memory Controller), neither of which the
-   emulator models. The matching exception-enable cookie at `0x4003FF1C`
-   stays zero, so the "hang detected" warning is suppressed.
+   branch and skips loading `libsys_lp0.bso` and training the DRAM with the
+   Minerva module, as it does on hardware after a watchdog reset. The EMC
+   model runs Minerva (see [EMC and DRAM clock](#emc-and-dram-clock)), and
+   Nyx trains the DRAM itself when it starts; the cookie only spares a
+   minimal SD image the IPL's "missing lib" errors and shortens the boot.
+   The matching exception-enable cookie at `0x4003FF1C` stays zero, so the
+   "hang detected" warning is suppressed.
 2. PC is set to `0x40010000`, SP to `IPL_STACK_ADDR`. CPSR enters ARM mode.
-3. The IPL (Initial Program Loader) initialises clocks, fuses and the display,
-   then continues straight into the boot menu without loading LP0 or Minerva.
+3. The IPL (Initial Program Loader) initialises clocks, fuses, the DRAM
+   (`sdram_init`, at 204 MHz) and the display, then continues into the boot
+   menu without loading LP0 or Minerva.
 4. Hekate self-relocates into DRAM (`0xC0000000+`) and continues. It points
    DC (Display Controller) window A at its portrait framebuffer and draws its
    boot logo and menus there, sideways, for the landscape-mounted panel.
-5. Nyx (the LVGL GUI) draws landscape into a second framebuffer and has VIC
+5. Nyx (the LVGL GUI) loads Minerva, trains the DRAM at 204, 800 and
+   1600 MHz, and from then on alternates 1600 and 800 MHz on every GUI loop
+   to save power. It draws landscape into a second framebuffer and has VIC
    turn every frame into the portrait surface that window A scans out. The
    display follows the DC's windows, whatever they point at (see Display
    pipeline).
@@ -160,6 +165,38 @@ file with the TRM's reset values, plus the side effects bdk waits on:
 
 The SD card stays at High Speed (48 MHz). UHS-I needs ACMD41 to answer with
 S18A and a CMD11 voltage switch, which the SD model does not do.
+
+### EMC and DRAM clock
+
+The EMC (External Memory Controller, `t210/mmio.cpp`) is a register file -
+reads return what was written, as `sdram_init` programmed it from the BCT -
+with the controller's own behaviour on top (TRM 18.11). That is what bdk's
+mode-register reads and Minerva, hekate's DRAM training and
+frequency-switching module, depend on:
+
+- **Banks.** A write to the broadcast bank (`EMC_BASE`) reaches both
+  channels; `EMC0_BASE` / `EMC1_BASE` address one channel each.
+- **Mode registers.** MRWs (`EMC_MRW`, `EMC_MRW2..15`) are remembered. An
+  MRR latches the answer into the channel's `EMC_MRR` and sets
+  `EMC_EMC_STATUS.MRR_DIVLD` until it is read. MR4 reports a normal
+  temperature, MR5-8 the configured DRAM ID, and MR18/MR19 the DQS interval
+  oscillator count: MR23's run time at the current DRAM clock over twice a
+  400 ps tDQS2DQ. Minerva divides by that count.
+- **Digital DLL.** `EMC_DIG_DLL_STATUS` reports lock as soon as the DLL is
+  (re)started; `EMC_CFG_DIG_DLL.CFG_DLL_EN` reads back as written, which is
+  what Minerva spins on around each DLL restart.
+- **Clock change.** A new source or divisor in CAR `CLK_SOURCE_EMC` (TRM
+  5.2.73) is the CAR/EMC handshake: the EMC replays the writes queued in its
+  clock-change FIFO (`EMC_CCFIFO_DATA` / `_ADDR`) and raises
+  `CLKCHANGE_COMPLETE` in `EMC_INTSTATUS`. The DRAM clock follows from
+  `CLK_SOURCE_EMC` and the PLLM / PLLMB dividers; `PLLMB_BASE` (TRM 5.2.230)
+  locks once enabled, like the other PLLs.
+- **Status.** `EMC_EMC_STATUS` otherwise reports timing updates done, the
+  DRAM active and the state machines idle.
+
+With the stock `bootloader/` folder, Nyx trains 204, 800 and 1600 MHz and
+then switches between 800 and 1600 MHz on every GUI loop, each switch a full
+handshake with a CCFIFO replay.
 
 ### Security Engine (`t210/se_engine.cpp`)
 
@@ -449,8 +486,12 @@ needed. The 64 KB TX log trim happens in-place during the write hook.
   function nibble after `display_init`. The previous behaviour
   (hardcoded `return 0`) silently dropped the muxed function bits and
   made any read-back-style probe see all zeros.
-- **PLLs.** Reads on `PLL_BASE` registers return `ENABLE | LOCK` for any of
-  the PLLs Minerva polls during DRAM training.
+- **PLLs.** PLLP and PLLD always read as measured on a console in RCM (up
+  and locked). The other `_BASE` registers read as measured until the
+  payload programs them (PLLM up but unlocked on Erista, the rest down),
+  then read back what was written, dividers included, with LOCK set
+  whenever ENABLE is. That includes PLLMB, which Minerva moves the EMC onto
+  for a frequency change.
 - **KFUSE.** `STATE` returns `DONE | CRCPASS` immediately so the BDK function
   `kfuse_wait_ready` doesn't hang.
 - **TSEC.** `DMATRFCMD_IDLE` is reported set, and the keygen status word is
@@ -471,7 +512,7 @@ needed. The 64 KB TX log trim happens in-place during the write hook.
   they are tweakable but because the chip-detection code expects exact
   cookies: `MAX17050.DevName=0x00AC`, `BQ24193.VendorPart=0x2F`, the BM92T36
   `FW_TYPE`/`MAN_ID`/`DEV_ID` triple, `TSEC.STATUS=0xB0B0B0B0`,
-  `KFUSE.STATE=DONE|CRCPASS`, `PLL_BASE=ENABLE|LOCK`. Changing them breaks
+  `KFUSE.STATE=DONE|CRCPASS`, `PLL_BASE.LOCK` once enabled. Changing them breaks
   the Hekate init path. They are hardcoded by design.
 
 ## Determinism and the auto-script flag
@@ -608,8 +649,16 @@ sweep; CI runs both.
 These are baked into the current source. Listed here so future maintainers
 don't repeat the diagnosis:
 
-- **Minerva DRAM training** hangs in a `PLL_BASE.LOCK` poll. Fix: always
-  report `LOCK | ENABLE`.
+- **Minerva DRAM training** hangs in a `PLL_BASE.LOCK` poll. Fix: report
+  LOCK once the PLL is enabled.
+- **Minerva hung Nyx** (hekate 6.5.3 with the stock `bootloader/` folder
+  never reached its GUI). Nyx trains the DRAM itself, and Minerva spun on
+  `PLLMB_BASE.LOCK` (the CAR model had no PLLMB and read it as 0). Behind
+  that it would have spun on the DLL-enable bit it writes to
+  `EMC_CFG_DIG_DLL` and on `EMC_DIG_DLL_STATUS` lock, timed out on the
+  clock-change handshake, and divided by a zero MR18/MR19 oscillator count,
+  because every EMC register but three read 0. Fix: PLLMB, and the EMC
+  model described in [EMC and DRAM clock](#emc-and-dram-clock).
 - **`kfuse_wait_ready`** loops on `STATE.DONE`. Fix: stub `DONE | CRCPASS`.
 - **AMS keygen** retries `tsec_query` 15 times until timeout. Fix: stub
   `STATUS = 0xB0B0B0B0`.

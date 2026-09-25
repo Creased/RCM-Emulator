@@ -153,12 +153,13 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
 
     // Pre-set Hekate's "watchdog fired" magic at IRAM 0x4003FF18 (cookie "WDT")
     // so its early boot does `goto skip_lp0_minerva_config`, skipping both
-    // libsys_lp0.bso and the Minerva DRAM-training path. The matching
-    // EXCP_EN_ADDR (0x4003FF1C) is intentionally left zeroed so ERR_EXCEPTION
-    // is *not* set and the user doesn't see a "hang detected" warning screen.
-    // We can't model EMC/MC well enough for real Minerva training, so this is
-    // the cleanest opt-out (the same path Hekate uses on hardware after a
-    // legitimate WDT reset).
+    // libsys_lp0.bso and the IPL's Minerva DRAM training - the same path
+    // Hekate takes on hardware after a WDT reset. The matching EXCP_EN_ADDR
+    // (0x4003FF1C) is intentionally left zeroed so ERR_EXCEPTION is *not* set
+    // and the user doesn't see a "hang detected" warning screen. The EMC
+    // model runs Minerva fine (Nyx trains the DRAM itself when it starts);
+    // this only spares a minimal SD image the IPL's "missing lib" errors and
+    // shortens the boot.
     {
         uint32_t wdt_magic = 0x544457; // "WDT"
         uc_mem_write(uc, 0x4003FF18, &wdt_magic, sizeof(wdt_magic));
@@ -495,7 +496,7 @@ int main(int argc, char *argv[]) {
 
         // Soft reboot: re-write the payload to IRAM, wipe DRAM (so Nyx and
         // the bootloader's file-static caches reset), reset PC/SP/clock and
-        // re-prime the WDT cookie so Hekate's early boot skips Minerva again.
+        // re-prime the WDT cookie so Hekate's IPL skips LP0/Minerva again.
         if (state.reboot_requested.exchange(false)) {
             uc_emu_stop(uc);
             bool cold = state.reboot_cold.exchange(false);
