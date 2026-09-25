@@ -175,7 +175,7 @@ real consoles. Details in [DESIGN.md](DESIGN.md#ccplex-cpu0).
 ## Tests
 
 ```bash
-make test                                   # CCPLEX + display regression payloads (arm-none-eabi-gcc, python3)
+make test                                   # CCPLEX, SE + display regression payloads (arm-none-eabi-gcc, python3)
 tests/hwtest/build.sh build-hwtest          # build hwtest-rcm (+ gcc-aarch64-linux-gnu)
 tests/hwtest/run.sh ./rcm_emu build-hwtest/hwtest-rcm/build/hwtest.bin
 ```
@@ -288,12 +288,12 @@ flowchart LR
     root --> top["main.cpp<br/>emu_state.h<br/>Makefile<br/>Dockerfile<br/>README.md / DESIGN.md"]
     root --> t210["t210/<br/>(SoC peripheral models)"]
     root --> display["display/"]
-    root --> tests["tests/<br/>ccplex/, hwtest/"]
+    root --> tests["tests/<br/>ccplex/, se/, display/, hwtest/"]
 
     t210 --> mmio["mmio.{h,cpp}<br/>memory_map.h<br/>regcache.h, tegra_bl.h"]
     t210 --> cpus["bpmp.{h,cpp} BPMP clock<br/>ccplex.{h,cpp} CPU0 (A57)"]
     t210 --> pcie["pcie.{h,cpp}<br/>root complex + CYW4356"]
-    t210 --> se["se_engine.{h,cpp}<br/>AES-128, SHA-256"]
+    t210 --> se["se_engine.{h,cpp}<br/>AES-128, SHA-256, RSA, RNG"]
     t210 --> i2c["i2c3.{h,cpp}<br/>STMFTS / FTS4 touch"]
 
     display --> sdl["sdl_display.{h,cpp}<br/>DC window scan-out<br/>+ SDL2"]
@@ -314,7 +314,8 @@ For implementation details, see [DESIGN.md](DESIGN.md).
   firmware and the full master-key unwrapping flow are not faithfully emulated.
   `--prod-keys` is a pragmatic shortcut: when Lockpick writes a derived BIS
   (Boot Image Storage) key into a keyslot, the value from the user-supplied key
-  file is substituted. RSA, RNG, and chunked SHA are stubs.
+  file is substituted. The random number generator starts from a fixed
+  seed, so runs repeat.
 - **Single-threaded.** Both cores run in batches on the main thread between
   SDL event polls. That is also what keeps them deterministic.
 

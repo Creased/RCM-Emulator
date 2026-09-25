@@ -260,6 +260,12 @@ constexpr uint32_t SE_CONTEXT_SAVE_CONFIG_REG = 0x070;
 constexpr uint32_t SE_SHA_CONFIG_REG         = 0x200;
 constexpr uint32_t SE_SHA_MSG_LENGTH_REG     = 0x204; // 4 dwords, in bits
 constexpr uint32_t SE_SHA_MSG_LEFT_REG       = 0x214; // 4 dwords, in bits
+constexpr uint32_t SE_RSA_CONFIG_REG         = 0x400;
+constexpr uint32_t SE_RSA_KEY_SIZE_REG       = 0x404;
+constexpr uint32_t SE_RSA_EXP_SIZE_REG       = 0x408;
+constexpr uint32_t SE_RSA_KEYTABLE_ADDR_REG  = 0x420;
+constexpr uint32_t SE_RSA_KEYTABLE_DATA_REG  = 0x424;
+constexpr uint32_t SE_RSA_OUTPUT_REG         = 0x428; // 64 dwords
 
 constexpr uint32_t SE_INT_OP_DONE   = 1u << 4;
 constexpr uint32_t SE_INT_ERR_STAT  = 1u << 16;
@@ -269,6 +275,7 @@ constexpr uint32_t SE_OP_CTX_SAVE = 3;
 
 constexpr uint32_t ALG_RNG = 2;
 constexpr uint32_t ALG_SHA = 3;
+constexpr uint32_t ALG_RSA = 4;
 constexpr uint32_t MODE_SHA256 = 5;
 constexpr uint32_t DST_SRK     = 3;
 constexpr uint32_t DST_RSAREG  = 4;
@@ -343,6 +350,23 @@ static uint32_t hash_result[16]   = {0};
 static uint32_t reg_err_status    = 0;
 static uint32_t reg_rng_config    = 0;
 static uint32_t spare_regs[256]   = {0}; // catch-all for less critical regs
+
+// The two RSA keyslots, as bdk's se_rsa_key_set() loads them: 32-bit words,
+// least significant first (it writes the big-endian key backwards, each word
+// byte-swapped). SE_RSA_KEYTABLE_ADDR picks the word: PKT in 5:0, EXP (0) or
+// MOD (1) in bit 6, the slot in bit 7.
+constexpr int kRsaWords = 64; // 2048 bits
+struct RsaKey { uint32_t exp[kRsaWords]; uint32_t mod[kRsaWords]; };
+static RsaKey   rsa_keys[2];
+static uint32_t rsa_config        = 0;
+static uint32_t rsa_key_size      = 0;
+static uint32_t rsa_exp_size      = 0;
+static uint32_t rsa_keytable_addr = 0;
+static uint32_t rsa_output[kRsaWords] = {0};
+
+// The random number generator's state. The SE's DRBG is seeded from an
+// entropy source; this one starts from a constant, so runs repeat.
+static uint64_t rng_state = 0;
 
 // Secure random key for context save, and the CBC chain the saved blocks
 // are encrypted under. See ctx_save().
@@ -438,6 +462,181 @@ static void run_aes_blocks(uint32_t slot, bool encrypt,
   if (chained && blocks) std::memcpy(ks_table[slot].iv_upd, v, 16);
 }
 
+// ---- RSA: x^e mod n, Montgomery multiplication on 32-bit words -------------
+//
+// Numbers are arrays of words, least significant first, n words long.
+
+static bool big_geq(const uint32_t *a, const uint32_t *b, int n) {
+  for (int i = n - 1; i >= 0; --i)
+    if (a[i] != b[i]) return a[i] > b[i];
+  return true;
+}
+
+static void big_sub(uint32_t *a, const uint32_t *b, int n) {
+  uint64_t borrow = 0;
+  for (int i = 0; i < n; ++i) {
+    uint64_t d = (uint64_t)a[i] - b[i] - borrow;
+    a[i] = (uint32_t)d;
+    borrow = d >> 63;
+  }
+}
+
+// x = (2x + bit) mod m, for x < m.
+static void big_shl1_mod(uint32_t *x, uint32_t bit, const uint32_t *m, int n) {
+  uint32_t carry = bit;
+  for (int i = 0; i < n; ++i) {
+    uint32_t top = x[i] >> 31;
+    x[i] = x[i] << 1 | carry;
+    carry = top;
+  }
+  if (carry || big_geq(x, m, n)) big_sub(x, m, n);
+}
+
+// r = a mod m, a being na words long.
+static void big_mod(const uint32_t *a, int na, const uint32_t *m, int n,
+                    uint32_t *r) {
+  std::memset(r, 0, n * sizeof(uint32_t));
+  for (int i = na * 32 - 1; i >= 0; --i)
+    big_shl1_mod(r, a[i / 32] >> (i % 32) & 1, m, n);
+}
+
+// t = a * b / 2^(32n) mod m, for a, b < m and m odd (CIOS).
+static void mont_mul(const uint32_t *a, const uint32_t *b, const uint32_t *m,
+                     uint32_t minv, int n, uint32_t *out) {
+  uint32_t t[kRsaWords + 2] = {0};
+  for (int i = 0; i < n; ++i) {
+    uint64_t c = 0;
+    for (int j = 0; j < n; ++j) {
+      uint64_t s = (uint64_t)t[j] + (uint64_t)a[j] * b[i] + c;
+      t[j] = (uint32_t)s;
+      c = s >> 32;
+    }
+    uint64_t s = (uint64_t)t[n] + c;
+    t[n] = (uint32_t)s;
+    t[n + 1] = (uint32_t)(s >> 32);
+    uint32_t u = t[0] * minv;
+    c = ((uint64_t)t[0] + (uint64_t)u * m[0]) >> 32;
+    for (int j = 1; j < n; ++j) {
+      s = (uint64_t)t[j] + (uint64_t)u * m[j] + c;
+      t[j - 1] = (uint32_t)s;
+      c = s >> 32;
+    }
+    s = (uint64_t)t[n] + c;
+    t[n - 1] = (uint32_t)s;
+    t[n] = t[n + 1] + (uint32_t)(s >> 32);
+  }
+  if (t[n] || big_geq(t, m, n)) big_sub(t, m, n);
+  std::memcpy(out, t, n * sizeof(uint32_t));
+}
+
+// out = x^e mod m. m must be odd (every RSA modulus is); false if it is not.
+static bool mod_exp(const uint32_t *x, const uint32_t *e, int ne,
+                    const uint32_t *m, int n, uint32_t *out) {
+  if (!(m[0] & 1)) return false;
+  // -1/m mod 2^32 by Newton's iteration; m0 is its own inverse mod 8.
+  uint32_t inv = m[0];
+  for (int i = 0; i < 4; ++i) inv *= 2 - m[0] * inv;
+  uint32_t minv = 0u - inv;
+
+  // R^2 mod m, R = 2^(32n): 1 doubled 64n times.
+  uint32_t r2[kRsaWords] = {0}, one[kRsaWords] = {0};
+  one[0] = 1;
+  big_mod(one, 1, m, n, r2);
+  for (int i = 0; i < 64 * n; ++i) big_shl1_mod(r2, 0, m, n);
+
+  uint32_t xm[kRsaWords], acc[kRsaWords];
+  big_mod(x, n, m, n, xm);
+  mont_mul(xm, r2, m, minv, n, xm);  // x in Montgomery form
+  mont_mul(one, r2, m, minv, n, acc); // 1 in Montgomery form
+  for (int i = ne * 32 - 1; i >= 0; --i) {
+    mont_mul(acc, acc, m, minv, n, acc);
+    if (e[i / 32] >> (i % 32) & 1) mont_mul(acc, xm, m, minv, n, acc);
+  }
+  mont_mul(acc, one, m, minv, n, out);
+  return true;
+}
+
+// SE_OP_START with ALG_RSA, as bdk's se_rsa_exp_mod() drives it: the input
+// arrives over DMA as a little-endian number the size of the modulus, the
+// key comes from the slot in SE_RSA_CONFIG, KEY_SIZE gives the modulus in
+// 512-bit steps and EXP_SIZE the exponent in words. The result goes to
+// SE_RSA_OUTPUT (least significant word first), or to memory.
+static void rsa_op(EmuState *state, uint32_t dst_kind) {
+  const RsaKey &k = rsa_keys[(rsa_config >> 24) & 1];
+  int n = (int)((rsa_key_size & 3) + 1) * 16;
+  int ne = (int)(rsa_exp_size > (uint32_t)kRsaWords ? kRsaWords : rsa_exp_size);
+
+  uint32_t x[kRsaWords] = {0};
+  LLDesc in_ll{};
+  if (read_ll(state->uc, reg_in_ll_addr, &in_ll) && in_ll.size) {
+    uint32_t copy = in_ll.size < (uint32_t)n * 4 ? in_ll.size : n * 4;
+    if (uc_mem_read(state->uc, in_ll.addr, x, copy) != UC_ERR_OK) {
+      op_fail("RSA input", in_ll.addr);
+      return;
+    }
+  }
+
+  std::memset(rsa_output, 0, sizeof(rsa_output));
+  if (!mod_exp(x, k.exp, ne, k.mod, n, rsa_output)) {
+    std::printf("[se] RSA-%d: even modulus, no result\n", n * 32);
+    reg_int_status |= SE_INT_OP_DONE | SE_INT_ERR_STAT;
+    return;
+  }
+  std::printf("[se] RSA-%d exp mod, %d-bit exponent -> ...%08X\n", n * 32,
+              ne * 32, rsa_output[0]);
+
+  if (dst_kind == DST_MEMORY) {
+    LLDesc out_ll{};
+    if (read_ll(state->uc, reg_out_ll_addr, &out_ll) && out_ll.size) {
+      uint32_t copy = out_ll.size < (uint32_t)n * 4 ? out_ll.size : n * 4;
+      if (uc_mem_write(state->uc, out_ll.addr, rsa_output, copy) != UC_ERR_OK) {
+        op_fail("RSA output", out_ll.addr);
+        return;
+      }
+    }
+  }
+  reg_int_status |= SE_INT_OP_DONE;
+}
+
+// SplitMix64: small, and its output has no visible pattern.
+static uint64_t rng_next() {
+  uint64_t z = (rng_state += 0x9E3779B97F4A7C15ull);
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+  return z ^ (z >> 31);
+}
+
+static void rng_fill(uint8_t *p, size_t len) {
+  for (size_t i = 0; i < len; i += 8) {
+    uint64_t v = rng_next();
+    std::memcpy(p + i, &v, len - i < 8 ? len - i : 8);
+  }
+}
+
+// SE_OP_START with ALG_RNG into memory or a keyslot: bdk's se_rng_pseudo()
+// and TegraExplorer's se_generate_random() fill a buffer, SE_CRYPTO_LAST_BLOCK
+// + 1 blocks of it; Atmosphère-style drivers fill a key quad.
+static void rng_op(EmuState *state, uint32_t dst_kind) {
+  uint32_t blocks = (reg_block_count % MAX_AES_BLOCKS) + 1;
+  if (dst_kind == DST_KEYTABLE) {
+    Keyslot &k = ks_table[(reg_keytable_dst >> 8) & 0xF];
+    uint8_t *target[4] = {k.key, k.key + 16, k.iv_orig, k.iv_upd};
+    rng_fill(target[reg_keytable_dst & 0x3], 16);
+  } else if (dst_kind == DST_MEMORY) {
+    LLDesc out_ll{};
+    if (read_ll(state->uc, reg_out_ll_addr, &out_ll) && out_ll.size) {
+      uint32_t len = out_ll.size < blocks * 16 ? out_ll.size : blocks * 16;
+      std::vector<uint8_t> buf(len);
+      rng_fill(buf.data(), len);
+      if (uc_mem_write(state->uc, out_ll.addr, buf.data(), len) != UC_ERR_OK) {
+        op_fail("RNG output", out_ll.addr);
+        return;
+      }
+    }
+  }
+  reg_int_status |= SE_INT_OP_DONE;
+}
+
 // SHA-256, one-shot or in parts (bdk _se_sha_hash_256). SHA_INIT_HASH starts
 // from the standard initial state, SHA_CONTINUE from the state the previous
 // part left in SE_HASH_RESULT - which is where the hardware keeps it, too.
@@ -504,9 +703,13 @@ static void op_start(EmuState *state) {
     return;
   }
 
-  if (dst_kind == DST_RSAREG) {
-    // RSA not implemented — leave output zero.
-    reg_int_status |= SE_INT_OP_DONE;
+  if (enc_alg == ALG_RNG) {
+    rng_op(state, dst_kind);
+    return;
+  }
+
+  if (enc_alg == ALG_RSA) {
+    rsa_op(state, dst_kind);
     return;
   }
 
@@ -667,6 +870,11 @@ static uint32_t keytable_read(uint32_t addr) {
   return v;
 }
 
+static uint32_t &rsa_keytable_word() {
+  RsaKey &k = rsa_keys[(rsa_keytable_addr >> 7) & 1];
+  return ((rsa_keytable_addr >> 6) & 1 ? k.mod : k.exp)[rsa_keytable_addr & 0x3F];
+}
+
 } // namespace
 
 uint32_t se_engine_read(EmuState *state, uint64_t addr) {
@@ -676,6 +884,9 @@ uint32_t se_engine_read(EmuState *state, uint64_t addr) {
   }
   if (off >= SE_CRYPTO_LINEAR_CTR_REG && off < SE_CRYPTO_LINEAR_CTR_REG + 16) {
     return linear_ctr[(off - SE_CRYPTO_LINEAR_CTR_REG) / 4];
+  }
+  if (off >= SE_RSA_OUTPUT_REG && off < SE_RSA_OUTPUT_REG + kRsaWords * 4) {
+    return rsa_output[(off - SE_RSA_OUTPUT_REG) / 4];
   }
   switch (off) {
     case SE_OPERATION_REG:        return reg_op;
@@ -692,6 +903,11 @@ uint32_t se_engine_read(EmuState *state, uint64_t addr) {
     case SE_RNG_CONFIG_REG:       return reg_rng_config;
     case SE_STATUS_REG:           return 0; // IDLE
     case SE_ERR_STATUS_REG:       return reg_err_status;
+    case SE_RSA_CONFIG_REG:       return rsa_config;
+    case SE_RSA_KEY_SIZE_REG:     return rsa_key_size;
+    case SE_RSA_EXP_SIZE_REG:     return rsa_exp_size;
+    case SE_RSA_KEYTABLE_ADDR_REG: return rsa_keytable_addr;
+    case SE_RSA_KEYTABLE_DATA_REG: return rsa_keytable_word();
     default:
       if (off < sizeof(spare_regs)/sizeof(spare_regs[0])*4)
         return spare_regs[off / 4];
@@ -734,6 +950,11 @@ void se_engine_write(EmuState *state, uint64_t addr, uint32_t val) {
     case SE_CRYPTO_KEYTABLE_DST:  reg_keytable_dst = val; return;
     case SE_RNG_CONFIG_REG:       reg_rng_config = val; return;
     case SE_ERR_STATUS_REG:       reg_err_status &= ~val; return;
+    case SE_RSA_CONFIG_REG:       rsa_config = val; return;
+    case SE_RSA_KEY_SIZE_REG:     rsa_key_size = val; return;
+    case SE_RSA_EXP_SIZE_REG:     rsa_exp_size = val; return;
+    case SE_RSA_KEYTABLE_ADDR_REG: rsa_keytable_addr = val; return;
+    case SE_RSA_KEYTABLE_DATA_REG: rsa_keytable_word() = val; return;
     default:
       if (off < sizeof(spare_regs)/sizeof(spare_regs[0])*4)
         spare_regs[off / 4] = val;
@@ -763,6 +984,10 @@ void se_engine_reset() {
   std::memset(spare_regs, 0, sizeof(spare_regs));
   std::memset(srk, 0, sizeof(srk));
   std::memset(ctx_chain, 0, sizeof(ctx_chain));
+  std::memset(rsa_keys, 0, sizeof(rsa_keys));
+  std::memset(rsa_output, 0, sizeof(rsa_output));
+  rsa_config = rsa_key_size = rsa_exp_size = rsa_keytable_addr = 0;
+  rng_state = 0;
 }
 
 // ---- prod.keys parser -------------------------------------------------------

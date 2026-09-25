@@ -21,7 +21,7 @@ flowchart TB
     uc -->|MMIO callbacks| mmio["<b>t210/mmio.cpp</b><br/>mmio_bus_read / mmio_bus_write<br/>shared by both masters"]
 
     mmio --> sdmmc["<b>sdmmc</b><br/>SDMMC1 / SDMMC4<br/>CMD0..21, EXT_CSD, ADMA2<br/>SD UHS-I, eMMC HS400"]
-    mmio --> se["<b>se_engine</b><br/>AES-128, SHA-256<br/>BIS keyslot override"]
+    mmio --> se["<b>se_engine</b><br/>AES-128, SHA-256, RSA, RNG<br/>BIS keyslot override"]
     mmio --> i2c["<b>i2c3</b><br/>STMFTS / FTS4 touch"]
     mmio --> i2c1["<b>I2C_1 slaves</b> (inline)<br/>MAX17050, TMP451,<br/>BQ24193, BM92T36"]
     mmio --> i2c5["<b>I2C_5 slaves</b> (inline)<br/>MAX77620, MAX77621"]
@@ -245,6 +245,18 @@ Models the SE (Security Engine) register block at `0x70012000`. Supports:
   save container hash.
 - **DST_KEYTABLE unwrap path.** The result of a single block is written into
   the destination slot's selected word quad.
+- **RSA** modular exponentiation, as Lockpick's bdk drives it
+  (`se_rsa_key_set()` / `se_rsa_exp_mod()`): two keyslots of up to 2048
+  bits, loaded a word at a time through `SE_RSA_KEYTABLE_ADDR/DATA` (least
+  significant word first), `KEY_SIZE` in 512-bit steps and `EXP_SIZE` in
+  words, the input a little-endian number over DMA and the result in
+  `SE_RSA_OUTPUT` (or memory). Montgomery multiplication on 32-bit words;
+  an even modulus fails the operation.
+- **RNG** into memory or a keyslot quad (`se_rng_pseudo()`, TegraExplorer's
+  `se_generate_random()`): `LAST_BLOCK + 1` blocks, cut to the buffer size.
+  The bytes come from a SplitMix64 generator with a fixed seed, reset with
+  the SE, so runs repeat. Nyx uses them for GPT partition GUIDs and the SD
+  benchmark's random offsets.
 - **Context save** (`SE_OP_CTX_SAVE`), as bdk's `se_aes_ctx_get_keys()` uses
   it to read keyslots back: an RNG op seeds a secure random key (fixed, for
   reproducibility), each saved keyslot quad is written out encrypted under it
@@ -258,10 +270,11 @@ Models the SE (Security Engine) register block at `0x70012000`. Supports:
   alone. For other keyslots, the SE behaves normally.
 
 The 16 keyslots are stored in a flat `Keyslot ks_table[16]` with
-`key[32] / iv_orig[16] / iv_upd[16]`. RSA and RNG output are stubbed: they
-return `OP_DONE` without producing data. Block counts are bounded by what one
+`key[32] / iv_orig[16] / iv_upd[16]`. Block counts are bounded by what one
 linked-list entry can describe (16 MiB), and an operation whose buffers are
 unreachable finishes with `SE_INT_ERR_STAT` instead of computing on zeros.
+`tests/se/` checks RSA-2048 and RSA-1024 both ways against Python, SHA-256
+one-shot and in parts, AES-ECB and the RNG.
 
 ### Touchscreen (`t210/i2c3.cpp`)
 
@@ -676,14 +689,16 @@ final `for(;;) wfe;` would otherwise spin through a billion instructions per
 emulated second.
 
 `make test` runs `tests/ccplex/`, a self-contained payload that checks the
-refusal, the EL3 entry, the mailbox, WFE parking and the reset, and
+refusal, the EL3 entry, the mailbox, WFE parking and the reset;
+`tests/se/`, which runs the SE's RSA, SHA-256, AES and RNG against vectors
+computed in Python (`gen_vectors.py` writes `vectors.h`); and
 `tests/display/`, one payload built per scenario that drives the display
 controller and VIC the way bdk does (a pitch window; Nyx's VIC turn into
 pitch and into block-linear surfaces; a block-linear VIC source; the DC's
 own column scan with an address offset; a mirrored window with window D
 blended over it). `check.py` compares every pixel of the frame the emulator
 shows with the picture the payload drew. `tests/hwtest/` builds hwtest-rcm
-with distro toolchains and runs its whole sweep; CI runs all three.
+with distro toolchains and runs its whole sweep; CI runs all four.
 
 ## Bug history
 
