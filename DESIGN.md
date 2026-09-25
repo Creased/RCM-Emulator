@@ -195,6 +195,10 @@ frequency-switching module, depend on:
   locks once enabled, like the other PLLs.
 - **Status.** `EMC_EMC_STATUS` otherwise reports timing updates done, the
   DRAM active and the state machines idle.
+- **Measured clock.** bdk's PTO counter measures the EMC at the modelled
+  clock (the measured 204 MHz figure at the boot clock).
+- **Not modelled.** The DLL's delay code (`DLL_OUT`) reads 0: the TRM gives
+  no tap delay to derive it from.
 
 With the stock `bootloader/` folder, hekate's IPL trains 204, 800 and
 1600 MHz, and Nyx then switches between 800 and 1600 MHz on every GUI loop,
@@ -481,6 +485,10 @@ needed. The 64 KB TX log trim happens in-place during the write hook.
 
 ### Other peripherals (mostly stubs)
 
+- **CAR and MC.** Registers without behaviour of their own read back what
+  was written - the `CLK_SOURCE_*` dividers, PLL MISC words, the MC's
+  arbitration and address-map configuration - instead of 0. The CAR's
+  SET/CLR alias registers are write strobes and read 0.
 - **PINMUX (`APB_MISC` pad config) and PWM controller (`0x7000A000`).**
   No active behaviour, but reads return whatever the payload last wrote
   via the global `mmio_regs` cache. Hwtest's "Display backlight & PWM"

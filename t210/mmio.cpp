@@ -2185,7 +2185,10 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
     // (Erista/Mariko/Lite/OLED).
     if (offset == 0x50)
       return 4096;
-    return 0;
+    // The rest are configuration registers (arbitration, latency allowance,
+    // carveouts, the EMEM address map sdram_init programs from the BCT):
+    // they read back what was written.
+    return mmio_regs.get(addr);
   }
   // PWM controller (LCD backlight on PWM0, optional fan on PWM1). Same
   // story as PINMUX above — the writes are captured by the global cache
@@ -3145,6 +3148,29 @@ static constexpr uint32_t CAR_ENB_U_RCM = 0x01F00200;
 static uint32_t car_rst_u = CAR_RST_U_RCM;
 static uint32_t car_enb_u = CAR_ENB_U_RCM;
 
+// The EMC clock as CAR sets it (EMC section below).
+static uint32_t emc_rate_khz();
+
+// The SET/CLR aliases of the reset and clock-enable banks (TRM 5.2): write
+// strobes that nothing reads back. They read 0.
+static bool car_is_set_clr_alias(uint32_t off) {
+  switch (off) {
+  case 0x284: case 0x288: case 0x290: case 0x294: // CLK_ENB_X, RST_DEV_X
+  case 0x29C: case 0x2A0: case 0x2A8: case 0x2AC: // CLK_ENB_Y, RST_DEV_Y
+  case 0x300: case 0x304: case 0x308: case 0x30C: // RST_DEV_L, _H
+  case 0x310: case 0x314:                         // RST_DEV_U
+  case 0x320: case 0x324: case 0x328: case 0x32C: // CLK_ENB_L, _H
+  case 0x330: case 0x334:                         // CLK_ENB_U
+  case 0x340: case 0x344:                         // RST_CPU_CMPLX
+  case 0x430: case 0x434: case 0x438: case 0x43C: // RST_DEV_V, _W
+  case 0x440: case 0x444: case 0x448: case 0x44C: // CLK_ENB_V, _W
+  case 0x450: case 0x454: case 0x460: case 0x464: // RST/CLK_CPUG_CMPLX
+    return true;
+  default:
+    return false;
+  }
+}
+
 uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
   uint32_t offset = (uint32_t)(addr - CLK_RST_BASE);
   // PLL_BASE registers (per Hekate bdk/soc/clock.h): each PLL has an _BASE
@@ -3269,7 +3295,11 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
     uint32_t khz = 0;
     switch (src) {
     case 0x1C: khz = mariko ? 407971 : 407980; break; // SCLK / BPMP
-    case 0x24: khz = mariko ? 203991 : 204001; break; // EMC (DRAM)
+    case 0x24: // EMC (DRAM): the modelled clock; measured at the boot clock
+      khz = emc_rate_khz();
+      if (khz == 204000)
+        khz = mariko ? 203991 : 204001;
+      break;
     case 0x23: khz = mariko ? 199673 : 199677; break; // SDMMC4 (eMMC)
     case 0x20: khz = mariko ? 199671 : 199694; break; // SDMMC1 (SD)
     case 0x12: khz = 0; break;   // CCLK_G - A57 cluster is off in RCM
@@ -3313,8 +3343,10 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
     if (pcie_car_read(offset, &v))
       return v;
   }
+  // Everything else is a plain R/W register (the CLK_SOURCE_* dividers,
+  // PLL MISC words, ...): it reads back what was written.
   (void)state;
-  return 0;
+  return car_is_set_clr_alias(offset) ? 0 : mmio_regs.get(addr);
 }
 
 // A CLK_SOURCE_EMC write is the CAR/EMC clock-change handshake (EMC below).
@@ -3325,8 +3357,7 @@ void clk_rst_write(EmuState *state, uint64_t addr, uint32_t val) {
   uint32_t offset = (uint32_t)(addr - CLK_RST_BASE);
   // The _U pair is live (bdk reaches it through the SET/CLR aliases), and
   // CLK_SOURCE_EMC starts an EMC clock change. Everything else only lands
-  // in the write hook's mmio_regs cache, which clk_rst_read consults for
-  // the registers it reads back (CLK_SOURCE_UARTD, the EMC clock sources).
+  // in the write hook's mmio_regs cache, which clk_rst_read hands back.
   switch (offset) {
   case 0x00C: car_rst_u  =  val; break; // RST_DEVICES_U, direct write
   case 0x018: car_enb_u  =  val; break; // CLK_OUT_ENB_U, direct write
