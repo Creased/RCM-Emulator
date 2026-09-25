@@ -43,6 +43,10 @@ void     padctl_write(EmuState *state, uint64_t addr, uint32_t val);
 void     pcie_car_write(uint32_t offset, uint32_t val);
 bool     pcie_car_read(uint32_t offset, uint32_t *out);
 
+// MSELECT clocked out of reset (RST_DEV_V bit 3 clear). The CCPLEX needs it
+// as much as PCIe does: it is the CPU cluster's path to every slave.
+bool     pcie_mselect_up();
+
 // The PCIE power partition, toggled through PMC_PWRGATE_TOGGLE.
 void     pcie_set_powergate(bool ungated);
 

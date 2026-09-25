@@ -22,9 +22,11 @@
 #include <unicorn/unicorn.h>
 
 #include "emu_state.h"
-#include <string>
+#include "platform.h"
 #include "payload_picker.h"
 #include "trace.h"
+#include "t210/bpmp.h"
+#include "t210/ccplex.h"
 #include "t210/memory_map.h"
 #include "t210/mmio.h"
 #include "display/sdl_display.h"
@@ -41,9 +43,15 @@ static uint8_t *load_payload(const char *path, size_t *out_size) {
         return nullptr;
     }
 
-    fseek(f, 0, SEEK_END);
-    size_t size = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    long len = -1;
+    if (fseek(f, 0, SEEK_END) == 0)
+        len = ftell(f);
+    if (len <= 0 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        fprintf(stderr, "[error] Payload is empty or unreadable: %s\n", path);
+        return nullptr;
+    }
+    size_t size = (size_t)len;
 
     uint8_t *buf = (uint8_t *)malloc(size);
     if (!buf) {
@@ -83,42 +91,6 @@ static uint8_t *load_payload(const char *path, size_t *out_size) {
 
 // ==================== Emulation Setup ====================
 
-// Global for instruction tracing
-static uint32_t pc_trace[2000];
-static size_t pc_trace_idx = 0;
-static uint32_t last_valid_block = 0;
-static uc_hook trace_h, block_h;
-
-static void trace_callback(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
-    static uint32_t last_pc = 0;
-    if (address == last_pc) return;
-    last_pc = (uint32_t)address;
-
-    pc_trace[pc_trace_idx] = (uint32_t)address;
-    pc_trace_idx = (pc_trace_idx + 1) % 2000;
-    
-    // NOP-slide detection
-    if (address >= 0x40030000 && address < 0x41000000) {
-        uint16_t insn = 0;
-        if (uc_mem_read(uc, address, &insn, 2) == UC_ERR_OK && insn == 0) {
-            static int nop_count = 0;
-            if (++nop_count > 10) {
-                printf("\n[emu] NOP-slide detected at 0x%08llX! Last valid block: 0x%08X\n", 
-                       (unsigned long long)address, last_valid_block);
-                uc_emu_stop(uc);
-            }
-        } else {
-            // nop_count = 0; // would need a persistent counter
-        }
-    }
-}
-
-static void block_callback(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
-    if (address >= 0x40000000 && address < 0x40030000) {
-        last_valid_block = (uint32_t)address;
-    }
-}
-
 static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payload_size) {
     uc_engine *uc;
     uc_err err;
@@ -131,9 +103,12 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
     }
     state->uc = uc;
 
-    // Setup hooks
-    uc_hook_add(uc, &trace_h, UC_HOOK_CODE, (void*)trace_callback, nullptr, 1, 0);
-    uc_hook_add(uc, &block_h, UC_HOOK_BLOCK, (void*)block_callback, nullptr, 1, 0);
+    // No UC_HOOK_CODE anywhere: a per-instruction callback keeps Unicorn off
+    // its fast path for every block it covers. This used to register three
+    // of them (one of them twice) - an instruction-trace ring buffer nothing
+    // read, a NOP-slide check that did a uc_mem_read per instruction, and
+    // the clock. The clock and the NOP-slide check now run once per block
+    // (t210/bpmp.cpp).
 
     // Enable VFP/NEON
     uint32_t cpacr = 0x00F00000;
@@ -152,8 +127,6 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
            (unsigned long long)(IRAM_BASE + IRAM_SIZE),
            (unsigned)(IRAM_SIZE / 1024));
 
-    uc_mem_write(uc, IPL_LOAD_ADDR, payload, payload_size);
-
     // Pre-set Hekate's "watchdog fired" magic at IRAM 0x4003FF18 (cookie "WDT")
     // so its early boot does `goto skip_lp0_minerva_config`, skipping both
     // libsys_lp0.bso and the Minerva DRAM-training path. The matching
@@ -166,9 +139,6 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
         uint32_t wdt_magic = 0x544457; // "WDT"
         uc_mem_write(uc, 0x4003FF18, &wdt_magic, sizeof(wdt_magic));
     }
-
-    // Setup instruction tracing
-    uc_hook_add(uc, &trace_h, UC_HOOK_CODE, (void*)trace_callback, nullptr, 1, 0);
 
     // ---- Map DRAM as one contiguous region ----
     // 0x80000000 .. 0x100000000, i.e. the whole 32-bit-addressable DRAM window
@@ -229,14 +199,10 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
     // ---- Nyx Storage (16MB @ 0xED000000) ----
     // Already mapped as part of 2GB DRAM chunk
 
-    // ---- Map Peripherals (PWM, SDMMC, etc.) ----
-    // Map individual pages to allow MMIO hooks
-    // The mappings previously declared manually were moved here:
-    // Some are mapped earlier in setup_emulation properly using FB_BASE e.g.
-    uc_mem_map(uc, 0x7000A000, 0x1000, UC_PROT_ALL); // PWM
-    uc_mem_map(uc, 0x700B0000, 0x1000, UC_PROT_ALL); // SDMMC1
-    uc_mem_map(uc, 0x7000E000, 0x1000, UC_PROT_ALL); // RTC/PMC
-    uc_mem_map(uc, 0x6000C000, 0x2000, UC_PROT_ALL); // SYSREG/APB_SEMAPH
+    // Peripherals are all mapped by mmio_init() below as MMIO windows. PWM,
+    // SDMMC1, RTC/PMC and SYSREG used to be mapped here first as plain RAM,
+    // which only worked because MMIO was a pair of address-range hooks over
+    // whatever happened to be mapped.
 
     // BootROM (iROM) at 0x100000, 96 KB. We don't have the real BootROM
     // contents, but mapping the region as zero-filled lets Hekate's "Bootrom
@@ -267,9 +233,10 @@ static uc_engine *setup_emulation(EmuState *state, uint8_t *payload, size_t payl
 
     printf("[emu] Initial PC=0x%08X SP=0x%08X\n", pc, sp);
 
-    // ---- Setup MMIO hooks ----
+    // ---- Peripherals and the deterministic clock ----
     mmio_init(uc, state);
-    printf("[emu] MMIO hooks registered\n");
+    bpmp_attach(uc, state);
+    printf("[emu] MMIO windows mapped\n");
 
     return uc;
 }
@@ -420,12 +387,12 @@ int main(int argc, char *argv[]) {
     }
 
     if (sd_path) {
-        state.sd_fd = open(sd_path, O_RDWR);
+        state.sd_fd = open(sd_path, O_RDWR | O_BINARY);
         if (state.sd_fd < 0) perror("[emu] Failed to open SD image");
         else printf("[emu] SD image opened: %s\n", sd_path);
     }
     if (boot0_path) {
-        state.emmc_boot0_fd = open(boot0_path, O_RDWR);
+        state.emmc_boot0_fd = open(boot0_path, O_RDWR | O_BINARY);
         if (state.emmc_boot0_fd < 0) perror("[emu] Failed to open BOOT0 image");
         else printf("[emu] BOOT0 image opened: %s\n", boot0_path);
     }
@@ -433,7 +400,7 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < 16; i++) {
             char path[512];
             snprintf(path, sizeof(path), "%s.%02d", rawnand_prefix, i);
-            int fd = open(path, O_RDWR);
+            int fd = open(path, O_RDWR | O_BINARY);
             if (fd >= 0) {
                 state.emmc_gpp_fds.push_back(fd);
                 // printf("[emu] rawnand part %02d opened: %s\n", i, path);
@@ -480,6 +447,11 @@ int main(int argc, char *argv[]) {
 
     const uint64_t BATCH_INSTRUCTIONS = 100000; // Instructions per batch
     const int DISPLAY_UPDATE_MS = 16;           // ~60 FPS
+    // While CPU0 is running the two cores advance in lockstep slices of this
+    // many BPMP instructions (250 us of emulated time). The BPMP polls CPU0's
+    // mailbox every 500 us, so neither side ever waits on a stale view of the
+    // other for longer than one of its own poll intervals.
+    const uint64_t CPU0_QUANTUM_INSTRUCTIONS = 2500;
 
     auto last_display_update = std::chrono::steady_clock::now();
 
@@ -492,9 +464,16 @@ int main(int argc, char *argv[]) {
         // re-prime the WDT cookie so Hekate's early boot skips Minerva again.
         if (state.reboot_requested.exchange(false)) {
             uc_emu_stop(uc);
+            // The SoC resets as a whole: CPU0 back into reset, the PCIe root
+            // complex back to power-on, the clock's half-counted block gone.
+            mmio_soft_reset(&state);
+            bpmp_clock_reset();
             // One contiguous block now; dram_ptr is a view into it.
             memset(state.dram_low_ptr, 0, DRAM_WINDOW_SIZE);
-            uc_mem_write(uc, IPL_LOAD_ADDR, state.payload_ptr, state.payload_len);
+            size_t reload = state.payload_len;
+            if (reload > IRAM_SIZE - (IPL_LOAD_ADDR - IRAM_BASE))
+                reload = IRAM_SIZE - (IPL_LOAD_ADDR - IRAM_BASE);
+            uc_mem_write(uc, IPL_LOAD_ADDR, state.payload_ptr, reload);
             uint32_t wdt_magic = 0x544457;
             uc_mem_write(uc, 0x4003FF18, &wdt_magic, sizeof(wdt_magic));
             uint32_t reset_pc = IPL_LOAD_ADDR;
@@ -506,6 +485,7 @@ int main(int argc, char *argv[]) {
             state.fb_addr = FB_BASE; // re-point display at the FB base
             state.emu_usec   = 0;
             state.insn_count = 0;
+            state.bpmp_slept_us = 0;
             state.touch_phase = 0;
             state.paused = false;
             printf("[emu] Soft reboot complete (DRAM wiped)\n");
@@ -644,17 +624,34 @@ int main(int argc, char *argv[]) {
                        state.touch_x, state.touch_y);
             }
 
-            // Run a batch of ARM instructions
-            uint32_t start_addr = pc;
-            if (cpsr & (1 << 5)) start_addr |= 1;
+            // Run a batch of ARM instructions. With CPU0 up, the batch is cut
+            // into lockstep slices: the BPMP runs a quantum, then CPU0 runs up
+            // to the same emulated time. Scripted input and the display are
+            // still serviced once per full batch, as before.
+            uint64_t batch_end = state.insn_count + BATCH_INSTRUCTIONS;
+            while (state.running && !state.paused &&
+                   state.insn_count < batch_end) {
+                uint64_t budget = batch_end - state.insn_count;
+                if (ccplex_cpu0_running() && budget > CPU0_QUANTUM_INSTRUCTIONS)
+                    budget = CPU0_QUANTUM_INSTRUCTIONS;
 
-            uc_err err = uc_emu_start(uc, start_addr, 0, 0, BATCH_INSTRUCTIONS);
-            if (err != UC_ERR_OK) {
-                uint32_t error_pc;
-                uc_reg_read(uc, UC_ARM_REG_PC, &error_pc);
-                fprintf(stderr, "\n[emu] FATAL: Emulation error at PC=0x%08X: %s\n", error_pc, uc_strerror(err));
-                state.running = false;
-                break;
+                uc_reg_read(uc, UC_ARM_REG_PC, &pc);
+                uc_reg_read(uc, UC_ARM_REG_CPSR, &cpsr);
+                uint32_t start_addr = pc;
+                if (cpsr & (1 << 5)) start_addr |= 1;
+
+                uc_err err = bpmp_run(uc, &state, start_addr, budget);
+                if (err != UC_ERR_OK) {
+                    uint32_t error_pc;
+                    uc_reg_read(uc, UC_ARM_REG_PC, &error_pc);
+                    fprintf(stderr, "\n[emu] FATAL: Emulation error at PC=0x%08X: %s\n", error_pc, uc_strerror(err));
+                    state.running = false;
+                    break;
+                }
+                // CPU0 catches up to the BPMP's clock.
+                ccplex_run(&state, state.emu_usec);
+                if (state.reboot_requested.load())
+                    break;
             }
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -689,6 +686,7 @@ int main(int argc, char *argv[]) {
     console_window_shutdown();
     config_window_shutdown();
     sdl_display_shutdown();
+    ccplex_reset(&state);   // closes CPU0's engine, if one is up
     uc_close(uc);
 
     free(state.iram_ptr);

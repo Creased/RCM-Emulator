@@ -30,6 +30,8 @@ static bool event_targets_window(const SDL_Event &ev, Uint32 wid) {
 static SDL_Window *window = nullptr;
 static SDL_Renderer *renderer = nullptr;
 static SDL_Texture *texture = nullptr;
+// The last converted frame (ARGB8888, out_w x out_h), reused across updates.
+static std::vector<uint32_t> g_frame;
 static int g_swizzle_override =
     -1; // -1 = Auto, 0 = Pitch Linear, 2 = Block Linear
 
@@ -41,8 +43,10 @@ bool sdl_display_init() {
                             SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
   if (!window)
     return false;
-  renderer = SDL_CreateRenderer(
-      window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+  // No PRESENTVSYNC. The CPU runs on this same thread and the main loop
+  // already paces redraws to ~60 Hz by wall clock; with vsync on, each
+  // SDL_RenderPresent could block the emulated CPU for up to a whole frame.
+  renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
   if (!renderer)
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
   if (!renderer)
@@ -230,10 +234,61 @@ void sdl_display_update(EmuState *state, uc_engine *uc) {
   if (fb_size > 32 * 1024 * 1024)
     fb_size = 32 * 1024 * 1024;
 
-  std::vector<uint8_t> buf(fb_size);
-  if (uc_mem_read(uc, eff_addr, buf.data(), fb_size) == UC_ERR_OK) {
-    std::vector<uint32_t> proc(out_w * out_h,
-                               0xFF000000); // Initialize opaque black
+  // The surface is read straight out of the host memory backing emulated
+  // DRAM when it lives there (it always does for hekate/Nyx), instead of a
+  // uc_mem_read into a fresh 3.5 MB vector - and the converted frame reuses
+  // one buffer too. The old code allocated and zero-filled two such vectors
+  // on every frame, 60 times a second, which showed up in profiles as page-
+  // fault and munmap churn on the emulation thread.
+  static std::vector<uint8_t> fallback;
+  const uint8_t *src = nullptr;
+  if (state->dram_low_ptr && eff_addr >= DRAM_BASE &&
+      eff_addr + fb_size <= DRAM_BASE + DRAM_WINDOW_SIZE) {
+    src = state->dram_low_ptr + (eff_addr - DRAM_BASE);
+  } else {
+    fallback.resize(fb_size);
+    if (uc_mem_read(uc, eff_addr, fallback.data(), fb_size) == UC_ERR_OK)
+      src = fallback.data();
+  }
+
+  // Skip the de-swizzle and the texture upload when neither the surface
+  // bytes nor the way they are laid out has changed since the last frame -
+  // the common case for a payload sitting on a menu or waiting on hardware.
+  struct Layout {
+    uint64_t addr = 0;
+    uint32_t w = 0, h = 0, stride = 0, sw = 0, bh = 0, gobs = 0, out_w = 0,
+             out_h = 0;
+    int rot = 0;
+    bool operator==(const Layout &o) const {
+      return addr == o.addr && w == o.w && h == o.h && stride == o.stride &&
+             sw == o.sw && bh == o.bh && gobs == o.gobs && out_w == o.out_w &&
+             out_h == o.out_h && rot == o.rot;
+    }
+  };
+  static Layout last_layout;
+  static std::vector<uint8_t> last_src;
+  Layout layout;
+  layout.addr = eff_addr;
+  layout.w = width;
+  layout.h = height;
+  layout.stride = eff_stride;
+  layout.sw = sw;
+  layout.bh = bh;
+  layout.gobs = sw_gobs;
+  layout.out_w = out_w;
+  layout.out_h = out_h;
+  layout.rot = rot;
+  bool unchanged = src && layout == last_layout && last_src.size() == fb_size &&
+                   memcmp(last_src.data(), src, fb_size) == 0;
+  static bool snapshot_pending = true;
+
+  if (src && !unchanged) {
+    last_layout = layout;
+    last_src.assign(src, src + fb_size);
+    snapshot_pending = true;
+    const uint8_t *buf_data = src;
+    std::vector<uint32_t> &proc = g_frame;
+    proc.assign((size_t)out_w * out_h, 0xFF000000); // opaque black
 
     for (uint32_t sy = 0; sy < height; sy++) {
       for (uint32_t sx = 0; sx < width; sx++) {
@@ -269,7 +324,7 @@ void sdl_display_update(EmuState *state, uc_engine *uc) {
             uint32_t byte_off = gob_idx * 512 + gob_off;
             // Read 16-bit pixel and expand to 32-bit ARGB
             if (byte_off + 2 <= fb_size) {
-              uint16_t u16 = *(uint16_t *)&buf[byte_off];
+              uint16_t u16 = *(const uint16_t *)&buf_data[byte_off];
               uint32_t p = (((u16 >> 11) & 0x1F) << 19) |
                            (((u16 >> 5) & 0x3F) << 10) |
                            ((u16 & 0x1F) << 3) | 0xFF000000;
@@ -290,7 +345,7 @@ void sdl_display_update(EmuState *state, uc_engine *uc) {
         }
 
         if (off < fb_size / 4) {
-          uint32_t p = ((uint32_t *)buf.data())[off];
+          uint32_t p = ((const uint32_t *)buf_data)[off];
           uint32_t dx = sx, dy = sy;
 
           switch (rot) {
@@ -317,12 +372,17 @@ void sdl_display_update(EmuState *state, uc_engine *uc) {
       }
     }
     SDL_UpdateTexture(texture, nullptr, proc.data(), out_w * 4);
+  }
 
-    // Snapshot for PNG conversion — save periodically (~1s) so the last
-    // written file always reflects the most recent frame content.
+  if (src) {
+    // Snapshot for PNG conversion — at most once a second (~60 frames), and
+    // only when the frame has changed since the last one written, so an idle
+    // payload no longer rewrites a 3.5 MB file every second.
     static int snap_counter = 0;
-    if (++snap_counter >= 60) { // ~1 second at 60 FPS
+    const std::vector<uint32_t> &proc = g_frame;
+    if (++snap_counter >= 60 && snapshot_pending && !proc.empty()) {
       snap_counter = 0;
+      snapshot_pending = false;
       FILE *f = fopen("last_fb.rgba", "wb");
       if (f) {
         fwrite(proc.data(), 1, proc.size() * 4, f);

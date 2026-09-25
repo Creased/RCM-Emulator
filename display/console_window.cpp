@@ -165,7 +165,13 @@ bool console_window_init()
         fprintf(stderr, "[console_window] SDL_CreateWindow failed: %s\n", SDL_GetError());
         return false;
     }
-    g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    // No PRESENTVSYNC: this window renders on the emulation thread, and
+    // vsync would stall the emulated CPU for up to a frame per present.
+    g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED);
+    // Same fallback as the main window: no GPU renderer (a headless run, a
+    // VM without GL) should not cost the window altogether.
+    if (!g_renderer)
+        g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE);
     if (!g_renderer) {
         fprintf(stderr, "[console_window] SDL_CreateRenderer failed: %s\n", SDL_GetError());
         SDL_DestroyWindow(g_window);

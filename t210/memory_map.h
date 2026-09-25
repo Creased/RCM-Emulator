@@ -147,9 +147,18 @@ constexpr uint64_t HOST1X_SIZE = 0x40000;
 constexpr uint64_t BPMP_CACHE_BASE = 0x50040000;
 constexpr uint64_t BPMP_CACHE_SIZE = 0x1000;
 
-// System Registers (SYSREG)
+// System Registers (SYSREG). SB (secure boot) sits at +0x200 and holds the
+// CCPLEX's AArch64 reset vector (SB_AA64_RESET_LOW/HIGH, +0x230/+0x234).
 constexpr uint64_t SYSREG_BASE = 0x6000C000;
 constexpr uint64_t SYSREG_SIZE = 0x1000;
+
+// Flow controller: BPMP/CPU halt events, cluster control, RAM repair.
+constexpr uint64_t FLOW_CTLR_BASE = 0x60007000;
+constexpr uint64_t FLOW_CTLR_SIZE = 0x1000;
+
+// Exception vectors, incl. EVP_CPU_RESET_VECTOR (+0x100) for AArch32 boot.
+constexpr uint64_t EXCP_VEC_BASE = 0x6000F000;
+constexpr uint64_t EXCP_VEC_SIZE = 0x1000;
 
 // I2S (Audio)
 constexpr uint64_t I2S_BASE = 0x702D1000;
