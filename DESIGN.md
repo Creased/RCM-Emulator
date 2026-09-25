@@ -59,6 +59,11 @@ same peripheral models through one dispatch (see [CCPLEX CPU0](#ccplex-cpu0)).
    hardware (see [EMC and DRAM clock](#emc-and-dram-clock)). An SD image
    without those modules gets hekate's "Missing LP0 (sleep) lib! / Missing
    Minerva lib!" screen, which waits for a key press before the menu.
+   hekate prints "Missing Minerva lib!" for any Minerva failure, not only a
+   missing file: Minerva also refuses to start unless HIDREV reads chip
+   0x21 and `FUSE_SKU_INFO` (0x110) reads 0x83 (ODIN). Both hold by
+   default; a `[fuses]` edit to 0x110 in the config window or
+   `rcm_emu.ini` brings the screen back.
 4. Hekate self-relocates into DRAM (`0xC0000000+`) and continues. It points
    DC (Display Controller) window A at its portrait framebuffer and draws its
    boot logo and menus there, sideways, for the landscape-mounted panel.

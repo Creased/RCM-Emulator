@@ -759,7 +759,7 @@ void build_ui(EmuState *state) {
         // Each row corresponds to a FUSE_BASE offset in Hekate's
         // bdk/soc/fuse.h. Defaults match a typical Erista golden sample.
         atomic_hex_input("0x100 PRODUCTION_MODE",  state->fuse_at(0x100));
-        atomic_hex_input("0x110 SKU_INFO",         state->fuse_at(0x110));
+        atomic_hex_input("0x110 SKU_INFO (0x83 ODIN; Minerva needs it)", state->fuse_at(0x110));
         atomic_hex_input("0x114 CPU_SPEEDO_0",     state->fuse_at(0x114));
         atomic_hex_input("0x118 CPU_IDDQ",         state->fuse_at(0x118));
         atomic_hex_input("0x128 OPT_FT_REV",       state->fuse_at(0x128));
