@@ -526,8 +526,15 @@ needed. The 64 KB TX log trim happens in-place during the write hook.
 
 - **CAR and MC.** Registers without behaviour of their own read back what
   was written - the `CLK_SOURCE_*` dividers, PLL MISC words, the MC's
-  arbitration and address-map configuration - instead of 0. The CAR's
-  SET/CLR alias registers are write strobes and read 0.
+  arbitration and address-map configuration - instead of 0.
+- **CAR reset and clock-enable banks.** `RST_DEVICES_x` and `CLK_OUT_ENB_x`
+  (L, H, U, V, W, X, Y) follow direct writes and their SET/CLR strobes, and
+  a read of any of the three returns the bank (TRM 5.2.100) - bdk's
+  `clock_sdmmc_is_active()` reads `RST_DEV_L_SET` and `CLK_ENB_L_SET`. The
+  PCIe and CPU models keep reset banks V, W, Y and clock bank V. The rest
+  start at the TRM reset values (bank U at a real console's reading), so at
+  RCM entry the display is unclocked and `display_init()` does not begin
+  with a panel teardown.
 - **PINMUX (`APB_MISC` pad config) and PWM controller (`0x7000A000`).**
   No active behaviour, but reads return whatever the payload last wrote
   via the global `mmio_regs` cache. Hwtest's "Display backlight & PWM"
@@ -707,6 +714,10 @@ don't repeat the diagnosis:
 
 - **Minerva DRAM training** hangs in a `PLL_BASE.LOCK` poll. Fix: report
   LOCK once the PLL is enabled.
+- **Every payload began with a display teardown.** `CLK_OUT_ENB_L` read a
+  real console's value taken after a payload had brought the display up, so
+  `display_init()` found DISP1 already clocked at RCM entry. Fix: the bank
+  starts at the TRM reset value and follows the payload's writes.
 - **Minerva hung Nyx** (hekate 6.5.3 with the stock `bootloader/` folder
   never reached its GUI). The emulator planted hekate's "watchdog fired"
   cookie in IRAM so the IPL would skip Minerva; Nyx then trained the DRAM

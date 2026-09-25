@@ -3260,51 +3260,73 @@ static void flow_write(EmuState *state, uint64_t addr, uint32_t val) {
 
 // ==================== Clock/Reset ====================
 
-// ---- RST_DEVICES_U / CLK_OUT_ENB_U -----------------------------------------
+// ---- Reset and clock-enable banks (TRM 5.2) ---------------------------------
 //
-// bdk never writes these two directly: clock_enable() goes through the SET and
-// CLR aliases (RST_DEV_U_SET 0x310 / _CLR 0x314, CLK_ENB_U_SET 0x330 / _CLR
-// 0x334). With clk_rst_write a no-op and both reads hardcoded, enabling a _U
-// peripheral had no observable effect at all -- clock_enable_uart(UART_D) ran
-// to completion and the payload's own "is this port clocked?" gate then read
-// CLK_U_UARTD clear and aborted. Both seeds are the values measured on a real
-// console at that point in the sweep.
+// RST_DEVICES_x and CLK_OUT_ENB_x for banks L, H, U, V, W, X and Y. Each is
+// written directly or through its SET and CLR strobes, and all three read
+// back the bank: "for reads, you can use either method to retrieve the
+// reset/clock-enable state" (TRM 5.2.100). bdk relies on both halves -
+// clock_enable() goes through the strobes, clock_sdmmc_is_active() reads
+// RST_DEV_L_SET and CLK_ENB_L_SET, and display_init() tears the panel down
+// first when CLK_OUT_ENB_L already has DISP1 on.
 //
-// Note the previous CLK_OUT_ENB_U value force-set bit 15 with a comment about
-// keeping SDMMC4 alive; bit 15 of the _U register is DTV (deprecated). SDMMC4
-// is CLK_L bit 15, which the hardcoded _L value 0x9802D1B0 already carries, so
-// dropping the forced bit costs the storage model nothing and lets _U match
-// hardware exactly.
-static constexpr uint32_t CAR_RST_U_RCM = 0x828EC5F8;
-static constexpr uint32_t CAR_ENB_U_RCM = 0x01F00200;
-static uint32_t car_rst_u = CAR_RST_U_RCM;
-static uint32_t car_enb_u = CAR_ENB_U_RCM;
+// The PCIe and CPU models keep reset banks V, W and Y and clock bank V,
+// because their preconditions depend on them; the table only routes reads
+// of those strobes to them. The rest start from the TRM reset values
+// (unknown bits as 0), except bank U, which is what a real console read.
+// The L, H and X clock banks used to be real-console readings too, but
+// taken after a payload had brought the display up - so every payload
+// found DISP1 already clocked at RCM entry and began with a panel teardown.
+struct CarBank {
+  uint16_t reg, set, clr;
+  bool own;       // false: another model holds this bank
+  uint32_t seed;
+};
+static const CarBank kCarBanks[] = {
+    {0x004, 0x300, 0x304, true,  0x1CD3D2C8}, // RST_DEVICES_L
+    {0x008, 0x308, 0x30C, true,  0x87D1F326}, // RST_DEVICES_H
+    {0x00C, 0x310, 0x314, true,  0x828EC5F8}, // RST_DEVICES_U (measured)
+    {0x358, 0x430, 0x434, false, 0},          // RST_DEVICES_V (pcie.cpp)
+    {0x35C, 0x438, 0x43C, false, 0},          // RST_DEVICES_W (pcie.cpp)
+    {0x28C, 0x290, 0x294, true,  0x01E42049}, // RST_DEVICES_X
+    {0x2A4, 0x2A8, 0x2AC, false, 0},          // RST_DEVICES_Y (pcie.cpp)
+    {0x010, 0x320, 0x324, true,  0x80000130}, // CLK_OUT_ENB_L
+    {0x014, 0x328, 0x32C, true,  0x00000080}, // CLK_OUT_ENB_H
+    {0x018, 0x330, 0x334, true,  0x01F00200}, // CLK_OUT_ENB_U (measured)
+    {0x360, 0x440, 0x444, false, 0},          // CLK_OUT_ENB_V (ccplex.cpp)
+    {0x364, 0x448, 0x44C, true,  0x402000FC}, // CLK_OUT_ENB_W
+    {0x280, 0x284, 0x288, true,  0x23000780}, // CLK_OUT_ENB_X
+    {0x298, 0x29C, 0x2A0, true,  0x00000300}, // CLK_OUT_ENB_Y
+};
+constexpr size_t kCarBankCount = sizeof(kCarBanks) / sizeof(kCarBanks[0]);
+
+struct CarBanks {
+  uint32_t v[kCarBankCount];
+  CarBanks() {
+    for (size_t i = 0; i < kCarBankCount; ++i)
+      v[i] = kCarBanks[i].seed;
+  }
+};
+static CarBanks car_banks;
+
+static const CarBank *car_bank_of(uint32_t off) {
+  for (const CarBank &b : kCarBanks)
+    if (off == b.reg || off == b.set || off == b.clr)
+      return &b;
+  return nullptr;
+}
 
 // The EMC clock as CAR sets it (EMC section below).
 static uint32_t emc_rate_khz();
 
-// The SET/CLR aliases of the reset and clock-enable banks (TRM 5.2): write
-// strobes that nothing reads back. They read 0.
-static bool car_is_set_clr_alias(uint32_t off) {
-  switch (off) {
-  case 0x284: case 0x288: case 0x290: case 0x294: // CLK_ENB_X, RST_DEV_X
-  case 0x29C: case 0x2A0: case 0x2A8: case 0x2AC: // CLK_ENB_Y, RST_DEV_Y
-  case 0x300: case 0x304: case 0x308: case 0x30C: // RST_DEV_L, _H
-  case 0x310: case 0x314:                         // RST_DEV_U
-  case 0x320: case 0x324: case 0x328: case 0x32C: // CLK_ENB_L, _H
-  case 0x330: case 0x334:                         // CLK_ENB_U
-  case 0x340: case 0x344:                         // RST_CPU_CMPLX
-  case 0x430: case 0x434: case 0x438: case 0x43C: // RST_DEV_V, _W
-  case 0x440: case 0x444: case 0x448: case 0x44C: // CLK_ENB_V, _W
-  case 0x450: case 0x454: case 0x460: case 0x464: // RST/CLK_CPUG_CMPLX
-    return true;
-  default:
-    return false;
-  }
-}
-
 uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
   uint32_t offset = (uint32_t)(addr - CLK_RST_BASE);
+  if (const CarBank *b = car_bank_of(offset)) {
+    if (b->own)
+      return car_banks.v[b - kCarBanks];
+    if (offset != b->reg) // a strobe of a bank another model keeps
+      return clk_rst_read(state, CLK_RST_BASE + b->reg);
+  }
   // PLL_BASE registers (per Hekate bdk/soc/clock.h): each PLL has an _BASE
   // register where bit 30 = ENABLE and bit 27 = LOCK. After enabling a PLL
   // the boot code polls bit 27 until set. Real silicon locks within ~1ms; we
@@ -3393,15 +3415,6 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
     case 0x28:  return mariko ? 0x20003333u : 0x20003330u;
     case 0x2C:  return 0x80000000; // SUPER_SCLK_DIVIDER
     case 0x30:  return 0x00000002; // CLK_SYSTEM_RATE
-    case 0x14:  return 0x030180C1; // CLK_OUT_ENB_H
-    case 0x280: return 0x23024780; // CLK_OUT_ENB_X
-    // _L carries the SDMMC clock-enable bits the storage model depends on:
-    // SDMMC1 is bit 14 and SDMMC4 is bit 15, and the measured value has both.
-    case 0x10:  return 0x9802D1B0;
-    // _U and its reset counterpart are live, so a payload that enables a _U
-    // peripheral (UART-D, I2C3, SDMMC3, ...) can see that it worked.
-    case 0x0C:  return car_rst_u;  // RST_DEVICES_U
-    case 0x18:  return car_enb_u;  // CLK_OUT_ENB_U
     // CLK_SOURCE_UARTD. clock_uart_use_src_div() programs PLLP_OUT0 with
     // CLK_SRC_DIV(2) here (0x00000002) and sets UART_SRC_CLK_DIV_EN for the
     // 1M/3M rates; the payload reads it back to confirm the port's source.
@@ -3458,8 +3471,6 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
   // answer 4, which decodes as 19.2 MHz and contradicted OSC_FREQ_DET.
   if (offset == 0x50)
     return mmio_regs.get(addr, 0x500003F1);
-  if (offset == 0x04)
-    return 0; // RST_DEVICES_L (none in reset)
 
   // CPU complex clock/reset state (CLK_OUT_ENB_V, RST_CPUG_CMPLX, ...).
   {
@@ -3477,8 +3488,7 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
   }
   // Everything else is a plain R/W register (the CLK_SOURCE_* dividers,
   // PLL MISC words, ...): it reads back what was written.
-  (void)state;
-  return car_is_set_clr_alias(offset) ? 0 : mmio_regs.get(addr);
+  return mmio_regs.get(addr);
 }
 
 // A CLK_SOURCE_EMC write is the CAR/EMC clock-change handshake (EMC below).
@@ -3487,19 +3497,17 @@ static void emc_clock_source_write(EmuState *state, uint32_t val);
 void clk_rst_write(EmuState *state, uint64_t addr, uint32_t val) {
   (void)state;
   uint32_t offset = (uint32_t)(addr - CLK_RST_BASE);
-  // The _U pair is live (bdk reaches it through the SET/CLR aliases), and
-  // CLK_SOURCE_EMC starts an EMC clock change. Everything else only lands
-  // in the write hook's mmio_regs cache, which clk_rst_read hands back.
-  switch (offset) {
-  case 0x00C: car_rst_u  =  val; break; // RST_DEVICES_U, direct write
-  case 0x018: car_enb_u  =  val; break; // CLK_OUT_ENB_U, direct write
-  case 0x310: car_rst_u |=  val; break; // RST_DEV_U_SET
-  case 0x314: car_rst_u &= ~val; break; // RST_DEV_U_CLR
-  case 0x330: car_enb_u |=  val; break; // CLK_ENB_U_SET
-  case 0x334: car_enb_u &= ~val; break; // CLK_ENB_U_CLR
-  case 0x19C:   emc_clock_source_write(state, val); break; // CLK_SOURCE_EMC
-  default: break;
+  // The reset and clock-enable banks, and CLK_SOURCE_EMC, which starts an
+  // EMC clock change. Everything else only lands in the write hook's
+  // mmio_regs cache, which clk_rst_read hands back.
+  if (const CarBank *b = car_bank_of(offset); b && b->own) {
+    uint32_t &bank = car_banks.v[b - kCarBanks];
+    if (offset == b->reg)      bank = val;
+    else if (offset == b->set) bank |= val;
+    else                       bank &= ~val;
   }
+  if (offset == 0x19C)
+    emc_clock_source_write(state, val);
   // The PCIe root complex depends on PLLE, PLLREFE and the PCIE/AFI/
   // PCIEXCLK/UPHY/padctl reset+enable bits, so it shadows the same writes.
   pcie_car_write(state, offset, val);
@@ -5057,8 +5065,7 @@ void mmio_soft_reset(EmuState *state, bool power_cycle) {
 
   flow_ram_repair = RAM_REPAIR_RESET;
   memset(tmr_armed_us, 0, sizeof(tmr_armed_us));
-  car_rst_u = CAR_RST_U_RCM;
-  car_enb_u = CAR_ENB_U_RCM;
+  car_banks = CarBanks();
   g_fuse_ctrl_addr = 0;
   emc = EmcState();
   g_dsi_pending_dcs_cmd = 0;
