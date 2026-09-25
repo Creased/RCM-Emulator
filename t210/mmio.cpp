@@ -609,6 +609,9 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
   return 0;
 }
 
+// The SD card loses power with PE4 (SDMMC section below).
+static void sd_card_gpio_update();
+
 void gpio_write(EmuState *state, uint64_t addr, uint32_t val) {
   uint32_t offset = (uint32_t)(addr - GPIO_BASE);
   uint32_t bank_off = offset & 0xFF;
@@ -632,10 +635,13 @@ void gpio_write(EmuState *state, uint64_t addr, uint32_t val) {
     TRACE("[gpio] W: offset 0x%X = 0x%08X\n", offset, val);
   }
 
-  // Bank 1 holds ports E..H, and port H carries BT_REG_ON, so re-sample the
-  // radio's power pin after anything that could have moved it.
-  if (offset >= 0x100 && offset < 0x200)
+  // Bank 1 holds ports E..H: port H carries BT_REG_ON and port E the SD
+  // card's supply (PE4), so re-sample both after anything that could have
+  // moved them.
+  if (offset >= 0x100 && offset < 0x200) {
     gpio_h_update(state);
+    sd_card_gpio_update();
+  }
 }
 
 // ==================== I2C ====================
@@ -1982,6 +1988,110 @@ static void sdhci_tuning_command(EmuState *s, uint32_t base) {
     r.tune_pending = true;
 }
 
+// ---- The SD card's signalling voltage and switch functions ----------------
+//
+// A UHS-I card (SD Physical Layer 3.01). ACMD41 with S18R set answers S18A
+// while the card still signals at 3.3 V; CMD11 then moves it to 1.8 V, where
+// it stays until it loses power - bdk's supply GPIO (PE4) going low, or a
+// reset. A card re-initialised without a power cycle answers S18A = 0 but
+// keeps offering its UHS bus speeds, which is how hosts tell. CMD6
+// (SWITCH_FUNC) reports and selects one function per group: bus speed
+// (group 1: SDR12 and SDR25/HS, plus SDR50, SDR104 and DDR50 at 1.8 V),
+// driver strength (3: type B, plus A, C and D at 1.8 V) and power limit
+// (4: 0.72 W, plus 1.44 W at 1.8 V). CMD0 puts the functions back to their
+// defaults but not the signalling voltage.
+struct SdCard {
+  bool    s18a_offered = false; // the last ACMD41 answered S18A
+  bool    v18 = false;          // signalling at 1.8 V
+  bool    bus4 = false;         // ACMD6 set a 4-bit bus
+  uint8_t func[6] = {};         // current function, groups 1..6
+  bool    supplied = false;     // PE4 driving the card's VDD
+};
+static SdCard sd_card;
+
+static uint16_t sd_func_support(int group) {
+  static const uint16_t k33[6] = {0x8003, 0x8001, 0x8001, 0x8001, 0x8001, 0x8001};
+  static const uint16_t k18[6] = {0x801F, 0x8001, 0x800F, 0x8003, 0x8001, 0x8001};
+  return (sd_card.v18 ? k18 : k33)[group];
+}
+
+// The 64-byte CMD6 status (SD 4.3.10.4). arg bit 31: 0 check, 1 switch;
+// bits 4g+3..4g: the function wanted in group g+1, 0xF for "no change".
+static void sd_switch_func(uint32_t arg, uint8_t st[64]) {
+  memset(st, 0, 64);
+  st[1] = 100; // mA the selected functions draw; bdk refuses over 800
+  uint8_t res[6];
+  for (int g = 0; g < 6; g++) {
+    uint16_t sup = sd_func_support(g);
+    st[2 + (5 - g) * 2] = (uint8_t)(sup >> 8);
+    st[3 + (5 - g) * 2] = (uint8_t)sup;
+    uint32_t want = (arg >> (4 * g)) & 0xF;
+    res[g] = want == 0xF ? sd_card.func[g]
+           : ((sup >> want) & 1) ? (uint8_t)want : 0xF;
+  }
+  if (arg >> 31)
+    for (int g = 0; g < 6; g++)
+      if (res[g] != 0xF)
+        sd_card.func[g] = res[g];
+  st[14] = (uint8_t)(res[5] << 4 | res[4]);
+  st[15] = (uint8_t)(res[3] << 4 | res[2]);
+  st[16] = (uint8_t)(res[1] << 4 | res[0]);
+  st[17] = 1; // data structure version 1: busy status valid (none busy)
+}
+
+// The 64-byte SD status (ACMD13, SD 4.10.2): the bus width ACMD6 set, and
+// the card's grades - a Class 10, U1, V10 UHS-I card with 4 MB AUs.
+static void sd_status(uint8_t ss[64]) {
+  memset(ss, 0, 64);
+  ss[0]  = sd_card.bus4 ? 0x80 : 0x00; // DAT_BUS_WIDTH
+  ss[8]  = 4;                          // SPEED_CLASS: Class 10
+  ss[10] = 9 << 4;                     // AU_SIZE: 4 MB
+  ss[14] = 1 << 4 | 9;                 // UHS_SPEED_GRADE U1, UHS_AU_SIZE 4 MB
+  ss[15] = 10;                         // VIDEO_SPEED_CLASS: V10
+}
+
+// The SD card's CSD, version 2.0 (SD 5.3.3): an SDHC/SDXC card as big as
+// the image (32 GiB with none), command classes 0, 2, 4, 5, 7, 8 and 10 -
+// class 8, application commands, is what makes bdk read the SD status.
+// Laid out as the R2 response registers carry it, CSD[127:8]: bdk shifts
+// each word left by 8 to put the stripped CRC back.
+static void sd_csd(EmuState *state, uint32_t r[4]) {
+  uint64_t bytes = state->sd_fd >= 0 ? (uint64_t)file_size64(state->sd_fd)
+                                     : 32ull << 30;
+  uint64_t units = bytes / (512u << 10);
+  uint32_t c_size = units ? (uint32_t)std::min<uint64_t>(units - 1, 0x3FFFFF)
+                          : 0;
+  unsigned __int128 c = 0;
+  auto put = [&](unsigned hi, unsigned lo, uint64_t v) {
+    c |= (unsigned __int128)(v & ((1ull << (hi - lo + 1)) - 1)) << lo;
+  };
+  put(127, 126, 1);     // CSD_STRUCTURE: version 2.0
+  put(119, 112, 0x0E);  // TAAC: 1 ms
+  put(103, 96, 0x32);   // TRAN_SPEED: 25 MHz
+  put(95, 84, 0x5B5);   // CCC
+  put(83, 80, 9);       // READ_BL_LEN: 512
+  put(69, 48, c_size);  // C_SIZE: (C_SIZE + 1) x 512 KiB
+  put(46, 46, 1);       // ERASE_BLK_EN
+  put(45, 39, 0x7F);    // SECTOR_SIZE
+  put(28, 26, 2);       // R2W_FACTOR
+  put(25, 22, 9);       // WRITE_BL_LEN: 512
+  put(0, 0, 1);         // always 1
+  for (int i = 0; i < 4; i++)
+    r[i] = (uint32_t)(c >> (8 + 32 * i));
+}
+
+// Port E sits in GPIO bank 1: CNF 0x100, OE 0x110, OUT 0x120. PE4 high
+// powers the card; falling, the card loses its state.
+static void sd_card_gpio_update() {
+  uint32_t m = 1u << 4;
+  bool on = (mmio_regs.get(GPIO_BASE + 0x100) & m) &&
+            (mmio_regs.get(GPIO_BASE + 0x110) & m) &&
+            (mmio_regs.get(GPIO_BASE + 0x120) & m);
+  if (sd_card.supplied && !on)
+    sd_card = SdCard();
+  sd_card.supplied = on;
+}
+
 // ---- The eMMC's EXT_CSD -----------------------------------------------------
 //
 // The properties segment is fixed; the fields CMD6 SWITCH writes (bus
@@ -2440,6 +2550,20 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
         if (base == SDMMC4_BASE) {
           state->emmc_partition = 0;
           emmc_ext_csd_card_reset();
+        } else {
+          // Functions back to default; the signalling voltage stays.
+          memset(sd_card.func, 0, sizeof(sd_card.func));
+          sd_card.s18a_offered = false;
+          sd_card.bus4 = false;
+        }
+        break;
+      case 11: // SD VOLTAGE_SWITCH (R1, card in READY)
+        if (base == SDMMC1_BASE && sd_card.s18a_offered) {
+          sd_card.v18 = true;
+          sd_card.s18a_offered = false;
+          rsp[0] = r1_base | (1 << 9);
+        } else {
+          rsp[0] = r1_base | (1 << 9) | (1u << 22); // ILLEGAL_COMMAND
         }
         break;
       case 19: // SD SEND_TUNING_BLOCK
@@ -2549,6 +2673,10 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
         // bits 18-21 of my rspreg3. Set those to 0100 (=4) so storage->csd.
         // mmca_vsn >= CSD_SPEC_VER_4 and sdmmc_storage_init_mmc reaches
         // storage->initialized = 1 instead of the early-return at line 688.
+        if (base == SDMMC1_BASE) {
+          sd_csd(state, rsp);
+          break;
+        }
         rsp[0] = 0x400E0032;
         rsp[1] = 0x5B590000;
         rsp[2] = 0x00007F80;
@@ -2558,8 +2686,8 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
         bool is_acmd = (base == SDMMC1_BASE) ? state->last_cmd_was_55
                                              : state->last_cmd4_was_55;
         if (is_acmd) {
-          uint8_t ss[64] = {0};
-          ss[0] = 0x80; // 4-bit support (bit 511:510 = 10)
+          uint8_t ss[64];
+          sd_status(ss);
           uint64_t dma_addr = sdmmc_dma_target(uc, hostctl, adma_addr, sysad);
           if (dma_addr)
             uc_mem_write(uc, dma_addr, ss, 64);
@@ -2587,14 +2715,14 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
         bool is_acmd = (base == SDMMC1_BASE) ? state->last_cmd_was_55
                                              : state->last_cmd4_was_55;
         if (is_acmd) {
-          // ACMD6: SET_BUS_WIDTH
+          // ACMD6: SET_BUS_WIDTH (arg 2 = 4-bit)
+          if (base == SDMMC1_BASE)
+            sd_card.bus4 = (arg & 3) == 2;
           rsp[0] = r1_base | (4 << 9);
         } else if (base == SDMMC1_BASE) {
           // CMD6: SWITCH_FUNC (SD)
-          uint8_t status[64] = {0};
-          status[12] = 0x00;
-          status[13] = 0x02; // HS Support
-          status[16] = 0x01; // Group 1 switched to HS
+          uint8_t status[64];
+          sd_switch_func(arg, status);
 
           uint64_t dma_addr = sdmmc_dma_target(uc, hostctl, adma_addr, sysad);
           if (dma_addr)
@@ -2621,8 +2749,10 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
           state->last_cmd4_was_55 = true;
         break;
       }
-      case 41:
-        rsp[0] = 0xC0FF8000;
+      case 41: // SD_SEND_OP_COND: powered up, CCS, 2.7-3.6 V; S18A per S18R
+        sd_card.s18a_offered = base == SDMMC1_BASE && (arg & (1u << 24)) &&
+                               !sd_card.v18;
+        rsp[0] = 0xC0FF8000 | (sd_card.s18a_offered ? (1u << 24) : 0);
         break;
       case 42:
         rsp[0] = r1_base | (4 << 9);
@@ -2634,8 +2764,9 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
           // SD SCR: byte 0 low nibble = SD_SPEC (2 => v2.00), byte 1 low
           // nibble = SD_BUS_WIDTHS (5 => 1-bit + 4-bit). This is what makes
           // hekate switch the bus to 4-bit; without it the init falls back to
-          // 1-bit HS25 and hwtest flags "1-bit (dirty slot?)".
-          uint8_t scr[8] = {0x02, 0x35, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+          // 1-bit HS25 and hwtest flags "1-bit (dirty slot?)". Byte 2 bit 7,
+          // SD_SPEC3: Physical Layer 3.0x, as a UHS-I card is.
+          uint8_t scr[8] = {0x02, 0x35, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00};
           // Tegra drives this small read over SDMA with the destination in
           // register 0x58 (captured here as adma_addr), NOT the SDHCI-standard
           // sysad (0x00), which Tegra leaves unused. Matches the EXT_CSD path.
@@ -4962,6 +5093,7 @@ void mmio_soft_reset(EmuState *state, bool power_cycle) {
     g_ext_csd_ready = false;
   else
     emmc_ext_csd_card_reset();
+  sd_card = SdCard(); // the reset drops PE4, and the card's VDD with it
 
   // Display controller and VIC back to their defaults.
   dc_reset(state);

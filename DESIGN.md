@@ -20,7 +20,7 @@ flowchart TB
 
     uc -->|MMIO callbacks| mmio["<b>t210/mmio.cpp</b><br/>mmio_bus_read / mmio_bus_write<br/>shared by both masters"]
 
-    mmio --> sdmmc["<b>sdmmc</b><br/>SDMMC1 / SDMMC4<br/>CMD0..21, EXT_CSD, ADMA2<br/>HS200 tuning, HS400"]
+    mmio --> sdmmc["<b>sdmmc</b><br/>SDMMC1 / SDMMC4<br/>CMD0..21, EXT_CSD, ADMA2<br/>SD UHS-I, eMMC HS400"]
     mmio --> se["<b>se_engine</b><br/>AES-128, SHA-256<br/>BIS keyslot override"]
     mmio --> i2c["<b>i2c3</b><br/>STMFTS / FTS4 touch"]
     mmio --> i2c1["<b>I2C_1 slaves</b> (inline)<br/>MAX17050, TMP451,<br/>BQ24193, BM92T36"]
@@ -116,7 +116,8 @@ of the spec is modelled for the Hekate, Lockpick and TE init paths:
 - CMD0 GO_IDLE, CMD1 SEND_OP_COND, CMD2 ALL_SEND_CID, CMD3 SEND_RELATIVE_ADDR,
   CMD6 SWITCH, CMD7 SELECT_CARD, CMD8 SEND_EXT_CSD (eMMC) or SEND_IF_COND (SD),
   CMD9 SEND_CSD, CMD13 SEND_STATUS, CMD16 SET_BLOCKLEN, CMD17 and CMD18
-  READ_(MULTI_)BLOCK, CMD19 / CMD21 SEND_TUNING_BLOCK, CMD55 APP_CMD.
+  READ_(MULTI_)BLOCK, CMD11 VOLTAGE_SWITCH, CMD19 / CMD21 SEND_TUNING_BLOCK,
+  CMD55 APP_CMD.
 - ADMA2 (Advanced DMA 2) with 64-bit descriptors, multi-block reads chunked
   into the host file IO via `pread`-style calls.
 - `--rawnand` opens the matching `rawnand.bin.NN` chunks and `fstat`s the first
@@ -165,8 +166,25 @@ file with the TRM's reset values, plus the side effects bdk waits on:
   HS400, and reports a 199.68 MHz card clock. BOOT0, BOOT1 and RPMB are
   4 MiB each, as on a Switch.
 
-The SD card stays at High Speed (48 MHz). UHS-I needs ACMD41 to answer with
-S18A and a CMD11 voltage switch, which the SD model does not do.
+#### The SD card: UHS-I
+
+The SD card is a UHS-I card (SD Physical Layer 3.01), so bdk runs it at
+SDR104 like the real slot:
+
+- ACMD41 with S18R answers S18A while the card still signals at 3.3 V, and
+  CMD11 moves it to 1.8 V. It stays there until it loses power: bdk's
+  supply GPIO (PE4) going low, or a reset. A card re-initialised without a
+  power cycle answers S18A = 0 but keeps offering its UHS speeds.
+- CMD6 (SWITCH_FUNC) reports and selects a function per group, per SD
+  4.3.10: bus speed (SDR12 and SDR25/HS, plus SDR50, SDR104 and DDR50 at
+  1.8 V), driver strength and power limit. CMD0 puts the functions back to
+  their defaults, not the voltage.
+- CMD19 tunes the SDR104 sampling point through the same tuning circuit as
+  the eMMC. hwtest reports a 199.68 MHz card clock.
+- The CSD is an SD CSD 2.0 (SD 5.3.3): the image's size (32 GiB with none)
+  and command classes that include class 8, so bdk reads the SD status.
+  That (ACMD13) reports the bus width ACMD6 set and a Class 10, U1, V10
+  card with 4 MB AUs; the SCR sets SD_SPEC3.
 
 ### EMC and DRAM clock
 
