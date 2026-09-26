@@ -412,6 +412,14 @@ int main(int argc, char *argv[]) {
         if (state.sd_fd < 0) perror("[emu] Failed to open SD image");
         else printf("[emu] SD image opened: %s\n", sd_path);
     }
+    // No image, no card: the slot starts empty, so card detect (PZ1) reads
+    // empty and SDMMC1 commands time out, as on a console with no card in.
+    // This used to present a blank card that FatFs then found no volume on.
+    // The config window's SD toggle can still insert a blank card.
+    if (state.sd_fd < 0 && state.sd_inserted.load()) {
+        state.sd_inserted = false;
+        printf("[emu] No SD image: the SD slot is empty\n");
+    }
     if (boot0_path) {
         state.emmc_boot0_fd = open(boot0_path, O_RDWR | O_BINARY);
         if (state.emmc_boot0_fd < 0) perror("[emu] Failed to open BOOT0 image");

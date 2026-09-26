@@ -36,7 +36,8 @@ slow or destructive.
 - Read real eMMC (embedded MMC) dumps (`BOOT0`, multi-part `rawnand.bin.NN`)
   and decrypt them with XTS-AES-128 (XEX-based Tweaked-codebook with ciphertext
   stealing) against keys from `prod.keys`.
-- Serve a real FAT32 SD image to the payload (`--sd sd.img`).
+- Serve a real FAT32 SD image to the payload (`--sd sd.img`). Without one the
+  SD slot is empty.
 
 ## Quick start
 
@@ -270,7 +271,7 @@ needed.
 
 | Flag                  | Argument      | Purpose                                                   |
 | --------------------- | ------------- | --------------------------------------------------------- |
-| `--sd`                | `sd.img`      | Back the SD card (SDMMC1) with this raw FAT32 image.      |
+| `--sd`                | `sd.img`      | Back the SD card (SDMMC1) with this raw FAT32 image. Without it (and with no `sd.img` in the working directory) the slot is empty. |
 | `--boot0`             | `BOOT0`       | eMMC BOOT0 partition file (SDMMC4).                       |
 | `--rawnand`           | `rawnand.bin` | eMMC GPP partition prefix (auto-detects `.00`, `.01`, …). |
 | `--prod-keys`         | `prod.keys`   | Override BIS keys from a Lockpick-style key file.         |

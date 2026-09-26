@@ -181,7 +181,11 @@ SDR104 like the real slot:
   their defaults, not the voltage.
 - CMD19 tunes the SDR104 sampling point through the same tuning circuit as
   the eMMC. hwtest reports a 199.68 MHz card clock.
-- The CSD is an SD CSD 2.0 (SD 5.3.3): the image's size (32 GiB with none)
+- With no image (`--sd`, or `sd.img` in the working directory) the slot is
+  empty: card detect (PZ1) reads no card and every SDMMC1 command times
+  out, as on a console with no card in. The config window can still insert
+  a blank card.
+- The CSD is an SD CSD 2.0 (SD 5.3.3): the image's size (32 GiB for a blank card)
   and command classes that include class 8, so bdk reads the SD status.
   That (ACMD13) reports the bus width ACMD6 set and a Class 10, U1, V10
   card with 4 MB AUs; the SCR sets SD_SPEC3.
