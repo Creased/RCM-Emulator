@@ -67,7 +67,10 @@ constexpr uint64_t I2C2_BASE = 0x7000C400; // GEN2_I2C, Rohm BH1730 ALS at slave
 constexpr uint64_t I2C2_SIZE = 0x100;
 constexpr uint64_t I2C3_BASE = 0x7000C500; // GEN3_I2C, used by STMFTS touchscreen at slave 0x49
 constexpr uint64_t I2C5_BASE = 0x7000D000;
-constexpr uint64_t I2C_SIZE  = 0x1000;
+constexpr uint64_t I2C_SIZE  = 0x1000;   // the MMIO page: I2C5, I2C6, SPI2B
+constexpr uint64_t I2C_CTRL_SIZE = 0x100; // one controller's registers
+constexpr uint64_t I2C4_BASE = 0x7000C700;
+constexpr uint64_t I2C6_BASE = 0x7000D100;
 constexpr uint64_t I2C3_SIZE = 0x100;
 
 // PWM
@@ -147,9 +150,18 @@ constexpr uint64_t HOST1X_SIZE = 0x40000;
 constexpr uint64_t BPMP_CACHE_BASE = 0x50040000;
 constexpr uint64_t BPMP_CACHE_SIZE = 0x1000;
 
-// System Registers (SYSREG)
+// System Registers (SYSREG). SB (secure boot) sits at +0x200 and holds the
+// CCPLEX's AArch64 reset vector (SB_AA64_RESET_LOW/HIGH, +0x230/+0x234).
 constexpr uint64_t SYSREG_BASE = 0x6000C000;
 constexpr uint64_t SYSREG_SIZE = 0x1000;
+
+// Flow controller: BPMP/CPU halt events, cluster control, RAM repair.
+constexpr uint64_t FLOW_CTLR_BASE = 0x60007000;
+constexpr uint64_t FLOW_CTLR_SIZE = 0x1000;
+
+// Exception vectors, incl. EVP_CPU_RESET_VECTOR (+0x100) for AArch32 boot.
+constexpr uint64_t EXCP_VEC_BASE = 0x6000F000;
+constexpr uint64_t EXCP_VEC_SIZE = 0x1000;
 
 // I2S (Audio)
 constexpr uint64_t I2S_BASE = 0x702D1000;
@@ -181,6 +193,16 @@ constexpr uint64_t SE_SIZE = 0x2000;
 constexpr uint64_t MSELECT_BASE = 0x50060000;
 constexpr uint64_t MSELECT_SIZE = 0x1000;
 
+// USB2 controller USB1 ("OTG"): the device controller bdk's usbd.c drives on
+// Erista. Registers, the UTMI PHY at +0x400/+0x800, queue heads at +0x1000.
+constexpr uint64_t USB_OTG_BASE = 0x7D000000;
+constexpr uint64_t USB_OTG_SIZE = 0x4000;
+
+// XUSB device controller: bdk's xusbd.c on Mariko. XHCI registers, then its
+// PCI configuration space at +0x8000 and device registers at +0x9000.
+constexpr uint64_t XUSB_DEV_BASE = 0x700D0000;
+constexpr uint64_t XUSB_DEV_SIZE = 0xA000;
+
 // XUSB pad controller. Owns the UPHY SERDES lanes shared by PCIe (pcie-0..4)
 // and USB 3.0 SuperSpeed (pcie-5/6 on this board), plus UPHY PLL P0.
 constexpr uint64_t XUSB_PADCTL_BASE = 0x7009F000;
@@ -194,12 +216,13 @@ constexpr uint64_t XUSB_PADCTL_SIZE = 0x1000;
 // bdk's MMU table defines DRAM and IRAM entries only and leaves the fallback
 // entry RWX, so PCIe space is reachable and uncached.
 //
-// Only the windows a payload actually touches are mapped: 16 KiB covering
-// both root ports plus PADS and AFI, 128 KiB of configuration aperture (bus
-// 0 and bus 1 are all that exist), and one 4 KiB page of downstream memory
-// for the endpoint's BAR0 register window. Mapping the architectural sizes
-// (256 MiB of config, 208 MiB of memory) would cost the host gigabytes for
-// address ranges nothing ever reads.
+// These are MMIO windows (callbacks, no backing memory), so they are mapped
+// at their architectural sizes: the whole 256 MiB configuration aperture -
+// extended registers sit at AXI[27:24] - and the non-prefetchable memory
+// window to the end of PCIE_A2, wherever software places the endpoint's BARs.
+// A smaller map left a CPU0 access to, say, config offset 0x100 or BAR0 +
+// 0x2000 unmapped: nothing answered and the core wedged, where silicon
+// returns data or all-ones.
 constexpr uint64_t PCIE_RP0_BASE  = 0x01000000;  // root port 0 registers
 constexpr uint64_t PCIE_RP1_BASE  = 0x01001000;  // root port 1 registers
 constexpr uint64_t PCIE_PADS_BASE = 0x01003000;
@@ -207,9 +230,9 @@ constexpr uint64_t PCIE_AFI_BASE  = 0x01003800;
 constexpr uint64_t PCIE_BLOCK_BASE = 0x01000000;
 constexpr uint64_t PCIE_BLOCK_SIZE = 0x4000;
 constexpr uint64_t PCIE_CS_BASE   = 0x02000000;  // type-1 extended config
-constexpr uint64_t PCIE_CS_MODEL_SIZE = 0x20000; // buses 0 and 1 only
+constexpr uint64_t PCIE_CS_MODEL_SIZE = 0x10000000; // all of it: 256 MiB
 constexpr uint64_t PCIE_MEM_BASE  = 0x13000000;  // non-prefetchable window
-constexpr uint64_t PCIE_MEM_MODEL_SIZE = 0x1000;
+constexpr uint64_t PCIE_MEM_MODEL_SIZE = 0x0D000000; // up to the end of A2
 
 // TSEC (Falcon control regs are in the 0x1000–0x11FF window within TSEC_BASE)
 constexpr uint64_t TSEC_BASE = 0x54500000;

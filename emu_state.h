@@ -91,6 +91,42 @@ inline bool wifi_radio_parse(const char *s, uint8_t *out) {
     return false;
 }
 
+// Tegra DC window registers (TRM 24.10-24.11) as slots in a window's
+// register file: the indirect window page 0x700-0x7FF is slots 0x000-0x0FF,
+// the WINBUF page 0x800-0x83F slots 0x100-0x13F.
+namespace dcwin {
+constexpr uint32_t kRegs        = 0x140;
+constexpr uint32_t OPTIONS      = 0x000; // DC_WIN_WIN_OPTIONS
+constexpr uint32_t COLOR_DEPTH  = 0x003; // DC_WIN_COLOR_DEPTH
+constexpr uint32_t POSITION     = 0x004; // DC_WIN_POSITION
+constexpr uint32_t SIZE         = 0x005; // DC_WIN_SIZE (post-scaling)
+constexpr uint32_t PRESCALED    = 0x006; // DC_WIN_PRESCALED_SIZE (bytes x lines)
+constexpr uint32_t LINE_STRIDE  = 0x00A; // DC_WIN_LINE_STRIDE (bytes)
+constexpr uint32_t BLEND_LAYER  = 0x016; // DC_WINBUF_BLEND_LAYER_CONTROL
+constexpr uint32_t BLEND_MATCH  = 0x017; // DC_WINBUF_BLEND_MATCH_SELECT
+constexpr uint32_t START_ADDR   = 0x100; // DC_WINBUF_START_ADDR
+constexpr uint32_t ADDR_H_OFF   = 0x106; // DC_WINBUF_ADDR_H_OFFSET (bytes)
+constexpr uint32_t ADDR_V_OFF   = 0x108; // DC_WINBUF_ADDR_V_OFFSET (lines)
+constexpr uint32_t SURFACE_KIND = 0x10B; // DC_WINBUF_SURFACE_KIND
+
+// WIN_OPTIONS bits.
+constexpr uint32_t H_DIRECTION = 1u << 0;
+constexpr uint32_t V_DIRECTION = 1u << 2;
+constexpr uint32_t SCAN_COLUMN = 1u << 4;
+constexpr uint32_t WIN_ENABLE  = 1u << 30;
+
+// BLEND_LAYER_CONTROL resets to BLEND_BYPASS (TRM 24.10.12).
+constexpr uint32_t BLEND_LAYER_RESET = 0x01000000;
+
+// A picture turn, as flip-then-transpose: the source is mirrored left-right
+// (XF_FLIP_X) and/or top-bottom (XF_FLIP_Y), then rows become columns
+// (XF_TRANSPOSE). DC WIN_OPTIONS (H_DIRECTION, V_DIRECTION, SCAN_COLUMN) and
+// VIC's OutputFlipX/FlipY/Transpose both follow this convention.
+constexpr uint32_t XF_FLIP_X    = 1u << 0;
+constexpr uint32_t XF_FLIP_Y    = 1u << 1;
+constexpr uint32_t XF_TRANSPOSE = 1u << 2;
+} // namespace dcwin
+
 struct EmuState {
     uc_engine *uc = nullptr;
     // Button state (updated by SDL keyboard events).
@@ -102,36 +138,58 @@ struct EmuState {
     // Updated by SDL mouse events; consumed by i2c3_*/STMFTS code on CPU thread.
     // Coordinates are in panel-raw space (X long axis 0..1264, Y short 0..704)
     // matching what touch.c expects before its rescaling.
-    std::atomic<uint16_t> tc_x{0};
-    std::atomic<uint16_t> tc_y{0};
+    //
+    // Events queue up rather than overwrite each other: a click shorter than
+    // the payload's poll interval used to reach it as a bare LEAVE, the
+    // ENTER lost under it. Single producer (SDL), single consumer (I2C3).
+    struct TouchEvent { uint8_t op; uint16_t x, y; }; // op 3/4/5 = ENTER/LEAVE/MOTION
+    static constexpr uint32_t TC_QUEUE = 32;
+    TouchEvent            tc_queue[TC_QUEUE] = {};
+    std::atomic<uint32_t> tc_q_head{0};    // next slot the producer fills
+    std::atomic<uint32_t> tc_q_tail{0};    // next slot the consumer takes
     std::atomic<bool>     tc_pressed{false};
-    std::atomic<bool>     tc_event_pending{false};
-    std::atomic<uint8_t>  tc_event_op{0};   // 0x03=ENTER, 0x04=LEAVE, 0x05=MOTION
-    uint8_t               tc_finger_id = 1; // FTS4 finger IDs are 1-indexed
+    uint8_t               tc_finger_id = 0; // raw FTS4 ID; bdk reports it + 1
+
+    // Queue a touch event. MOTION is dropped when the queue is nearly full,
+    // so an ENTER or LEAVE always finds room.
+    void touch_post(uint8_t op, uint16_t x, uint16_t y) {
+      uint32_t head = tc_q_head.load(), tail = tc_q_tail.load();
+      uint32_t used = head - tail;
+      if (used >= TC_QUEUE || (op == 0x05 && used >= TC_QUEUE - 4))
+        return;
+      tc_queue[head % TC_QUEUE] = {op, x, y};
+      tc_q_head.store(head + 1);
+    }
+    bool touch_take(TouchEvent *ev) {
+      uint32_t tail = tc_q_tail.load();
+      if (tail == tc_q_head.load())
+        return false;
+      *ev = tc_queue[tail % TC_QUEUE];
+      tc_q_tail.store(tail + 1);
+      return true;
+    }
     // last_rot mirrors the rotation last applied by sdl_display_update.
     // Read from the SDL event handler to invert the display→window transform.
     std::atomic<uint32_t> last_rot{0};
+    std::atomic<uint32_t> last_auto_rot{0}; // what auto-detect picked, before any override
     std::atomic<uint32_t> last_out_w{1280};
     std::atomic<uint32_t> last_out_h{720};
 
-    // Display state.
-    uint64_t fb_addr = 0, pre_addr = 0;
-    uint32_t fb_width = 720, pre_w = 720;
-    uint32_t fb_height = 1280, pre_h = 1280;
-    uint32_t fb_stride = 2880, pre_stride = 2880;
-    uint32_t fb_swizzle = 0, pre_sw = 0;
-    uint32_t fb_rotation = 0, pre_rot = 0;
-    uint32_t pre_bh = 0; // block height in GOBs from DC surface-kind (0 = unset)
-    uint32_t fb_sw_gobs = 80;
-    uint32_t fb_bh = 0; // 0 = use display code default until DC surface-kind latches
-
-    // DC window selection: tracks DC_CMD_DISPLAY_WINDOW_HEADER.
-    // Bit 4 = Window A, Bit 5 = Window B, Bit 6 = Window C, Bit 7 = Window D.
-    uint32_t dc_window_sel = 0x10; // Default: Window A
-    // Saved Window A parameters (primary display surface).
-    uint64_t winA_addr = 0;
-    uint32_t winA_w = 720, winA_h = 1280, winA_stride = 2880;
-    uint32_t winA_sw = 0, winA_rot = 0, winA_bh = 0;
+    // Display controller windows A-D (t210/mmio.cpp, Display). Each window
+    // has a register file indexed by dcwin:: slot. The CPU writes the
+    // assembly copy; DC_CMD_STATE_CONTROL's WIN_x_ACT_REQ copies it into the
+    // active copy, which is what the scan-out (display/sdl_display.cpp)
+    // decodes.
+    uint32_t dc_win[4][dcwin::kRegs] = {};
+    uint32_t dc_win_active[4][dcwin::kRegs] = {};
+    uint32_t dc_window_header = 0; // DC_CMD_DISPLAY_WINDOW_HEADER
+    // False from reset until the payload first activates a window. Until
+    // then the scan-out shows the emulator's own framebuffer (FB_BASE).
+    bool dc_programmed = false;
+    // Where the last VIC compose wrote, and how it turned the picture on the
+    // way (dcwin::XF_* bits). The scan-out undoes that turn for display.
+    uint64_t vic_out_addr = 0;
+    uint32_t vic_out_xform = 0;
     std::atomic<bool> display_dirty{false};
     std::atomic<bool> display_initialized{false};
     int32_t           manual_offset = 0;
@@ -141,6 +199,14 @@ struct EmuState {
     std::atomic<bool> running{true};
     std::atomic<bool> paused{false};
     std::atomic<bool> reboot_requested{false};
+    // The reboot is a power cycle (PMIC software reset, the UI's Reboot):
+    // the regulators lose their state too. Otherwise it is a SoC reset
+    // (PMC MAIN_RST), which the PMIC, and its rails, sit out.
+    std::atomic<bool> reboot_cold{false};
+    // The BPMP parked itself for good (bpmp_halt(): WAITEVENT with no timer)
+    // while CPU0 still runs - the handoff fusee and hekate's L4T launch do.
+    // Time keeps passing for CPU0; the BPMP executes nothing until reset.
+    bool bpmp_halted = false;
 
     // Payload kept around for soft reboot (re-write to IRAM and reset PC).
     uint8_t *payload_ptr = nullptr;
@@ -254,6 +320,14 @@ struct EmuState {
     // SD card insertion (GPIO Port Z bit 1 = 0 means inserted).
     std::atomic<bool>     sd_inserted{true};
 
+    // A PC on the USB-C port (--usb-host): it enumerates whatever gadget the
+    // payload brings up (t210/usb.cpp). Off, nothing is on the cable.
+    std::atomic<bool>     usb_host{false};
+    // --usb-host nbd[:port]: instead of reading a mass storage disk back and
+    // ejecting it, the host serves it over NBD on 127.0.0.1:port until the
+    // client disconnects. 0: off.
+    std::atomic<uint16_t> usb_nbd_port{0};
+
     // SD card identity (returned for SDMMC1 CMD2 ALL_SEND_CID).
     // Hekate parses these out of the R2 response per bdk/storage/sdmmc.c
     // _sd_storage_parse_cid; the I2C handler builds the 16-byte CID payload
@@ -328,6 +402,8 @@ struct EmuState {
     std::atomic<uint32_t>& fuse_at(uint32_t offset) { return fuse_word[(offset & 0x3FC) / 4]; }
 
     void init_fuse_defaults() {
+        for (auto &w : fuse_word)
+            w.store(0);
         // Names below mirror Hekate's bdk/soc/fuse.h. Values picked from a
         // typical Erista golden-sample dump (any retail Switch is similar).
         fuse_at(0x100).store(1);            // FUSE_PRODUCTION_MODE

@@ -13,6 +13,7 @@ Usage:
 """
 import argparse
 import os
+import shlex
 import subprocess
 import sys
 
@@ -20,6 +21,9 @@ import sys
 def build_sd_image(src_dir: str, out_img: str, size_mb: int) -> int:
     if not os.path.isdir(src_dir):
         print(f"[error] source folder not found: {src_dir}")
+        return 1
+    if size_mb < 64:
+        print("[error] --size-mb must be at least 64: FAT32 needs 65525 clusters")
         return 1
 
     src_dir_abs = os.path.abspath(src_dir)
@@ -45,6 +49,13 @@ def build_sd_image(src_dir: str, out_img: str, size_mb: int) -> int:
 
     print(f"[*] formatting + populating via Docker (alpine)")
     fdisk_script = f"o\\nn\\np\\n1\\n2048\\n\\nt\\nc\\nw\\n"
+    # FatFs (and every FAT driver) decides FAT12/16/32 by cluster count, and
+    # FAT32 needs at least 65525 clusters: 4 KiB clusters only get there from
+    # ~260 MB up. Below that, format with 512-byte clusters, or the payload's
+    # f_mount rejects the volume (FR_NO_FILESYSTEM).
+    spc = 8 if size_mb >= 512 else 1
+    # File names go into a shell command line: quote them.
+    q_fat, q_img = shlex.quote(fat_name), shlex.quote(img_name)
     docker_cmd = [
         "docker", "run", "--rm",
         "-v", f"{work_dir}:/work",
@@ -53,10 +64,12 @@ def build_sd_image(src_dir: str, out_img: str, size_mb: int) -> int:
         "alpine",
         "sh", "-c",
         "apk add --no-cache dosfstools mtools util-linux >/dev/null && "
-        f"mkfs.fat -F 32 -s 8 {fat_name} && "
-        f"mcopy -i {fat_name} -s /src/* :: && "
-        f"printf '{fdisk_script}' | fdisk {img_name} && "
-        f"dd if={fat_name} of={img_name} bs=1M seek=1 conv=notrunc status=none"
+        f"mkfs.fat -F 32 -s {spc} {q_fat} && "
+        # Every top-level entry, dotfiles included; an empty source is fine.
+        f"(cd /src && find . -mindepth 1 -maxdepth 1 "
+        f"-exec mcopy -i /work/{q_fat} -s {{}} :: \\;) && "
+        f"printf '{fdisk_script}' | fdisk {q_img} && "
+        f"dd if={q_fat} of={q_img} bs=1M seek=1 conv=notrunc status=none"
     ]
     try:
         subprocess.run(docker_cmd, check=True)

@@ -12,4 +12,8 @@ struct EmuState;
 uint32_t i2c3_read(EmuState *state, uint64_t addr);
 void     i2c3_write(EmuState *state, uint64_t addr, uint32_t val);
 
+// Soft reboot: controller and touch controller back to power-on, with no
+// events left over from the previous run.
+void     i2c3_reset(EmuState *state);
+
 #endif

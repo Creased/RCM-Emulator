@@ -15,4 +15,7 @@ WORKDIR /work
 
 # Build command: docker run --rm -v $(pwd):/work rcm_emu
 # (init the imgui submodule if it's missing, then build)
-CMD ["sh", "-c", "git submodule update --init --recursive && make"]
+# The source is bind-mounted and owned by the host user, not root: without
+# safe.directory, git refuses to touch it ("dubious ownership") and make never
+# runs.
+CMD ["sh", "-c", "git config --global --add safe.directory /work && git submodule update --init --recursive && make"]

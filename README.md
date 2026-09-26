@@ -7,9 +7,10 @@ precompiled `.bin` (Hekate, Lockpick_RCM, TegraExplorer, custom payloads) and
 executes its ARM32 code on an emulated Tegra X1 (T210) environment, with a
 windowed framebuffer and keyboard input mapped to the Switch hardware buttons.
 
-It is **not** a console emulator. Only the BPMP (Boot and Power Management
-Processor) bootloader stage is modelled. You will not boot Horizon, run NSPs,
-or load games. The intended use is payload development and scripted
+It is **not** a console emulator. The BPMP (Boot and Power Management
+Processor) bootloader stage is what is modelled, plus CPU0 of the main CPU
+cluster for payloads that boot it to run bare-metal AArch64 code. You will not
+boot Horizon, run NSPs, or load games. The intended use is payload development and scripted
 verification, plus security research where iterating on real hardware would be
 slow or destructive.
 
@@ -21,17 +22,29 @@ slow or destructive.
   bypasses the parts of the chain that aren't fully modelled.
 - Run **TegraExplorer**, including `.te` script execution from an emulated SD
   card.
+- Run **hwtest-rcm**'s complete hardware sweep in a few seconds, including its
+  Wi-Fi probe, which boots **CPU0** (Cortex-A57, AArch64) to bring up PCIe and
+  enumerate the CYW4356 - PCIe answers a CPU-complex master only. See
+  [CCPLEX CPU0](#ccplex-cpu0).
 - Replay deterministic button sequences via `--auto-pin-recovery` or
   `--auto-te-script`, so a payload flow can be exercised from a CI run or a
-  one-shot script.
+  one-shot script. `--input-script` scripts buttons and touchscreen taps for
+  any payload.
+- Plug an emulated PC into the USB-C port (`--usb-host`): Nyx's USB mass
+  storage and gamepad gadgets enumerate on both the Erista (USB2) and Mariko
+  (XUSB) device controllers, and the PC reads a mass storage disk back,
+  checks it against the SD image, writes a few sectors back unchanged and
+  ejects it. With `--usb-host nbd` the PC serves the disk over NBD instead,
+  so it can be mounted on the machine running the emulator.
 - Tweak emulated hardware live (battery, charger, thermal, USB-PD, PMIC,
-  fuses, SD insertion) from a side window. See [Live hardware tweaks](#live-hardware-tweaks).
+  fuses, SD insertion, the USB host) from a side window. See [Live hardware tweaks](#live-hardware-tweaks).
 - Inspect each Tegra UART port (TX history) and inject keystrokes into the
   payload's RX FIFO from a separate console window. See [UART console](#uart-console).
 - Read real eMMC (embedded MMC) dumps (`BOOT0`, multi-part `rawnand.bin.NN`)
   and decrypt them with XTS-AES-128 (XEX-based Tweaked-codebook with ciphertext
   stealing) against keys from `prod.keys`.
-- Serve a real FAT32 SD image to the payload (`--sd sd.img`).
+- Serve a real FAT32 SD image to the payload (`--sd sd.img`). Without one the
+  SD slot is empty.
 
 ## Quick start
 
@@ -141,6 +154,78 @@ Audio goes to WASAPI on Windows and ALSA/PulseAudio on Linux; SDL picks the
 backend, so nothing in the emulator cares which. `RCM_EMU_NO_AUDIO=1` skips
 playback entirely, which is what CI uses since a runner has no sound device.
 
+## CCPLEX CPU0
+
+A payload can boot the first Cortex-A57 exactly as bdk's `ccplex_boot_cpu0()`
+does - CPU rail, PLLX, CCLK, the CRAIL/C0NC/CE0 partitions, RAM repair, the
+AArch64 vector in `SB_AA64_RESET_LOW/HIGH`, then `RST_CPUG_CMPLX_CLR` - and the
+emulator runs it: AArch64, entered at EL3 with the MMU off at the vector,
+sharing IRAM, DRAM and every peripheral with the BPMP, in lockstep with it on
+the emulated clock. Output is prefixed `[ccplex]`:
+
+```
+[ccplex] CPU0 released: AArch64 EL3, MMU off, entry 0xA0000000 (boot #1)
+[pcie] root port 1: link UP, gen1 x1 (healthy WLAN)
+[uartB]   CPU0          : ran to completion (hb=613)
+[uartB]   AFI (CPU)     : cfg=00103025 witness=A5A50000 -> APERTURE LIVE
+[uartB]   RP1 link      : UP, DL active (LNKSTA=3011 gen1 x1)
+[uartB]   EP config     : 14E4:43EC Broadcom BCM/CYW4356 WLAN
+[uartB]   Result        : WLAN core enumerated on the PCIe bus
+[ccplex] CPU0 stopped (held in reset) after 19402985 instructions, 4846717 bus accesses
+```
+
+A release with something missing does not run the core - silicon would not -
+and says what was missing, e.g. `[ccplex] CPU0 released from reset but cannot
+run: CPU rail off (MAX77621 VOUT_EN / MAX77620 GPIO5 EN pin)`. PCIe and
+MSELECT answer CPU0 only; the BPMP reads all ones from them, as measured on
+real consoles. Details in [DESIGN.md](DESIGN.md#ccplex-cpu0).
+
+## Tests
+
+```bash
+make test                                   # CCPLEX, SE, USB + display regression payloads (arm-none-eabi-gcc, python3)
+tests/hwtest/build.sh build-hwtest          # build hwtest-rcm (+ gcc-aarch64-linux-gnu)
+tests/hwtest/run.sh ./rcm_emu build-hwtest/hwtest-rcm/build/hwtest.bin
+```
+
+`make test` runs small self-contained payloads: one boots CPU0 and checks the
+refusal of an unpowered release, the EL3 entry, the mailbox, a stopped clock,
+WFE parking and the reset; one checks the Security Engine's RSA, SHA-256, AES
+and RNG against vectors computed in Python; one brings up a USB mass storage
+gadget on each device controller (and a HID gadget) for the `--usb-host` PC to
+enumerate, read back and write, and serves it over NBD to a Python client;
+one drives the display controller and VIC and
+compares the frame pixel for pixel. The hwtest scripts run hwtest-rcm's whole
+hardware sweep headless and check that the CPU0-driven Wi-Fi probe enumerates
+the endpoint. CI runs both.
+
+## Mounting a gadget's disk
+
+`--usb-host nbd` turns the emulated PC into a bridge: when a mass storage
+gadget attaches - Nyx's SD card, eMMC or emuMMC under USB tools - the PC
+locks the medium (PREVENT MEDIUM REMOVAL, so Nyx will not unload it from its
+side) and serves it with the NBD protocol on 127.0.0.1, port 10809 or the one
+given as `nbd:<port>`. Every NBD read, write and flush becomes SCSI
+commands to the gadget, so what reaches the SD image goes through bdk's UMS
+code as it would from a real PC. A write-protected disk (Nyx's eMMC in its
+default read-only mode) is exported read-only.
+
+```sh
+./rcm_emu hekate.bin --sd sd.img --usb-host nbd
+# in Nyx: Tools > USB Tools > SD Card, then on the host:
+sudo modprobe nbd max_part=8
+sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -b 512
+sudo mount /dev/nbd0p1 /mnt        # ... use it ...
+sudo umount /mnt && sudo nbd-client -d /dev/nbd0   # the disk is ejected
+```
+
+Without root, `qemu-img convert nbd://127.0.0.1:10809 copy.img` takes a
+copy, `qemu-io nbd://127.0.0.1:10809` reads and writes sectors, and
+`nbdfuse` exposes the disk as a file. The session ends when the client
+disconnects: the PC allows removal and ejects, and Nyx reports "Disk
+ejected". The port only listens while a disk is being served. In the config
+window, the USB device mode section has the same switch and port.
+
 ## Live hardware tweaks
 
 Press `M` in the main window to open a second window that exposes the values
@@ -226,13 +311,15 @@ needed.
 
 | Flag                  | Argument      | Purpose                                                   |
 | --------------------- | ------------- | --------------------------------------------------------- |
-| `--sd`                | `sd.img`      | Back the SD card (SDMMC1) with this raw FAT32 image.      |
+| `--sd`                | `sd.img`      | Back the SD card (SDMMC1) with this raw FAT32 image. Without it (and with no `sd.img` in the working directory) the slot is empty. |
 | `--boot0`             | `BOOT0`       | eMMC BOOT0 partition file (SDMMC4).                       |
 | `--rawnand`           | `rawnand.bin` | eMMC GPP partition prefix (auto-detects `.00`, `.01`, …). |
 | `--prod-keys`         | `prod.keys`   | Override BIS keys from a Lockpick-style key file.         |
 | `--oem`               | `erista` \| `mariko` | Switch SoC generation. Drives `APB_MISC_GP_HIDREV` so Hekate's `h_cfg.t210b01` matches and pkg1 identification skips the right OEM header. Default `erista`. |
 | `--bt-radio`          | `healthy` \| `faulty` \| `absent` | Broadcom CYW4356 behaviour on UART-D. `healthy` powers up on the `BT_REG_ON` edge, holds `BT_HOST_WAKE` high, asserts `RTS_N` and answers HCI; `faulty` reproduces the 2110-1118 console (module fitted, never leaves POR); `absent` additionally leaves `BT_UART_RXD` in a break condition. Overrides `[bluetooth] radio` in the ini. Default `healthy`. |
-| `--wifi-radio`        | `healthy` \| `faulty` \| `absent` | The WLAN half of the same CYW4356: a PCI Express endpoint on root port 1. `healthy` trains the link, enumerates as `14E4:43EC` and answers a ChipCommon ChipID read with `0x4356`; `faulty` still trains and enumerates but reads all ones on the backplane (live PCIe front-end, dead radio die); `absent` never leaves detect. The model also enforces the datasheet's power-up ordering, so a payload that releases PERST# too early gets a link that stays down and a `[pcie]` line naming the reason. Overrides `[wifi] radio` in the ini. Default `healthy`. |
+| `--wifi-radio`        | `healthy` \| `faulty` \| `absent` | The WLAN half of the same CYW4356: a PCI Express endpoint on root port 1, reachable only from CPU0 (the BPMP reads all ones, as on silicon). `healthy` trains the link, enumerates as `14E4:43EC` and answers a ChipCommon ChipID read with `0x4356`; `faulty` still trains and enumerates but reads all ones on the backplane (live PCIe front-end, dead radio die); `absent` never leaves detect. The model also enforces the datasheet's power-up ordering, so a payload that releases PERST# too early gets a link that stays down and a `[pcie]` line naming the reason. Overrides `[wifi] radio` in the ini. Default `healthy`. |
+| `--usb-host`          | `nbd[:port]` (optional) | A PC on the USB-C port. It enumerates whatever USB gadget the payload brings up; a mass storage disk is read back (checked against the SD image), its last 8 sectors are written back unchanged and read again unless it is write-protected, and it is ejected; HID reports are polled. With `nbd` the disk is served over NBD on 127.0.0.1 (port 10809 by default) until the client disconnects, then ejected - see [Mounting a gadget's disk](#mounting-a-gadgets-disk). Logged as `[usb-host]`; `RCM_USB_TRACE=1` traces every transfer. Overrides `[usb] host` and `[usb] nbd_port` in the ini. |
+| `--input-script`      | file or spec  | Scripted input keyed to emulated time: `<ms> P\|U\|D [hold_ms]` presses POWER / VOL+ / VOL-, `<ms> TAP <x> <y> [hold_ms]` taps the touchscreen at (x, y) in the 1280x720 picture, `+N` times an event N ms after the previous one. Events are separated by `,`, `;` or newlines. |
 | `--auto-pin-recovery` | (none)        | Drive the Lockpick PIN-recovery menu without user input.  |
 | `--auto-te-script`    | (none)        | Drive `recover_pin.te` in TegraExplorer without input.    |
 
@@ -244,21 +331,26 @@ flowchart LR
     root --> top["main.cpp<br/>emu_state.h<br/>Makefile<br/>Dockerfile<br/>README.md / DESIGN.md"]
     root --> t210["t210/<br/>(SoC peripheral models)"]
     root --> display["display/"]
+    root --> tests["tests/<br/>ccplex/, se/, usb/, display/, hwtest/"]
 
-    t210 --> mmio["mmio.{h,cpp}<br/>memory_map.h<br/>tegra_bl.h"]
-    t210 --> sdmmc["sdmmc.{h,cpp}<br/>SDMMC1 / SDMMC4"]
-    t210 --> se["se_engine.{h,cpp}<br/>AES-128, SHA-256"]
+    t210 --> mmio["mmio.{h,cpp}<br/>memory_map.h<br/>regcache.h, tegra_bl.h"]
+    t210 --> cpus["bpmp.{h,cpp} BPMP clock<br/>ccplex.{h,cpp} CPU0 (A57)"]
+    t210 --> pcie["pcie.{h,cpp}<br/>root complex + CYW4356"]
+    t210 --> se["se_engine.{h,cpp}<br/>AES-128, SHA-256, RSA, RNG"]
     t210 --> i2c["i2c3.{h,cpp}<br/>STMFTS / FTS4 touch"]
+    t210 --> usb["usb.{h,cpp}<br/>USB device controllers + host PC"]
 
-    display --> sdl["sdl_display.{h,cpp}<br/>block-linear de-swizzle<br/>+ SDL2"]
+    display --> sdl["sdl_display.{h,cpp}<br/>DC window scan-out<br/>+ SDL2"]
 ```
 
 For implementation details, see [DESIGN.md](DESIGN.md).
 
 ## Limitations
 
-- **BPMP only.** Horizon and Atmosphère need A57 core emulation. This only
-  models the ARM7 bootloader environment.
+- **BPMP plus one A57.** CPU0 runs bare-metal AArch64 handed to it by a
+  payload; there is no GIC, no generic timer, no secondary cores and no guest
+  exception delivery (a fault halts CPU0 and says so). Horizon and Atmosphère
+  are out of reach.
 - **Subset of MMIO (Memory-Mapped I/O).** Peripherals are modelled to the depth
   required by the payloads above. New payloads may exercise registers that fall
   through to the default catch-all and need handlers added.
@@ -266,9 +358,15 @@ For implementation details, see [DESIGN.md](DESIGN.md).
   firmware and the full master-key unwrapping flow are not faithfully emulated.
   `--prod-keys` is a pragmatic shortcut: when Lockpick writes a derived BIS
   (Boot Image Storage) key into a keyslot, the value from the user-supplied key
-  file is substituted. RSA, RNG, and chunked SHA are stubs.
-- **Single-threaded.** The CPU runs in batches on the main thread between SDL
-  event polls. Tight host CPU loops will starve the display refresh.
+  file is substituted. The random number generator starts from a fixed
+  seed, so runs repeat.
+- **Single-threaded.** Both cores run in batches on the main thread between
+  SDL event polls. That is also what keeps them deterministic.
+- **The USB host drives mass storage and HID only.** A gadget of another
+  class is enumerated and left configured. Over NBD, one client has the disk
+  per session: when it disconnects - `nbdinfo` and `qemu-img info` do so as
+  soon as they have their answer - the disk is ejected, as a PC ejects a
+  disk it has unmounted.
 
 ## Acknowledgements
 

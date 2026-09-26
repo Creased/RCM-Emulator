@@ -1,12 +1,14 @@
 #include "se_engine.h"
 #include "../emu_state.h"
 #include "memory_map.h"
+#include "mmio.h"
 
 #include <unicorn/unicorn.h>
 
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <vector>
 
 // =============================================================================
 //  Tegra X1 Security Engine (SE) emulation
@@ -41,25 +43,20 @@ static const uint32_t K[64] = {
 
 #define ROR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
 
-static void compute(const uint8_t *msg, uint32_t len, uint8_t out[32]) {
-    uint32_t H[8] = {
-        0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
-        0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19,
-    };
-    // Total padded length: msg + 0x80 + zeros + 8-byte length, multiple of 64
-    uint64_t bitlen = (uint64_t)len * 8;
-    uint32_t padded_len = ((len + 1 + 8 + 63) / 64) * 64;
-    uint8_t *buf = (uint8_t*)std::calloc(1, padded_len);
-    std::memcpy(buf, msg, len);
-    buf[len] = 0x80;
-    for (int i = 0; i < 8; i++) buf[padded_len - 1 - i] = (uint8_t)(bitlen >> (i * 8));
-    for (uint32_t off = 0; off < padded_len; off += 64) {
+static const uint32_t H0[8] = {
+    0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+    0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19,
+};
+
+// Compress `nblocks` 64-byte blocks into the running state H.
+static void blocks(uint32_t H[8], const uint8_t *p, size_t nblocks) {
+    for (size_t blk = 0; blk < nblocks; blk++, p += 64) {
         uint32_t W[64];
         for (int i = 0; i < 16; i++) {
-            W[i] = ((uint32_t)buf[off + i*4 + 0] << 24) |
-                   ((uint32_t)buf[off + i*4 + 1] << 16) |
-                   ((uint32_t)buf[off + i*4 + 2] <<  8) |
-                   ((uint32_t)buf[off + i*4 + 3]);
+            W[i] = ((uint32_t)p[i*4 + 0] << 24) |
+                   ((uint32_t)p[i*4 + 1] << 16) |
+                   ((uint32_t)p[i*4 + 2] <<  8) |
+                   ((uint32_t)p[i*4 + 3]);
         }
         for (int i = 16; i < 64; i++) {
             uint32_t s0 = ROR32(W[i-15],7) ^ ROR32(W[i-15],18) ^ (W[i-15] >> 3);
@@ -79,13 +76,23 @@ static void compute(const uint8_t *msg, uint32_t len, uint8_t out[32]) {
         H[0]+=a; H[1]+=b; H[2]+=c; H[3]+=d;
         H[4]+=e; H[5]+=f; H[6]+=g; H[7]+=h;
     }
-    std::free(buf);
-    for (int i = 0; i < 8; i++) {
-        out[i*4 + 0] = (uint8_t)(H[i] >> 24);
-        out[i*4 + 1] = (uint8_t)(H[i] >> 16);
-        out[i*4 + 2] = (uint8_t)(H[i] >>  8);
-        out[i*4 + 3] = (uint8_t)(H[i]);
-    }
+}
+
+// Hash the last `len` bytes of a message whose total length is `total_bits`,
+// padding as FIPS 180-4 requires. Whole blocks go straight through; only the
+// tail is copied.
+static void final(uint32_t H[8], const uint8_t *msg, size_t len,
+                  uint64_t total_bits) {
+    size_t whole = len / 64;
+    blocks(H, msg, whole);
+    uint8_t tail[128] = {0};
+    size_t rest = len - whole * 64;
+    std::memcpy(tail, msg + whole * 64, rest);
+    tail[rest] = 0x80;
+    size_t tail_len = (rest + 1 + 8 <= 64) ? 64 : 128;
+    for (int i = 0; i < 8; i++)
+        tail[tail_len - 1 - i] = (uint8_t)(total_bits >> (i * 8));
+    blocks(H, tail, tail_len / 64);
 }
 
 #undef ROR32
@@ -249,8 +256,40 @@ constexpr uint32_t SE_RNG_CONFIG_REG         = 0x340;
 constexpr uint32_t SE_HASH_RESULT_REG        = 0x030; // 16 dwords
 constexpr uint32_t SE_STATUS_REG             = 0x800;
 constexpr uint32_t SE_ERR_STATUS_REG         = 0x804;
+constexpr uint32_t SE_CONTEXT_SAVE_CONFIG_REG = 0x070;
+constexpr uint32_t SE_SHA_CONFIG_REG         = 0x200;
+constexpr uint32_t SE_SHA_MSG_LENGTH_REG     = 0x204; // 4 dwords, in bits
+constexpr uint32_t SE_SHA_MSG_LEFT_REG       = 0x214; // 4 dwords, in bits
+constexpr uint32_t SE_RSA_CONFIG_REG         = 0x400;
+constexpr uint32_t SE_RSA_KEY_SIZE_REG       = 0x404;
+constexpr uint32_t SE_RSA_EXP_SIZE_REG       = 0x408;
+constexpr uint32_t SE_RSA_KEYTABLE_ADDR_REG  = 0x420;
+constexpr uint32_t SE_RSA_KEYTABLE_DATA_REG  = 0x424;
+constexpr uint32_t SE_RSA_OUTPUT_REG         = 0x428; // 64 dwords
 
 constexpr uint32_t SE_INT_OP_DONE   = 1u << 4;
+constexpr uint32_t SE_INT_ERR_STAT  = 1u << 16;
+
+constexpr uint32_t SE_OP_START    = 1;
+constexpr uint32_t SE_OP_CTX_SAVE = 3;
+
+constexpr uint32_t ALG_RNG = 2;
+constexpr uint32_t ALG_SHA = 3;
+constexpr uint32_t ALG_RSA = 4;
+constexpr uint32_t MODE_SHA256 = 5;
+constexpr uint32_t DST_SRK     = 3;
+constexpr uint32_t DST_RSAREG  = 4;
+constexpr uint32_t SHA_INIT_HASH = 1;
+
+// SE_CONTEXT_SAVE_CONFIG: source in 31:29, AES key index in 11:8, word quad
+// in 1:0 (bdk se_t210.h).
+constexpr uint32_t CTX_SRC_AES_KEYTABLE = 2;
+constexpr uint32_t CTX_SRC_SRK          = 6;
+
+// A linked-list entry's size field is 24 bits (bdk masks it the same way),
+// which also bounds how much one operation can move: 16 MiB, 2^20 blocks.
+constexpr uint32_t LL_SIZE_MASK   = 0xFFFFFF;
+constexpr uint32_t MAX_AES_BLOCKS = (LL_SIZE_MASK + 1) / 16;
 
 constexpr uint32_t ALG_NOP     = 0;
 constexpr uint32_t ALG_AES_DEC = 1;
@@ -312,106 +351,333 @@ static uint32_t reg_err_status    = 0;
 static uint32_t reg_rng_config    = 0;
 static uint32_t spare_regs[256]   = {0}; // catch-all for less critical regs
 
+// The two RSA keyslots, as bdk's se_rsa_key_set() loads them: 32-bit words,
+// least significant first (it writes the big-endian key backwards, each word
+// byte-swapped). SE_RSA_KEYTABLE_ADDR picks the word: PKT in 5:0, EXP (0) or
+// MOD (1) in bit 6, the slot in bit 7.
+constexpr int kRsaWords = 64; // 2048 bits
+struct RsaKey { uint32_t exp[kRsaWords]; uint32_t mod[kRsaWords]; };
+static RsaKey   rsa_keys[2];
+static uint32_t rsa_config        = 0;
+static uint32_t rsa_key_size      = 0;
+static uint32_t rsa_exp_size      = 0;
+static uint32_t rsa_keytable_addr = 0;
+static uint32_t rsa_output[kRsaWords] = {0};
+
+// The random number generator's state. The SE's DRBG is seeded from an
+// entropy source; this one starts from a constant, so runs repeat.
+static uint64_t rng_state = 0;
+
+// Secure random key for context save, and the CBC chain the saved blocks
+// are encrypted under. See ctx_save().
+static uint8_t  srk[16]           = {0};
+static uint8_t  ctx_chain[16]     = {0};
+
 // LL descriptor: { num, addr, size }. Hekate often uses num=0 (single descriptor).
 struct LLDesc { uint32_t num, addr, size; };
 
 static bool read_ll(uc_engine *uc, uint32_t ll_addr, LLDesc *out) {
   if (!ll_addr) return false;
   if (uc_mem_read(uc, ll_addr, out, sizeof(LLDesc)) != UC_ERR_OK) return false;
+  out->size &= LL_SIZE_MASK;
   return true;
 }
 
-// Encrypt/decrypt a buffer in-place using the keyslot's key (assumes 128-bit).
+// The operation touched memory it cannot reach: finish with an error, which
+// bdk's _se_op_wait() reports instead of handing back a buffer of zeros.
+static void op_fail(const char *what, uint32_t addr) {
+  std::printf("[se] %s: cannot access 0x%08X - operation failed\n", what, addr);
+  reg_int_status |= SE_INT_OP_DONE | SE_INT_ERR_STAT;
+}
+
+static inline void xor16(uint8_t *d, const uint8_t *s) {
+  for (int j = 0; j < 16; ++j) d[j] ^= s[j];
+}
+
+// SE_CRYPTO_LINEAR_CTR holds the counter as the driver wrote it, bytes in
+// memory order; it counts as one big-endian 128-bit number.
+static void ctr_add(uint32_t n) {
+  uint8_t *p = (uint8_t *)linear_ctr;
+  for (int j = 15; j >= 0 && n; --j) {
+    uint32_t v = p[j] + (n & 0xFF);
+    p[j] = (uint8_t)v;
+    n = (n >> 8) + (v >> 8);
+  }
+}
+
+// One AES operation over `blocks` 16-byte blocks, chained the way the SE
+// datapath chains them. The configurations bdk's sec/se.c uses:
+//
+//   ECB      INPUT_MEMORY   XOR_BYPASS                  out = AES(in)
+//   CBC enc  INPUT_MEMORY   XOR_TOP     VCTRAM_AESOUT   out = AES(in ^ v); v = out
+//   CBC dec  INPUT_MEMORY   XOR_BOTTOM  VCTRAM_PREVMEM  out = AES(in) ^ v; v = in
+//   OFB      INPUT_AESOUT   XOR_BOTTOM                  v = AES(v); out = v ^ in
+//   CTR      INPUT_LNR_CTR  XOR_BOTTOM                  out = AES(ctr) ^ in; ctr += n
+//
+// v, the vector RAM, starts from the slot's original or updated IV (IV_SEL).
+// When the mode chains, the final v is left in the slot's UPDATED_IV: that is
+// how bdk continues a chain into a trailing partial block, and how its CMAC
+// feeds the last block after the others. With HASH enabled (CMAC) the last
+// AES output goes to SE_HASH_RESULT.
 static void run_aes_blocks(uint32_t slot, bool encrypt,
                            const uint8_t *in, uint8_t *out, size_t blocks,
                            uint32_t xor_pos, uint32_t input_sel,
                            uint32_t vctram_sel, uint32_t iv_sel,
-                           bool ctr_mode, bool hash_mode) {
+                           uint32_t ctr_step, bool hash_mode) {
   uint8_t rk[176];
   aes::key_expand(ks_table[slot].key, rk);
 
-  // Pick which IV to use for chaining. Hekate typically uses ORIGINAL_IV for
-  // CBC starts and switches to UPDATED_IV mid-CMAC; we honour that.
-  uint8_t chain[16];
-  if (iv_sel == IV_UPDATED) std::memcpy(chain, ks_table[slot].iv_upd, 16);
-  else                      std::memcpy(chain, ks_table[slot].iv_orig, 16);
-
-  uint8_t prev_in[16] = {0};
-  uint8_t hash_state[16] = {0}; // accumulator for HASH=1 (CMAC) — XOR top, encrypt
-  if (hash_mode) std::memcpy(hash_state, chain, 16);
+  uint8_t v[16];
+  std::memcpy(v, iv_sel == IV_UPDATED ? ks_table[slot].iv_upd
+                                      : ks_table[slot].iv_orig, 16);
+  uint8_t aes_out[16] = {0};
 
   for (size_t i = 0; i < blocks; ++i) {
-    uint8_t in_block[16];
-    uint8_t out_block[16];
+    const uint8_t *mem = in + i * 16;
+    uint8_t a[16];
+    if (input_sel == INPUT_LNR_CTR)     std::memcpy(a, linear_ctr, 16);
+    else if (input_sel == INPUT_AESOUT) std::memcpy(a, v, 16);
+    else                                std::memcpy(a, mem, 16);
 
-    if (input_sel == INPUT_LNR_CTR) {
-      // CTR mode input is the linear counter (big-endian 128-bit), per-block.
-      // Our linear_ctr[] is stored as 4 dwords little-endian; assemble.
-      uint8_t ctr_be[16];
-      for (int j = 0; j < 4; ++j) {
-        uint32_t w = linear_ctr[j];
-        ctr_be[j*4 + 0] = (w >> 0)  & 0xFF;
-        ctr_be[j*4 + 1] = (w >> 8)  & 0xFF;
-        ctr_be[j*4 + 2] = (w >> 16) & 0xFF;
-        ctr_be[j*4 + 3] = (w >> 24) & 0xFF;
-      }
-      std::memcpy(in_block, ctr_be, 16);
-    } else if (input_sel == INPUT_AESOUT) {
-      // Re-feeding previous AES output (used in some chained constructions).
-      std::memcpy(in_block, prev_in, 16);
-    } else {
-      std::memcpy(in_block, in + i*16, 16);
+    if (xor_pos == XOR_TOP) xor16(a, v);
+    if (encrypt) aes::encrypt_block(a, aes_out, rk);
+    else         aes::decrypt_block(a, aes_out, rk);
+
+    uint8_t *o = out + i * 16;
+    std::memcpy(o, aes_out, 16);
+    // After the core: CBC decrypt XORs the vector; OFB and CTR XOR the data.
+    if (xor_pos == XOR_BOTTOM) xor16(o, input_sel == INPUT_MEMORY ? v : mem);
+
+    if (input_sel == INPUT_AESOUT || vctram_sel == VCTRAM_AESOUT)
+      std::memcpy(v, aes_out, 16);
+    else if (vctram_sel == VCTRAM_PREVMEM)
+      std::memcpy(v, mem, 16);
+
+    if (input_sel == INPUT_LNR_CTR) ctr_add(ctr_step);
+  }
+
+  if (hash_mode) std::memcpy(hash_result, aes_out, 16);
+  bool chained = input_sel == INPUT_AESOUT || vctram_sel == VCTRAM_AESOUT ||
+                 vctram_sel == VCTRAM_PREVMEM;
+  if (chained && blocks) std::memcpy(ks_table[slot].iv_upd, v, 16);
+}
+
+// ---- RSA: x^e mod n, Montgomery multiplication on 32-bit words -------------
+//
+// Numbers are arrays of words, least significant first, n words long.
+
+static bool big_geq(const uint32_t *a, const uint32_t *b, int n) {
+  for (int i = n - 1; i >= 0; --i)
+    if (a[i] != b[i]) return a[i] > b[i];
+  return true;
+}
+
+static void big_sub(uint32_t *a, const uint32_t *b, int n) {
+  uint64_t borrow = 0;
+  for (int i = 0; i < n; ++i) {
+    uint64_t d = (uint64_t)a[i] - b[i] - borrow;
+    a[i] = (uint32_t)d;
+    borrow = d >> 63;
+  }
+}
+
+// x = (2x + bit) mod m, for x < m.
+static void big_shl1_mod(uint32_t *x, uint32_t bit, const uint32_t *m, int n) {
+  uint32_t carry = bit;
+  for (int i = 0; i < n; ++i) {
+    uint32_t top = x[i] >> 31;
+    x[i] = x[i] << 1 | carry;
+    carry = top;
+  }
+  if (carry || big_geq(x, m, n)) big_sub(x, m, n);
+}
+
+// r = a mod m, a being na words long.
+static void big_mod(const uint32_t *a, int na, const uint32_t *m, int n,
+                    uint32_t *r) {
+  std::memset(r, 0, n * sizeof(uint32_t));
+  for (int i = na * 32 - 1; i >= 0; --i)
+    big_shl1_mod(r, a[i / 32] >> (i % 32) & 1, m, n);
+}
+
+// t = a * b / 2^(32n) mod m, for a, b < m and m odd (CIOS).
+static void mont_mul(const uint32_t *a, const uint32_t *b, const uint32_t *m,
+                     uint32_t minv, int n, uint32_t *out) {
+  uint32_t t[kRsaWords + 2] = {0};
+  for (int i = 0; i < n; ++i) {
+    uint64_t c = 0;
+    for (int j = 0; j < n; ++j) {
+      uint64_t s = (uint64_t)t[j] + (uint64_t)a[j] * b[i] + c;
+      t[j] = (uint32_t)s;
+      c = s >> 32;
     }
-
-    // VCTRAM source: the value XORed at XOR_TOP / XOR_BOTTOM.
-    uint8_t vctram[16];
-    if (vctram_sel == VCTRAM_AESOUT)       std::memcpy(vctram, prev_in, 16);
-    else if (vctram_sel == VCTRAM_PREVMEM) std::memcpy(vctram, (i==0)? chain : (in + (i-1)*16), 16);
-    else                                   std::memcpy(vctram, chain, 16);
-
-    if (xor_pos == XOR_TOP) {
-      for (int j = 0; j < 16; ++j) in_block[j] ^= vctram[j];
+    uint64_t s = (uint64_t)t[n] + c;
+    t[n] = (uint32_t)s;
+    t[n + 1] = (uint32_t)(s >> 32);
+    uint32_t u = t[0] * minv;
+    c = ((uint64_t)t[0] + (uint64_t)u * m[0]) >> 32;
+    for (int j = 1; j < n; ++j) {
+      s = (uint64_t)t[j] + (uint64_t)u * m[j] + c;
+      t[j - 1] = (uint32_t)s;
+      c = s >> 32;
     }
+    s = (uint64_t)t[n] + c;
+    t[n - 1] = (uint32_t)s;
+    t[n] = t[n + 1] + (uint32_t)(s >> 32);
+  }
+  if (t[n] || big_geq(t, m, n)) big_sub(t, m, n);
+  std::memcpy(out, t, n * sizeof(uint32_t));
+}
 
-    if (encrypt) aes::encrypt_block(in_block, out_block, rk);
-    else         aes::decrypt_block(in_block, out_block, rk);
+// out = x^e mod m. m must be odd (every RSA modulus is); false if it is not.
+static bool mod_exp(const uint32_t *x, const uint32_t *e, int ne,
+                    const uint32_t *m, int n, uint32_t *out) {
+  if (!(m[0] & 1)) return false;
+  // -1/m mod 2^32 by Newton's iteration; m0 is its own inverse mod 8.
+  uint32_t inv = m[0];
+  for (int i = 0; i < 4; ++i) inv *= 2 - m[0] * inv;
+  uint32_t minv = 0u - inv;
 
-    if (xor_pos == XOR_BOTTOM) {
-      // Output XOR with chain (CTR keystream XOR plaintext, etc.)
-      const uint8_t *xb = (input_sel == INPUT_LNR_CTR)
-        ? (in + i*16)            // CTR: XOR with plaintext from memory
-        : vctram;
-      for (int j = 0; j < 16; ++j) out_block[j] ^= xb[j];
-    }
+  // R^2 mod m, R = 2^(32n): 1 doubled 64n times.
+  uint32_t r2[kRsaWords] = {0}, one[kRsaWords] = {0};
+  one[0] = 1;
+  big_mod(one, 1, m, n, r2);
+  for (int i = 0; i < 64 * n; ++i) big_shl1_mod(r2, 0, m, n);
 
-    if (out) std::memcpy(out + i*16, out_block, 16);
+  uint32_t xm[kRsaWords], acc[kRsaWords];
+  big_mod(x, n, m, n, xm);
+  mont_mul(xm, r2, m, minv, n, xm);  // x in Montgomery form
+  mont_mul(one, r2, m, minv, n, acc); // 1 in Montgomery form
+  for (int i = ne * 32 - 1; i >= 0; --i) {
+    mont_mul(acc, acc, m, minv, n, acc);
+    if (e[i / 32] >> (i % 32) & 1) mont_mul(acc, xm, m, minv, n, acc);
+  }
+  mont_mul(acc, one, m, minv, n, out);
+  return true;
+}
 
-    // Advance chain for next block.
-    if (xor_pos == XOR_BOTTOM && input_sel != INPUT_LNR_CTR) {
-      // CBC encrypt: chain = ciphertext = out_block
-      std::memcpy(chain, out_block, 16);
-    } else if (xor_pos == XOR_TOP) {
-      // CBC decrypt: chain = ciphertext (the input block we read)
-      std::memcpy(chain, in + i*16, 16);
-    }
-    std::memcpy(prev_in, out_block, 16);
+// SE_OP_START with ALG_RSA, as bdk's se_rsa_exp_mod() drives it: the input
+// arrives over DMA as a little-endian number the size of the modulus, the
+// key comes from the slot in SE_RSA_CONFIG, KEY_SIZE gives the modulus in
+// 512-bit steps and EXP_SIZE the exponent in words. The result goes to
+// SE_RSA_OUTPUT (least significant word first), or to memory.
+static void rsa_op(EmuState *state, uint32_t dst_kind) {
+  const RsaKey &k = rsa_keys[(rsa_config >> 24) & 1];
+  int n = (int)((rsa_key_size & 3) + 1) * 16;
+  int ne = (int)(rsa_exp_size > (uint32_t)kRsaWords ? kRsaWords : rsa_exp_size);
 
-    if (ctr_mode) {
-      // Increment linear counter (big-endian 128-bit).
-      for (int j = 15; j >= 0; --j) {
-        uint8_t *p = (uint8_t*)linear_ctr;
-        p[j]++;
-        if (p[j]) break;
-      }
+  uint32_t x[kRsaWords] = {0};
+  LLDesc in_ll{};
+  if (read_ll(state->uc, reg_in_ll_addr, &in_ll) && in_ll.size) {
+    uint32_t copy = in_ll.size < (uint32_t)n * 4 ? in_ll.size : n * 4;
+    if (uc_mem_read(state->uc, in_ll.addr, x, copy) != UC_ERR_OK) {
+      op_fail("RSA input", in_ll.addr);
+      return;
     }
   }
 
-  if (hash_mode) {
-    // For HASH paths the final cipher block is exposed via SE_HASH_RESULT_REG.
-    std::memcpy(hash_result, prev_in, 16);
+  std::memset(rsa_output, 0, sizeof(rsa_output));
+  if (!mod_exp(x, k.exp, ne, k.mod, n, rsa_output)) {
+    std::printf("[se] RSA-%d: even modulus, no result\n", n * 32);
+    reg_int_status |= SE_INT_OP_DONE | SE_INT_ERR_STAT;
+    return;
   }
-  // Save updated IV (chain) for next call's IV_UPDATED.
-  std::memcpy(ks_table[slot].iv_upd, chain, 16);
+  std::printf("[se] RSA-%d exp mod, %d-bit exponent -> ...%08X\n", n * 32,
+              ne * 32, rsa_output[0]);
+
+  if (dst_kind == DST_MEMORY) {
+    LLDesc out_ll{};
+    if (read_ll(state->uc, reg_out_ll_addr, &out_ll) && out_ll.size) {
+      uint32_t copy = out_ll.size < (uint32_t)n * 4 ? out_ll.size : n * 4;
+      if (uc_mem_write(state->uc, out_ll.addr, rsa_output, copy) != UC_ERR_OK) {
+        op_fail("RSA output", out_ll.addr);
+        return;
+      }
+    }
+  }
+  reg_int_status |= SE_INT_OP_DONE;
+}
+
+// SplitMix64: small, and its output has no visible pattern.
+static uint64_t rng_next() {
+  uint64_t z = (rng_state += 0x9E3779B97F4A7C15ull);
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+  return z ^ (z >> 31);
+}
+
+static void rng_fill(uint8_t *p, size_t len) {
+  for (size_t i = 0; i < len; i += 8) {
+    uint64_t v = rng_next();
+    std::memcpy(p + i, &v, len - i < 8 ? len - i : 8);
+  }
+}
+
+// SE_OP_START with ALG_RNG into memory or a keyslot: bdk's se_rng_pseudo()
+// and TegraExplorer's se_generate_random() fill a buffer, SE_CRYPTO_LAST_BLOCK
+// + 1 blocks of it; Atmosphère-style drivers fill a key quad.
+static void rng_op(EmuState *state, uint32_t dst_kind) {
+  uint32_t blocks = (reg_block_count % MAX_AES_BLOCKS) + 1;
+  if (dst_kind == DST_KEYTABLE) {
+    Keyslot &k = ks_table[(reg_keytable_dst >> 8) & 0xF];
+    uint8_t *target[4] = {k.key, k.key + 16, k.iv_orig, k.iv_upd};
+    rng_fill(target[reg_keytable_dst & 0x3], 16);
+  } else if (dst_kind == DST_MEMORY) {
+    LLDesc out_ll{};
+    if (read_ll(state->uc, reg_out_ll_addr, &out_ll) && out_ll.size) {
+      uint32_t len = out_ll.size < blocks * 16 ? out_ll.size : blocks * 16;
+      std::vector<uint8_t> buf(len);
+      rng_fill(buf.data(), len);
+      if (uc_mem_write(state->uc, out_ll.addr, buf.data(), len) != UC_ERR_OK) {
+        op_fail("RNG output", out_ll.addr);
+        return;
+      }
+    }
+  }
+  reg_int_status |= SE_INT_OP_DONE;
+}
+
+// SHA-256, one-shot or in parts (bdk _se_sha_hash_256). SHA_INIT_HASH starts
+// from the standard initial state, SHA_CONTINUE from the state the previous
+// part left in SE_HASH_RESULT - which is where the hardware keeps it, too.
+// SE_SHA_MSG_LEFT says whether this is the last part: bdk passes one byte
+// more than it feeds for any part but the last, so the engine pads the part
+// only when LEFT equals the data it has, using the total from
+// SE_SHA_MSG_LENGTH. HASH_RESULT holds the state as 8 dwords, most
+// significant byte first; the driver byte-swaps them into the digest.
+static void sha_op(EmuState *state) {
+  LLDesc in_ll{};
+  if (!read_ll(state->uc, reg_in_ll_addr, &in_ll) || !in_ll.size) {
+    reg_int_status |= SE_INT_OP_DONE;
+    return;
+  }
+  std::vector<uint8_t> buf(in_ll.size);
+  if (uc_mem_read(state->uc, in_ll.addr, buf.data(), in_ll.size) != UC_ERR_OK) {
+    op_fail("SHA-256 input", in_ll.addr);
+    return;
+  }
+  auto reg64 = [](uint32_t off) {
+    return (uint64_t)spare_regs[off / 4] | ((uint64_t)spare_regs[off / 4 + 1] << 32);
+  };
+  uint64_t total_bits = reg64(SE_SHA_MSG_LENGTH_REG);
+  uint64_t left_bits  = reg64(SE_SHA_MSG_LEFT_REG);
+  bool init = (spare_regs[SE_SHA_CONFIG_REG / 4] & 1) == SHA_INIT_HASH;
+
+  uint32_t H[8];
+  if (init) std::memcpy(H, sha256::H0, sizeof(H));
+  else      std::memcpy(H, hash_result, sizeof(H));
+
+  bool last = left_bits <= (uint64_t)in_ll.size * 8;
+  if (last)
+    sha256::final(H, buf.data(), in_ll.size, total_bits);
+  else
+    sha256::blocks(H, buf.data(), in_ll.size / 64);
+  std::memcpy(hash_result, H, sizeof(H));
+
+  std::printf("[se] SHA-256 %s%s over %u bytes @0x%X -> %08X...\n",
+              init ? "" : "continued ", last ? "final" : "part",
+              in_ll.size, in_ll.addr, H[0]);
+  reg_int_status |= SE_INT_OP_DONE;
 }
 
 static void op_start(EmuState *state) {
@@ -423,39 +689,27 @@ static void op_start(EmuState *state) {
   bool dec = (dec_alg == ALG_AES_DEC) && (enc_alg == ALG_NOP);
   bool enc = (enc_alg == ALG_AES_ENC) && (dec_alg == ALG_NOP);
 
-  // ---- SHA-256 path ----
-  // ALG_SHA=3, MODE_SHA256=5, DST=DST_HASHREG. Driver flow: writes
-  // SE_SHA_MSG_LENGTH/LEFT, sets up IN_LL pointing at src/src_size, then
-  // OP_START. Output 32 bytes go into HASH_RESULT_REG as 8 big-endian dwords
-  // (driver byte_swap_32's each on read). We currently only model the
-  // oneshot case (SHA_INIT_HASH); save_process_header uses oneshot.
-  if (enc_alg == 3 /*ALG_SHA*/ && dst_kind == DST_HASHREG && enc_mode == 5 /*MODE_SHA256*/) {
-    LLDesc in_ll{};
-    bool got_in = read_ll(state->uc, reg_in_ll_addr, &in_ll);
-    if (!got_in || !in_ll.size) {
-      reg_int_status |= SE_INT_OP_DONE;
-      return;
-    }
-    std::vector<uint8_t> buf(in_ll.size, 0);
-    uc_mem_read(state->uc, in_ll.addr, buf.data(), in_ll.size);
-    uint8_t digest[32];
-    sha256::compute(buf.data(), in_ll.size, digest);
-    // Pack into HASH_RESULT_REG as 8 big-endian dwords (driver byteswaps).
-    for (int i = 0; i < 8; i++) {
-      hash_result[i] = ((uint32_t)digest[i*4 + 0] << 24) |
-                       ((uint32_t)digest[i*4 + 1] << 16) |
-                       ((uint32_t)digest[i*4 + 2] <<  8) |
-                       ((uint32_t)digest[i*4 + 3]);
-    }
-    std::printf("[se] SHA-256 over %u bytes @0x%X -> %02X%02X%02X%02X...\n",
-                in_ll.size, in_ll.addr, digest[0], digest[1], digest[2], digest[3]);
+  if (enc_alg == ALG_SHA && dst_kind == DST_HASHREG && enc_mode == MODE_SHA256) {
+    sha_op(state);
+    return;
+  }
+
+  // RNG into the secure random key: the start of a context save. The key is
+  // fixed rather than random so runs stay reproducible.
+  if (enc_alg == ALG_RNG && dst_kind == DST_SRK) {
+    for (int i = 0; i < 16; ++i) srk[i] = (uint8_t)(0xA5 ^ (i * 0x1D));
+    std::memset(ctx_chain, 0, sizeof(ctx_chain));
     reg_int_status |= SE_INT_OP_DONE;
     return;
   }
 
-  if (dst_kind == 4 /* DST_RSAREG */) {
-    // RSA not implemented — leave output zero.
-    reg_int_status |= SE_INT_OP_DONE;
+  if (enc_alg == ALG_RNG) {
+    rng_op(state, dst_kind);
+    return;
+  }
+
+  if (enc_alg == ALG_RSA) {
+    rsa_op(state, dst_kind);
     return;
   }
 
@@ -470,46 +724,51 @@ static void op_start(EmuState *state) {
   uint32_t iv_sel     = (reg_crypto_config >> 7)  & 0x1;
   uint32_t core_sel   = (reg_crypto_config >> 8)  & 0x1;
   bool     hash_en    = (reg_crypto_config >> 0)  & 0x1;
-  uint32_t ctr_cnt    = (reg_crypto_config >> 11) & 0x1;
+  uint32_t ctr_step   = (reg_crypto_config >> 11) & 0xFF;
   uint32_t key_index  = (reg_crypto_config >> 24) & 0xF;
 
   bool encrypt = (core_sel == CORE_ENCRYPT);
 
-  uint32_t blocks = reg_block_count + 1;
+  // SE_CRYPTO_LAST_BLOCK is the index of the last block. Bounded by what one
+  // linked-list entry can describe, so a wild value cannot overflow the
+  // buffer size below.
+  uint32_t blocks = (reg_block_count % MAX_AES_BLOCKS) + 1;
   uint32_t total_bytes = blocks * 16;
 
-  // Read input via IN_LL.
-  std::vector<uint8_t> in_buf, out_buf;
-  in_buf.resize(total_bytes, 0);
-  out_buf.resize(total_bytes, 0);
+  std::vector<uint8_t> in_buf(total_bytes, 0), out_buf(total_bytes, 0);
 
   LLDesc in_ll{}, out_ll{};
   bool got_in  = read_ll(state->uc, reg_in_ll_addr, &in_ll);
   bool got_out = read_ll(state->uc, reg_out_ll_addr, &out_ll);
-  (void)got_out;
 
-  if (got_in && in_ll.size && input_sel == INPUT_MEMORY) {
+  // Memory input is data for every mode: the block itself for ECB/CBC, what
+  // the keystream is XORed with for OFB/CTR.
+  if (got_in && in_ll.size) {
     uint32_t copy = (in_ll.size < total_bytes) ? in_ll.size : total_bytes;
-    uc_mem_read(state->uc, in_ll.addr, in_buf.data(), copy);
+    if (uc_mem_read(state->uc, in_ll.addr, in_buf.data(), copy) != UC_ERR_OK) {
+      op_fail("AES input", in_ll.addr);
+      return;
+    }
   }
 
   run_aes_blocks(key_index, encrypt, in_buf.data(), out_buf.data(), blocks,
-                 xor_pos, input_sel, vctram_sel, iv_sel,
-                 (input_sel == INPUT_LNR_CTR) || ctr_cnt, hash_en);
+                 xor_pos, input_sel, vctram_sel, iv_sel, ctr_step, hash_en);
 
   if (dst_kind == DST_MEMORY) {
     if (got_out && out_ll.size) {
       uint32_t copy = (out_ll.size < total_bytes) ? out_ll.size : total_bytes;
-      uc_mem_write(state->uc, out_ll.addr, out_buf.data(), copy);
+      if (uc_mem_write(state->uc, out_ll.addr, out_buf.data(), copy) != UC_ERR_OK) {
+        op_fail("AES output", out_ll.addr);
+        return;
+      }
     }
   } else if (dst_kind == DST_KEYTABLE) {
-    // Unwrap-key path: store the (single-block) result in the destination slot.
+    // Unwrap-key path: the (single-block) result lands in the destination
+    // slot's selected word quad.
     uint32_t dst_slot = (reg_keytable_dst >> 8) & 0xF;
-    uint32_t word_quad = reg_keytable_dst & 0x3;
-    uint8_t *target = (word_quad == 1)
-      ? ks_table[dst_slot].key + 16
-      : ks_table[dst_slot].key + 0;
-    std::memcpy(target, out_buf.data(), 16);
+    Keyslot &k = ks_table[dst_slot];
+    uint8_t *target[4] = {k.key, k.key + 16, k.iv_orig, k.iv_upd};
+    std::memcpy(target[reg_keytable_dst & 0x3], out_buf.data(), 16);
   }
   // DST_HASHREG: hash_result is already populated by run_aes_blocks.
 
@@ -520,6 +779,40 @@ static void op_start(EmuState *state) {
          key_index, encrypt ? "ENC" : "DEC", blocks, xor_pos, input_sel,
          vctram_sel, iv_sel, dst_kind,
          got_in ? in_ll.addr : 0, got_out ? out_ll.addr : 0);
+}
+
+// SE_OP_CTX_SAVE, as bdk's se_aes_ctx_get_keys() drives it to read keyslots
+// back: an RNG op seeds the secure random key (SRK); each save of an AES
+// keytable quad writes that quad to memory encrypted under the SRK, CBC-
+// chained from one save to the next; saving the SRK source deposits the key
+// in PMC SECURE_SCRATCH4..7. The driver then loads the SRK into a slot and
+// CBC-decrypts everything it saved in one pass with that slot's original IV,
+// which it never sets - zero from reset - so the chain starts from zero.
+static void ctx_save(EmuState *state) {
+  uint32_t cfg = spare_regs[SE_CONTEXT_SAVE_CONFIG_REG / 4];
+  uint32_t src = cfg >> 29;
+  if ((reg_config >> 2 & 0x7) == DST_MEMORY && src == CTX_SRC_AES_KEYTABLE) {
+    const Keyslot &k = ks_table[(cfg >> 8) & 0xF];
+    const uint8_t *quad[4] = {k.key, k.key + 16, k.iv_orig, k.iv_upd};
+    uint8_t blk[16], rk[176];
+    std::memcpy(blk, quad[cfg & 0x3], 16);
+    xor16(blk, ctx_chain);
+    aes::key_expand(srk, rk);
+    aes::encrypt_block(blk, ctx_chain, rk);
+    LLDesc out_ll{};
+    if (read_ll(state->uc, reg_out_ll_addr, &out_ll) && out_ll.size >= 16 &&
+        uc_mem_write(state->uc, out_ll.addr, ctx_chain, 16) != UC_ERR_OK) {
+      op_fail("context save output", out_ll.addr);
+      return;
+    }
+  } else if (src == CTX_SRC_SRK && reg_config != 0) {
+    for (int i = 0; i < 4; ++i) {
+      uint32_t w;
+      std::memcpy(&w, srk + i * 4, 4);
+      pmc_secure_scratch_write(4 + i, w);
+    }
+  }
+  reg_int_status |= SE_INT_OP_DONE;
 }
 
 // Keytable address layout: bits 4..7 = slot, bits 2..3 = quad, bits 0..1 = pkt
@@ -541,14 +834,19 @@ static void keytable_write(uint32_t addr, uint32_t val) {
   // Lockpick's _derive_bis_keys may produce wrong values when our SE engine
   // doesn't faithfully model some part of the chain; the override is a
   // pragmatic shortcut that lets the BIS XTS layer succeed regardless.
+  // Two writes are never BIS keys and are left alone: clearing a slot (all
+  // zeros), and loading the context-save SRK (bdk puts it in slot 3).
   if (quad == 0 && pkt == 3 && slot < 6) {
-    if (bis_override_present[slot]) {
+    static const uint8_t zero[16] = {0};
+    bool clear = std::memcmp(ks_table[slot].key, zero, 16) == 0;
+    bool is_srk = std::memcmp(ks_table[slot].key, srk, 16) == 0;
+    if (bis_override_present[slot] && !clear && !is_srk) {
       std::memcpy(ks_table[slot].key, bis_override_keys[slot], 16);
       std::printf("[se] slot %u BIS key overridden from prod.keys:", slot);
       for (int i = 0; i < 16; ++i) std::printf(" %02X", ks_table[slot].key[i]);
       std::printf("\n");
-    } else {
-      std::printf("[se] slot %u key loaded (derived):", slot);
+    } else if (!clear) {
+      std::printf("[se] slot %u key loaded:", slot);
       for (int i = 0; i < 16; ++i) std::printf(" %02X", ks_table[slot].key[i]);
       std::printf("\n");
     }
@@ -572,9 +870,12 @@ static uint32_t keytable_read(uint32_t addr) {
   return v;
 }
 
-} // namespace
+static uint32_t &rsa_keytable_word() {
+  RsaKey &k = rsa_keys[(rsa_keytable_addr >> 7) & 1];
+  return ((rsa_keytable_addr >> 6) & 1 ? k.mod : k.exp)[rsa_keytable_addr & 0x3F];
+}
 
-#include <vector>
+} // namespace
 
 uint32_t se_engine_read(EmuState *state, uint64_t addr) {
   uint32_t off = (uint32_t)(addr - SE_BASE);
@@ -583,6 +884,9 @@ uint32_t se_engine_read(EmuState *state, uint64_t addr) {
   }
   if (off >= SE_CRYPTO_LINEAR_CTR_REG && off < SE_CRYPTO_LINEAR_CTR_REG + 16) {
     return linear_ctr[(off - SE_CRYPTO_LINEAR_CTR_REG) / 4];
+  }
+  if (off >= SE_RSA_OUTPUT_REG && off < SE_RSA_OUTPUT_REG + kRsaWords * 4) {
+    return rsa_output[(off - SE_RSA_OUTPUT_REG) / 4];
   }
   switch (off) {
     case SE_OPERATION_REG:        return reg_op;
@@ -599,6 +903,11 @@ uint32_t se_engine_read(EmuState *state, uint64_t addr) {
     case SE_RNG_CONFIG_REG:       return reg_rng_config;
     case SE_STATUS_REG:           return 0; // IDLE
     case SE_ERR_STATUS_REG:       return reg_err_status;
+    case SE_RSA_CONFIG_REG:       return rsa_config;
+    case SE_RSA_KEY_SIZE_REG:     return rsa_key_size;
+    case SE_RSA_EXP_SIZE_REG:     return rsa_exp_size;
+    case SE_RSA_KEYTABLE_ADDR_REG: return rsa_keytable_addr;
+    case SE_RSA_KEYTABLE_DATA_REG: return rsa_keytable_word();
     default:
       if (off < sizeof(spare_regs)/sizeof(spare_regs[0])*4)
         return spare_regs[off / 4];
@@ -616,10 +925,12 @@ void se_engine_write(EmuState *state, uint64_t addr, uint32_t val) {
   switch (off) {
     case SE_OPERATION_REG:
       reg_op = val;
-      // SE_OP_START runs the configured AES op; other op codes (RESTART_*,
-      // CTX_SAVE, ABORT) just need OP_DONE so the driver's _se_wait() exits.
-      if ((val & 0x7) == 1 /*SE_OP_START*/) {
+      // SE_OP_START runs the configured op and CTX_SAVE saves context;
+      // the others (RESTART_*) just need OP_DONE so _se_op_wait() exits.
+      if ((val & 0x7) == SE_OP_START) {
         op_start(state);
+      } else if ((val & 0x7) == SE_OP_CTX_SAVE) {
+        ctx_save(state);
       } else if ((val & 0x7) != 0 /*not ABORT*/) {
         reg_int_status |= SE_INT_OP_DONE;
       }
@@ -639,6 +950,11 @@ void se_engine_write(EmuState *state, uint64_t addr, uint32_t val) {
     case SE_CRYPTO_KEYTABLE_DST:  reg_keytable_dst = val; return;
     case SE_RNG_CONFIG_REG:       reg_rng_config = val; return;
     case SE_ERR_STATUS_REG:       reg_err_status &= ~val; return;
+    case SE_RSA_CONFIG_REG:       rsa_config = val; return;
+    case SE_RSA_KEY_SIZE_REG:     rsa_key_size = val; return;
+    case SE_RSA_EXP_SIZE_REG:     rsa_exp_size = val; return;
+    case SE_RSA_KEYTABLE_ADDR_REG: rsa_keytable_addr = val; return;
+    case SE_RSA_KEYTABLE_DATA_REG: rsa_keytable_word() = val; return;
     default:
       if (off < sizeof(spare_regs)/sizeof(spare_regs[0])*4)
         spare_regs[off / 4] = val;
@@ -647,9 +963,31 @@ void se_engine_write(EmuState *state, uint64_t addr, uint32_t val) {
   (void)state;
 }
 
+// Keys a prod.keys file pre-loaded, which a soft reboot puts back.
+static Keyslot ks_preload[16];
+
 void se_engine_set_aes128_key(uint32_t slot, const uint8_t key[16]) {
   if (slot >= 16) return;
   std::memcpy(ks_table[slot].key, key, 16);
+  std::memcpy(ks_preload[slot].key, key, 16);
+}
+
+void se_engine_reset() {
+  std::memcpy(ks_table, ks_preload, sizeof(ks_table));
+  reg_config = reg_crypto_config = 0;
+  reg_in_ll_addr = reg_out_ll_addr = 0;
+  reg_block_count = reg_keytable_addr = reg_keytable_dst = 0;
+  reg_op = reg_int_status = reg_int_enable = 0;
+  reg_err_status = reg_rng_config = 0;
+  std::memset(linear_ctr, 0, sizeof(linear_ctr));
+  std::memset(hash_result, 0, sizeof(hash_result));
+  std::memset(spare_regs, 0, sizeof(spare_regs));
+  std::memset(srk, 0, sizeof(srk));
+  std::memset(ctx_chain, 0, sizeof(ctx_chain));
+  std::memset(rsa_keys, 0, sizeof(rsa_keys));
+  std::memset(rsa_output, 0, sizeof(rsa_output));
+  rsa_config = rsa_key_size = rsa_exp_size = rsa_keytable_addr = 0;
+  rng_state = 0;
 }
 
 // ---- prod.keys parser -------------------------------------------------------

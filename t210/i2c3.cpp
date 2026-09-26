@@ -132,17 +132,15 @@ void push_controller_ready() {
   if (ev_stack.size() < 32) ev_stack.push_back(ev);
 }
 
-// If SDL has flagged a pending touch event, pack it into the FTS4 stack.
+// Move whatever SDL has queued into the FTS4 event stack, oldest first.
 void try_emit_pending_touch(EmuState *state) {
-  bool was_pending = state->tc_event_pending.exchange(false);
-  if (!was_pending) return;
-  uint8_t  op  = state->tc_event_op.load();
-  uint16_t x   = state->tc_x.load();
-  uint16_t y   = state->tc_y.load();
-  // pressure: a small non-zero value keeps z below the 500-palm-reject threshold
-  // in touch.c (z = (pressure_lo|pressure_hi<<8) << 6 / (mod+0x40)).
-  uint16_t pressure = (op == FTS4_EV_MULTI_TOUCH_LEAVE) ? 0 : 0x10;
-  push_event(op, state->tc_finger_id, x, y, pressure);
+  EmuState::TouchEvent ev;
+  while (ev_stack.size() < 32 && state->touch_take(&ev)) {
+    // pressure: a small non-zero value keeps z below the 500-palm-reject
+    // threshold in touch.c (z = (pressure_lo|pressure_hi<<8) << 6 / (mod+0x40)).
+    uint16_t pressure = (ev.op == FTS4_EV_MULTI_TOUCH_LEAVE) ? 0 : 0x10;
+    push_event(ev.op, state->tc_finger_id, ev.x, ev.y, pressure);
+  }
 }
 
 // Pop oldest event into 8-byte buffer; on empty, return NO_EVENT.
@@ -306,6 +304,24 @@ uint32_t pull_rx_word() {
 }
 
 } // namespace
+
+void i2c3_reset(EmuState *state) {
+  slave_addr = 0;
+  dir_read = false;
+  cmd_data[0] = cmd_data[1] = 0;
+  last_cnfg = 0;
+  pkt_state = PKT_HDR_W1;
+  pkt_size = pkt_recv = 0;
+  pkt_is_combined = false;
+  tx_buf.clear();
+  rx_buf.clear();
+  rx_pos = 0;
+  ev_stack.clear();
+  EmuState::TouchEvent ev;
+  while (state->touch_take(&ev)) {
+  }
+  state->tc_pressed = false;
+}
 
 uint32_t i2c3_read(EmuState *state, uint64_t addr) {
   uint32_t offset = (uint32_t)(addr - I2C3_BASE);

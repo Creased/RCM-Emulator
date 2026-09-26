@@ -27,7 +27,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libunicorn-dev libsdl2-dev
+            build-essential pkg-config libunicorn-dev libsdl2-dev \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi gcc-aarch64-linux-gnu
 
       - name: Build
         run: make -j"$(nproc)"
@@ -43,6 +44,39 @@ jobs:
           ./rcm_emu /nonexistent.bin 2>&1 | tee out.txt || true
           grep -q "RCM Payload Emulator" out.txt \
             || { echo "banner missing - binary did not start"; exit 1; }
+
+      - name: CCPLEX, SE, USB and display regression tests
+        # Small self-contained payloads. One boots CPU0 through bdk's
+        # ccplex_boot_cpu0() register sequence: an unpowered release must be
+        # refused, a powered one must run an AArch64 blob at EL3, and WFE must
+        # park the core. One runs the Security Engine's RSA, SHA-256, AES and
+        # RNG against vectors computed in Python. One brings up USB gadgets on
+        # both device controllers for the --usb-host PC to enumerate, read
+        # back and write, and serves the disk over NBD (on a localhost port)
+        # to a Python client. The others drive the display controller and VIC in six
+        # scenarios, and the frame the emulator shows must match the picture
+        # drawn, pixel for pixel.
+        run: make test
+
+      - name: hwtest end to end
+        # hwtest-rcm's whole hardware sweep, including the Wi-Fi probe that
+        # hands PCIe to an AArch64 stub on CPU0. Built from a pinned commit
+        # with distro toolchains; the run must enumerate the CYW4356.
+        run: |
+          tests/hwtest/build.sh build-hwtest
+          tests/hwtest/run.sh ./rcm_emu build-hwtest/hwtest-rcm/build/hwtest.bin
+
+      - name: Keep test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            tests/ccplex/out.log
+            tests/se/out.log
+            tests/usb/out_*.log
+            tests/hwtest/out.log
+          if-no-files-found: ignore
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

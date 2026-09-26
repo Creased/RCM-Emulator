@@ -1,9 +1,15 @@
 #include "mmio.h"
+#include "block_linear.h"
 #include "trace.h"
 #include "../emu_state.h"
+#include "../platform.h"
 #include "i2c3.h"
 #include "memory_map.h"
+#include "bpmp.h"
+#include "ccplex.h"
 #include "pcie.h"
+#include "usb.h"
+#include "regcache.h"
 #include "se_engine.h"
 #include "tegra_bl.h"
 
@@ -14,35 +20,27 @@
 #include <cstring>
 #include <sys/stat.h>
 #include <map>
+#include <memory>
 #include <unistd.h>
 #include <vector>
 #include <SDL2/SDL.h>
 
-// pread/pwrite are POSIX and MinGW does not have them, so the SD/eMMC image
-// access below would not compile for Windows. Seek-then-read is equivalent
-// here: the emulated storage is touched only from the CPU thread, so the
-// atomicity real pread() buys against a shared file offset is not in play.
-// Kept next to the includes rather than in a header because these four call
-// sites are the only users in the tree.
-#ifdef _WIN32
-#include <io.h>
-static inline ssize_t pread(int fd, void *buf, size_t n, long long off) {
-  if (_lseeki64(fd, off, SEEK_SET) < 0)
-    return -1;
-  return _read(fd, buf, (unsigned int)n);
-}
-static inline ssize_t pwrite(int fd, const void *buf, size_t n, long long off) {
-  if (_lseeki64(fd, off, SEEK_SET) < 0)
-    return -1;
-  return _write(fd, buf, (unsigned int)n);
-}
-#endif
-
 #define BIT(n) (1U << (n))
 
-static uint32_t pmc_scratch0 = 0;
-static uint32_t pmc_scratch37 = 0;
-static std::map<uint64_t, uint32_t> mmio_regs;
+static RegCache mmio_regs;
+
+// A payload asked for a reset. Stop the BPMP where it is instead of letting
+// it run to the end of its batch: bdk's power_set_state() follows the reset
+// write with bpmp_halt(), which must not get the chance to end the run.
+static void request_reboot(EmuState *state, bool power_cycle) {
+  if (power_cycle)
+    state->reboot_cold = true;
+  state->reboot_requested = true;
+  if (g_bus_master == BUS_BPMP)
+    uc_emu_stop(state->uc);
+}
+
+BusMaster g_bus_master = BUS_BPMP;
 
 // Standard CRC32 (poly 0xEDB88320), matching hekate's crc32_calc(0, ...) which
 // the payload uses to validate the GPT. Init/final via ~ like the reference.
@@ -127,12 +125,28 @@ static const uint8_t *emmc_synth_gpt(size_t *out_len) {
 // hook caches every store), but a pad nobody has touched still has a reset
 // value, and probes read those to prove a pad is where the BootROM left it.
 // Only the pads a probe actually samples are listed; everything else keeps
-// reading 0, which is the honest "not modelled" answer.
+// reading 0, the honest "not modelled" answer (most pads reset to non-zero).
 struct PinmuxDefault { uint16_t off; uint32_t val; };
 static const PinmuxDefault pinmux_defaults[] = {
     // PH5 / BT_HOST_WAKE: E_INPUT | PARKED | TRISTATE | PULL_DOWN. Measured
     // as 0x0074 at payload entry on all four reference consoles.
     {0x1C8, 0x00000074},
+    // PEX_L1_RST_N / PEX_L1_CLKREQ_N: the root-port-1 reset and clock-request
+    // pads. TRM reset values, and what hwtest's Wi-Fi probe reads on a real
+    // console before it unparks them: PE1 function, PARKED (bit 5) set, so the
+    // pad does not drive until software clears it.
+    {0x044, 0x00000460},
+    {0x048, 0x00000470},
+    // Pads the wireless probes sample before (or without) configuring them.
+    // TRM 9.15 reset values: E_INPUT | PARKED | TRISTATE | PULL_DOWN (0x74),
+    // UART2_RX pulled up instead (0x78).
+    {0x0F8, 0x00000078},   // UART2_RX
+    {0x118, 0x00000074},   // UART4_RX (UART-D, the BT transport)
+    {0x1B8, 0x00000074},   // WIFI_RST
+    {0x1C0, 0x00000074},   // AP_WAKE_BT
+    {0x1C4, 0x00000074},   // BT_RST
+    {0x1CC, 0x00000074},   // AP_WAKE_NFC
+    {0x250, 0x00000074},   // GPIO_PH6
 };
 
 static uint32_t pinmux_reset_default(uint64_t addr) {
@@ -172,6 +186,8 @@ static const uint32_t uart_bases[EmuState::N_UARTS] = {
 // Per-port electrical state the plain register cache cannot express.
 struct UartPort {
   uint16_t divisor   = 0;      // latched DLL/DLM, i.e. the programmed baud
+  uint8_t  ier       = 0;      // IER, which shares +0x04 with DLM
+  uint8_t  fcr       = 0;      // FCR, write-only; IIR 7:6 reports its bit 0
   uint8_t  mcr       = 0;      // last MCR write; bit 4 = internal loopback
   uint8_t  msr_delta = 0;      // MSR bits 3:0: set on change, cleared on read
   bool     cts       = false;  // peer drove its RTS_N low -> MSR bit 4
@@ -252,8 +268,10 @@ static bool bt_radio_alive(EmuState *state) {
 // could observe it rather than from a timer: emu_usec only moves while the
 // CPU runs, so "now" is always current at the point of a register access.
 static void bt_chip_tick(EmuState *state) {
+  // `now` can step back a little when CPU0 takes the bus (it trails the
+  // BPMP by up to a slice), so compare rather than subtract.
   if (bt_chip.phase == BT_PHASE_POR &&
-      state->emu_usec - bt_chip.por_us >= BT_POR_US)
+      state->emu_usec >= bt_chip.por_us + BT_POR_US)
     bt_chip.phase = BT_PHASE_READY;
 }
 
@@ -402,7 +420,7 @@ static const uint16_t gpio_h_pinmux[8] = {
     0x000, 0x1B8, 0x000, 0x1C0, 0x1C4, 0x1C8, 0x000, 0x1CC};
 
 static uint32_t gpio_reg(uint64_t addr) {
-  return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+  return mmio_regs.get(addr);
 }
 
 // Level of a port-H pin the Tegra is NOT driving: the pad simply follows
@@ -483,8 +501,7 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
     // never moved" - so the input register has to reflect what the output
     // register is driving, or that check reports a dead pin on a healthy
     // console. Mirror OUT (port Z is 0x624) into IN for that pin.
-    uint32_t out = mmio_regs.count(GPIO_BASE + 0x624)
-                       ? mmio_regs[GPIO_BASE + 0x624] : 0;
+    uint32_t out = mmio_regs.get(GPIO_BASE + 0x624);
     val |= out & (1u << 4);
     return val;
   }
@@ -501,15 +518,21 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
   // Only toggle while the PWM channel is actually driving the fan, so a
   // payload that checks "duty 0 -> should read 0 RPM" still sees that.
   if (offset == 0x438) {
-    uint32_t csr = mmio_regs.count(PWM_BASE + PWM_CSR_1_OFF)
-                       ? mmio_regs[PWM_BASE + PWM_CSR_1_OFF] : 0;
+    uint32_t csr = mmio_regs.get(PWM_BASE + PWM_CSR_1_OFF);
     bool ch_en   = (csr & (1u << 31)) != 0;
     bool abs_off = (csr & (1u << 24)) != 0;
     uint32_t inv_duty = (csr >> 16) & 0xFF;   // inverted: 236 = ~0%
     bool spinning = ch_en && !abs_off && inv_duty < 236;
-    if (spinning && ((state->emu_usec / 2186ull) & 1ull))
-      return (1u << 7);
-    return 0;
+    uint32_t v = (spinning && ((state->emu_usec / 2186ull) & 1ull)) ? (1u << 7) : 0;
+    // PS3 is the gamecard slot's card detect: active low, pulled up. No
+    // cartridge is emulated, so an undriven PS3 reads high ("slot empty") -
+    // it read 0, "cartridge seated", before.
+    uint32_t oe = mmio_regs.get(GPIO_BASE + 0x418);
+    if (!(oe & (1u << 3)))
+      v |= 1u << 3;
+    // Pins the payload drives itself read back what it drives.
+    v = (v & ~oe) | (mmio_regs.get(GPIO_BASE + 0x428) & oe & 0x7F);
+    return v;
   }
 
   // Port H IN. Resolved per pin (see gpio_h_in) instead of mirroring OUT,
@@ -541,14 +564,14 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
   if (offset < 0x800) {
     if (bank_off < 0x30) {
       // CNF / OE / OUT: hand back the cached write.
-      uint32_t v = mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+      uint32_t v = mmio_regs.get(addr);
       TRACE("[gpio] R: offset 0x%X (CNF/OE/OUT cache) = 0x%08X\n", offset, v);
       return v;
     }
     if (bank_off < 0x40) {
       // IN: mirror of the matching OUT one slot earlier.
       uint64_t out_addr = addr - 0x10;
-      uint32_t v = mmio_regs.count(out_addr) ? mmio_regs[out_addr] : 0;
+      uint32_t v = mmio_regs.get(out_addr);
       TRACE("[gpio] R: offset 0x%X (IN, mirror of OUT @ 0x%X) = 0x%08X\n",
              offset, (uint32_t)(offset - 0x10), v);
       return v;
@@ -556,7 +579,7 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
     // MSK_CNF 0x80 / MSK_OE 0x90 / MSK_OUT 0xA0: aliases that read back the
     // plain register they write through, 0x80 lower.
     if (bank_off >= 0x80 && bank_off < 0xB0) {
-      uint32_t v = mmio_regs.count(addr - 0x80) ? mmio_regs[addr - 0x80] : 0;
+      uint32_t v = mmio_regs.get(addr - 0x80);
       TRACE("[gpio] R: offset 0x%X (masked alias of 0x%X) = 0x%08X\n", offset,
              (uint32_t)(offset - 0x80), v);
       return v;
@@ -566,6 +589,9 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
   TRACE("[gpio] R: offset 0x%X = 0\n", offset);
   return 0;
 }
+
+// The SD card loses power with PE4 (SDMMC section below).
+static void sd_card_gpio_update();
 
 void gpio_write(EmuState *state, uint64_t addr, uint32_t val) {
   uint32_t offset = (uint32_t)(addr - GPIO_BASE);
@@ -582,7 +608,7 @@ void gpio_write(EmuState *state, uint64_t addr, uint32_t val) {
   if (offset < 0x800 && bank_off >= 0x80 && bank_off < 0xB0) {
     uint64_t plain = addr - 0x80;
     uint32_t mask  = (val >> 8) & 0xFF;
-    uint32_t cur   = mmio_regs.count(plain) ? mmio_regs[plain] : 0;
+    uint32_t cur   = mmio_regs.get(plain);
     mmio_regs[plain] = (cur & ~mask) | (val & mask);
     TRACE("[gpio] W: offset 0x%X masked -> 0x%X = 0x%08X\n", offset,
            (uint32_t)(offset - 0x80), mmio_regs[plain]);
@@ -590,10 +616,13 @@ void gpio_write(EmuState *state, uint64_t addr, uint32_t val) {
     TRACE("[gpio] W: offset 0x%X = 0x%08X\n", offset, val);
   }
 
-  // Bank 1 holds ports E..H, and port H carries BT_REG_ON, so re-sample the
-  // radio's power pin after anything that could have moved it.
-  if (offset >= 0x100 && offset < 0x200)
+  // Bank 1 holds ports E..H: port H carries BT_REG_ON and port E the SD
+  // card's supply (PE4), so re-sample both after anything that could have
+  // moved them.
+  if (offset >= 0x100 && offset < 0x200) {
     gpio_h_update(state);
+    sd_card_gpio_update();
+  }
 }
 
 // ==================== I2C ====================
@@ -631,6 +660,67 @@ static uint16_t codec_reg_get(uint8_t reg) {
   return it == codec_regs.end() ? 0 : it->second;
 }
 
+// ---- CCPLEX CPU rail regulators on I2C_5 ----
+//
+// Erista: two MAX77621 bucks, CPU at 0x1B and GPU at 0x1C. Mariko: one
+// MAX77812 at 0x33 (PHASE211) whose M4 phase is the CPU rail. These used to
+// be fixed read-only answers, which was fine while nothing but an identity
+// read ever reached them - but bdk's ccplex_boot_cpu0() turns the CPU rail on
+// through them with read-modify-writes, and whether that rail is up decides
+// whether CPU0 can run at all. So they are register files now, seeded with
+// the values the fixed answers used to give.
+//
+// MAX77621 VOUT/VOUT_DVS: bit 7 = enable, bits 6:0 = 606.25 mV + N*6.25 mV.
+static const uint8_t kMax77621Seed[2][8] = {
+    {0x80 | 63, 0x80 | 63, 0, 0, 0, 0, 0, 0},  // CPU, 1.000 V
+    {0x80 | 63, 0x80 | 63, 0, 0, 0, 0, 0, 0},  // GPU, 1.000 V
+};
+static uint8_t max77621_regs[2][8] = {
+    {0x80 | 63, 0x80 | 63, 0, 0, 0, 0, 0, 0},
+    {0x80 | 63, 0x80 | 63, 0, 0, 0, 0, 0, 0},
+};
+static uint8_t max77812_regs[256];
+static bool max77812_ready = false;
+
+static void max77812_regs_init() {
+  if (max77812_ready)
+    return;
+  max77812_ready = true;
+  auto vout = [](uint32_t mv) -> uint8_t {
+    return (uint8_t)(((mv - 250u) / 5u) & 0xFF);
+  };
+  memset(max77812_regs, 0, sizeof(max77812_regs));
+  max77812_regs[0x14] = 0x05;      // VERSION: QS silicon (ES2 = 0x04)
+  max77812_regs[0x05] = 0x00;      // TOPSYS_STAT: no thermal / OV / UV fault
+  max77812_regs[0x22] = 0x00;      // BUCK_STAT: no per-rail fault latch
+  // EN_CTRL: in RCM the CPU/GPU rails are still dormant (HOS brings them up),
+  // so all phases start disabled - that is the true cold state.
+  max77812_regs[0x06] = 0x00;
+  // Measured on a real Mariko while dormant in RCM.
+  max77812_regs[0x23] = vout(650); // M1 GPU
+  max77812_regs[0x25] = vout(600); // M3 DRAM (VDD2)
+  max77812_regs[0x26] = vout(600); // M4 CPU
+}
+
+static void max77620_regs_init(EmuState *state);
+static uint8_t max77620_regs[256];
+
+bool cpu_rail_on(EmuState *state) {
+  if (state->pmic_otp.load() == 0x53) {
+    max77812_regs_init();
+    return (max77812_regs[0x06] >> 6) & 1;        // EN_CTRL.EN_M4 (CPU)
+  }
+  // The MAX77621's EN pin is MAX77620 GPIO5 (bdk _ccplex_enable_power_t210
+  // configures it push-pull, output high, before touching the buck), and the
+  // buck's own output enable is VOUT bit 7. Both have to be on.
+  max77620_regs_init(state);
+  uint8_t gpio5 = max77620_regs[0x3B];
+  bool en_pin = !(max77620_regs[0x40] & (1u << 5)) &&   // plain GPIO, not AME
+                !(gpio5 & (1u << 1)) &&                  // DIR = output
+                (gpio5 & (1u << 3));                     // output high
+  return en_pin && (max77621_regs[0][0] & 0x80);
+}
+
 // Which slaves actually answer, per bus. This is the emulator's answer to
 // "is that chip fitted?", so it must list exactly what is modelled below and
 // nothing else - a bus scan is a real diagnostic and an emulator that ACKs
@@ -639,15 +729,21 @@ static uint16_t codec_reg_get(uint8_t reg) {
 // Deliberately absent, because they are absent on the board this models:
 //   I2C_1 0x1A  TC94B15WBG headphone amp - not fitted on Erista; hwtest
 //               reports "not fitted on this board" and that is correct.
-#define I2C_STATUS_NOACK (0xFu << 0)
+// I2C_STATUS CMD1_STAT (3:0): 1 = SL1_NOACK_FOR_BYTE1, i.e. nobody answered
+// the address byte (TRM 35.x). bdk tests the whole nibble.
+#define I2C_STATUS_NOACK (1u << 0)
 
 static bool i2c_slave_present(EmuState *state, bool on_i2c5, uint8_t addr) {
   if (on_i2c5) {
+    bool mariko = state && state->pmic_otp.load() == 0x53;
     switch (addr) {
-    case 0x1B:                    // MAX77621 CPU DC-DC
-    case 0x33:                    // RTC / PMIC sub-block
+    case 0x1B:                    // MAX77621 CPU DC-DC  (Erista)
+    case 0x1C:                    // MAX77621 GPU DC-DC  (Erista)
+      return !mariko;
+    case 0x33:                    // MAX77812 CPU/GPU/DRAM buck (Mariko family)
+      return mariko;
     case MAX77620_I2C_ADDR:       // 0x3C PMIC
-    case 0x68:                    // MAX77812 / GPU rail
+    case 0x68:                    // MAX77620 RTC sub-block
       return true;
     default:
       return false;
@@ -660,8 +756,7 @@ static bool i2c_slave_present(EmuState *state, bool on_i2c5, uint8_t addr) {
   case 0x6B:                      // BQ24193 charger
     return true;
   case 0x1C:                      // ALC5639 codec - only once LDO1_EN is up
-    return (mmio_regs.count(GPIO_BASE + 0x624)
-                ? mmio_regs[GPIO_BASE + 0x624] : 0) & (1u << 4);
+    return (mmio_regs.get(GPIO_BASE + 0x624)) & (1u << 4);
   default:
     (void)state;
     return false;
@@ -694,13 +789,17 @@ static uint32_t i2c_cnfg_reg[2] = {0, 0};
 //              50 mV (rest), base 800 mV; bits 7:6 = power mode (3 = normal).
 // Rail-OK status: SD rails via STATSD (0x14, bit set = NOT ok), LDO rails via
 // each LDOx_CFG2 POK bit (BIT(3)).
-static uint8_t max77620_regs[256];
 static bool max77620_regs_ready = false;
+static uint8_t max77620_seed_otp = 0;
 
 static void max77620_regs_init(EmuState *state) {
-  if (max77620_regs_ready)
+  // Seeded for one console generation; switching it in the config window
+  // re-seeds on the next access instead of keeping the other one's rails.
+  uint8_t otp = state ? state->pmic_otp.load() : 0;
+  if (max77620_regs_ready && otp == max77620_seed_otp)
     return;
   max77620_regs_ready = true;
+  max77620_seed_otp = otp;
 
   // Two SD rails differ per SoC generation, measured on real consoles:
   //   SD1 (DRAM)    1.125 V Erista (LPDDR4)  vs 1.100 V Mariko (LPDDR4X)
@@ -757,9 +856,11 @@ static void max77620_regs_init(EmuState *state) {
   for (int i = 0; i < 9; i++) {
     const LdoDef &l = ldos[i];
     uint8_t code = (uint8_t)(((l.uv - 800000u) / l.step) & 0x3F);
-    max77620_regs[l.volt_reg] = (uint8_t)(code | (3u << 6)); // POWER_MODE_NORMAL
-    // CFG2 POK is what max77620_regulator_get_status() reads for an LDO.
-    max77620_regs[l.volt_reg + 1] = l.on ? (BIT(3) | BIT(2)) : 0x00;
+    // Power mode in CFG 7:6: NORMAL for a rail that is up, DISABLE for one
+    // that is down. CFG2 bit 3 (POK), which max77620_regulator_get_status()
+    // reads, is derived from it on every read (max77620_read).
+    max77620_regs[l.volt_reg] = (uint8_t)(code | ((l.on ? 3u : 0u) << 6));
+    max77620_regs[l.volt_reg + 1] = BIT(2);
   }
   // SD CFG1 registers (0x1D..0x20): flag the rails as power-OK too.
   for (uint8_t r = 0x1D; r <= 0x20; r++)
@@ -808,7 +909,8 @@ static void max77620_regs_init(EmuState *state) {
 // that watches TX_FIFO writes, captures the slave/register/direction, and
 // pre-fills an RX buffer when a read header arrives.
 struct PacketState {
-    int      hdr_idx       = 0;   // word index since last PROT magic
+    int      hdr_idx       = 0;   // 0 PROT, 1 size, 2 header, 3 payload
+    uint32_t tx_seen       = 0;   // payload bytes of this packet so far
     uint8_t  dev_addr      = 0;
     uint32_t payload_size  = 0;   // bytes
     bool     is_read       = false;
@@ -1030,8 +1132,7 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
     // payload enables it. Gating on PZ4 keeps that behaviour observable
     // instead of handing out an identity the hardware would not have given.
     if (!on_i2c5 && i2c_slave_addr == 0x1C) {
-      uint32_t pz4_out = mmio_regs.count(GPIO_BASE + 0x624)
-                             ? mmio_regs[GPIO_BASE + 0x624] : 0;
+      uint32_t pz4_out = mmio_regs.get(GPIO_BASE + 0x624);
       if (!(pz4_out & (1u << 4)))
         return 0;              // LDO1 still off: the part is silent
       auto be16 = [](uint16_t v) -> uint16_t {
@@ -1127,7 +1228,15 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
       // payload has written since. Returning 0 here (the old behaviour) made
       // every rail decode as 0.600 V and made writes look like they had no
       // effect ("not settable").
-      default:   return max77620_regs[i2c_reg_addr];
+      default:
+        // LDOn_CFG2 (0x24, 0x26 .. 0x34): POK (bit 3) follows the rail, i.e.
+        // the power mode in LDOn_CFG, so a rail the payload switches on
+        // reports good and one it switches off stops doing so.
+        if (i2c_reg_addr >= 0x24 && i2c_reg_addr <= 0x34 && !(i2c_reg_addr & 1)) {
+          bool up = (max77620_regs[i2c_reg_addr - 1] >> 6) != 0;
+          return (max77620_regs[i2c_reg_addr] & ~BIT(3)) | (up ? BIT(3) : 0);
+        }
+        return max77620_regs[i2c_reg_addr];
       }
     }
     // MAX77621 CPU/GPU regulator (slave 0x1B/0x1C on I2C_5, Erista only).
@@ -1137,10 +1246,10 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
       // payload sees both the MAX77621 and the MAX77812 present at once.
       if (state->pmic_otp.load() == 0x53) return 0;
       if (i2c_reg_addr == 0x04) return state->cpu_pmic_version.load();
-      // VOUT (0x00) / VOUT_DVS (0x01): bit 7 = enable, bits 6:0 = 606.25 mV +
-      // N * 6.25 mV. Report the rails enabled at a sane 1.0 V idle point.
-      if (i2c_reg_addr == 0x00 || i2c_reg_addr == 0x01)
-        return 0x80 | (uint8_t)((1000000u - 606250u) / 6250u);
+      // VOUT (0x00) / VOUT_DVS (0x01) / CONTROL1/2 read back what was last
+      // written; see max77621_regs.
+      if (i2c_reg_addr < 8)
+        return max77621_regs[i2c_slave_addr - 0x1B][i2c_reg_addr];
       return 0;
     }
     // MAX77812 multi-phase buck (Mariko / Lite / OLED), I2C_5 @ 0x33 for the
@@ -1149,22 +1258,8 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
     // M4 = CPU; vout_mv = 250 + N * 5.
     if (on_i2c5 && i2c_slave_addr == 0x33) {
       if (state->pmic_otp.load() != 0x53) return 0; // Mariko-family only
-      auto vout = [](uint32_t mv) -> uint8_t {
-        return (uint8_t)(((mv - 250u) / 5u) & 0xFF);
-      };
-      switch (i2c_reg_addr) {
-      case 0x14: return 0x05; // VERSION: QS silicon (ES2 = 0x04)
-      case 0x05: return 0x00; // TOPSYS_STAT: no thermal / OV / UV fault
-      case 0x22: return 0x00; // BUCK_STAT: no per-rail fault latch
-      // EN_CTRL: in RCM the CPU/GPU rails are still dormant (HOS brings them
-      // up), so report all phases disabled - that is the true cold state.
-      case 0x06: return 0x00;
-      // Measured on a real Mariko while dormant in RCM.
-      case 0x23: return vout(650);  // M1 GPU
-      case 0x25: return vout(600);  // M3 DRAM (VDD2)
-      case 0x26: return vout(600);  // M4 CPU
-      default:   return 0;
-      }
+      max77812_regs_init();
+      return max77812_regs[i2c_reg_addr];
     }
     // MAX77620 RTC (slave 0x68 on I2C_5). Separate slave address from the PMIC
     // core. Registers 0x07..0x0D hold SEC/MIN/HOUR/WEEKDAY/MONTH/YEAR/DAY.
@@ -1176,7 +1271,7 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
     // advance the seconds from the emulated clock so repeated reads move
     // forward (an RTC that never ticks is itself a fault a payload may flag).
     if (on_i2c5 && i2c_slave_addr == 0x68) {
-      if (i2c_reg_addr == 0x03) return 0x00; // CONTROL: binary mode, 24h
+      if (i2c_reg_addr == 0x03) return 0x03; // CONTROL: BIN_FORMAT | 24H
       if (i2c_reg_addr == 0x04 || i2c_reg_addr == 0x05) return 0x00; // UPDATE0/1: idle
       if (i2c_reg_addr >= 0x07 && i2c_reg_addr <= 0x0D) {
         // 2026-01-15 12:34:00 + emulated uptime, in binary (BCD_MODE off).
@@ -1289,6 +1384,38 @@ static uint32_t i2c_device_reg_read(EmuState *state, bool on_i2c5, uint8_t slave
   return v;
 }
 
+// One register byte written through a packet-mode transfer: the same
+// effect on the modelled chips as a normal-mode [reg, value] write.
+static void i2c_packet_reg_write(EmuState *state, bool on_i2c5, uint8_t dev,
+                                 uint8_t reg, uint8_t v) {
+  if (!on_i2c5)
+    return;
+  bool mariko = state->pmic_otp.load() == 0x53;
+  if (dev == MAX77620_I2C_ADDR) {
+    max77620_regs_init(state);
+    max77620_regs[reg] = v;
+    if (reg == 0x41 && (v & 0x02)) {            // ONOFFCNFG1_PWR_OFF
+      printf("[emu] MAX77620 PWR_OFF received - exiting\n");
+      fflush(stdout);
+      state->running = false;
+    } else if (reg == 0x41 && (v & 0x80)) {     // ONOFFCNFG1_SFT_RST
+      printf("[emu] MAX77620 SFT_RST received - rebooting payload\n");
+      fflush(stdout);
+      request_reboot(state, true);
+    }
+    if (reg == 0x3B || reg == 0x40)
+      ccplex_rail_changed(state);
+  } else if (!mariko && (dev == 0x1B || dev == 0x1C) && reg < 8 &&
+             reg != 0x04 && reg != 0x05) {
+    max77621_regs[dev - 0x1B][reg] = v;
+    ccplex_rail_changed(state);
+  } else if (mariko && dev == 0x33 && reg != 0x14) {
+    max77812_regs_init();
+    max77812_regs[reg] = v;
+    ccplex_rail_changed(state);
+  }
+}
+
 void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
   bool on_i2c5 = (addr >= I2C5_BASE);
   uint32_t base = on_i2c5 ? I2C5_BASE : I2C1_BASE;
@@ -1311,6 +1438,26 @@ void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
       max77620_regs_init(state);
       max77620_regs[i2c_cmd_data1 & 0xFF] = (uint8_t)((i2c_cmd_data1 >> 8) & 0xFF);
     }
+    // CPU/GPU rail bucks. Same wire format; only the chip this SoC
+    // generation is fitted with takes the write (the other one NAKs).
+    if ((val & (1u << 9)) && is_write && size >= 2 && on_i2c5) {
+      uint8_t reg = (uint8_t)(i2c_cmd_data1 & 0xFF);
+      uint8_t v   = (uint8_t)((i2c_cmd_data1 >> 8) & 0xFF);
+      bool mariko = state->pmic_otp.load() == 0x53;
+      if (!mariko && (i2c_slave_addr == 0x1B || i2c_slave_addr == 0x1C) &&
+          reg < 8 && reg != 0x04 && reg != 0x05) {        // CHIPID is RO
+        max77621_regs[i2c_slave_addr - 0x1B][reg] = v;
+        ccplex_rail_changed(state);
+      } else if (mariko && i2c_slave_addr == 0x33 && reg != 0x14) {
+        max77812_regs_init();
+        max77812_regs[reg] = v;
+        ccplex_rail_changed(state);
+      }
+    }
+    if ((val & (1u << 9)) && is_write && size >= 2 && on_i2c5 &&
+        i2c_slave_addr == MAX77620_I2C_ADDR &&
+        ((i2c_cmd_data1 & 0xFF) == 0x3B || (i2c_cmd_data1 & 0xFF) == 0x40))
+      ccplex_rail_changed(state);   // GPIO5 / AME_GPIO: the MAX77621 EN pin
     // ALC5639 codec: a 16-bit register write arrives as three bytes packed
     // into CMD_DATA1 - [reg, value MSB, value LSB] - because the part is
     // big-endian on the wire while bdk packs the buffer little-endian.
@@ -1350,48 +1497,52 @@ void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
       } else if (v & 0x80) {                  // ONOFFCNFG1_SFT_RST
         printf("[emu] MAX77620 SFT_RST received - rebooting payload\n");
         fflush(stdout);
-        state->reboot_requested = true;
+        request_reboot(state, true);
       }
     }
     break;
   case 0x50: {        // I2C_TX_FIFO  (packet-mode dispatch)
-    // Each packet starts with the PROT magic word; subsequent words follow a
-    // fixed layout: [size-1, header, payload...]. The header carries dev_addr
-    // and a READ flag; for write phases the first payload byte is the slave's
-    // register address that the matching read phase will target.
-    if (val == I2C_PACKET_PROT_I2C) {
-      pkt.hdr_idx = 1;  // word 0 (PROT) just consumed
-      return;
-    }
-    int idx = pkt.hdr_idx++;
-    if (idx == 1) {
+    // The word stream bdk's _i2c_send_packet / i2c_xfer_packet push:
+    //   PROT_I2C, size-1, header (addr << 1 | READ/REP_START...), then the
+    //   payload packed four bytes to a word, little-endian.
+    // A combined write+read sends its second packet straight after the
+    // first, with no FIFO flush, so a packet ends when its payload has been
+    // seen. The PROT marker is only looked for at a packet boundary: as a
+    // data word, 0x10 is just a register number or a length.
+    switch (pkt.hdr_idx) {
+    case 0:
+      if (val == I2C_PACKET_PROT_I2C)
+        pkt.hdr_idx = 1;
+      break;
+    case 1:
       pkt.payload_size = (val & 0xFFF) + 1;
-    } else if (idx == 2) {
+      pkt.hdr_idx = 2;
+      break;
+    case 2:
       pkt.dev_addr = (val >> 1) & 0x7F;
       pkt.is_read  = (val & I2C_HEADER_READ) != 0;
       i2c_slave_addr = pkt.dev_addr; // mirror for any cross-path lookups
+      pkt.tx_seen = 0;
       if (pkt.is_read) {
         packet_populate_rx(state, on_i2c5, pkt);
+        pkt.hdr_idx = 0;
+      } else {
+        pkt.hdr_idx = 3;
       }
-    } else if (!pkt.is_read && idx == 3) {
-      // First (and for our slaves, only) payload byte = register address.
-      pkt.reg_addr = val & 0xFF;
-    } else if (!pkt.is_read && idx == 4) {
-      // Second payload byte = value being written. Watch for PMIC commands
-      // that mean "shut the SoC down" or "reset" so the emulator can react
-      // the same way real hardware would.
-      if (on_i2c5 && pkt.dev_addr == 0x3C && pkt.reg_addr == 0x41) {
-        uint8_t v = val & 0xFF;
-        if (v & 0x02) {                         // ONOFFCNFG1_PWR_OFF
-          printf("[emu] MAX77620 PWR_OFF received - exiting\n");
-          fflush(stdout);
-          state->running = false;
-        } else if (v & 0x80) {                  // ONOFFCNFG1_SFT_RST
-          printf("[emu] MAX77620 SFT_RST received - rebooting payload\n");
-          fflush(stdout);
-          state->reboot_requested = true;
-        }
+      break;
+    default:
+      for (int k = 0; k < 4 && pkt.tx_seen < pkt.payload_size; k++) {
+        uint8_t b = (uint8_t)(val >> (8 * k));
+        if (pkt.tx_seen == 0)
+          pkt.reg_addr = b;   // first payload byte: the register address
+        else
+          i2c_packet_reg_write(state, on_i2c5, pkt.dev_addr,
+                               (uint8_t)(pkt.reg_addr + pkt.tx_seen - 1), b);
+        pkt.tx_seen++;
       }
+      if (pkt.tx_seen >= pkt.payload_size)
+        pkt.hdr_idx = 0;
+      break;
     }
     break;
   }
@@ -1407,112 +1558,132 @@ void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
 }
 
 // ==================== Display ====================
+//
+// The display controller's windows (TRM 24.10-24.11) are modelled as one
+// register file per window, A-D. The CPU reaches them either through the
+// indirect window pages (0x700-0x7FF, 0x800-0x83F), which write every window
+// DC_CMD_DISPLAY_WINDOW_HEADER selects and read back the lowest selected one,
+// or through a window's own direct range (A: 0xB80/0xBC0, B: 0xD80/0xDC0,
+// C: 0xF80/0xFC0). Writes go to the assembly copy. WIN_x_ACT_REQ in
+// DC_CMD_STATE_CONTROL promotes window x to the active copy that the scan-out
+// (display/sdl_display.cpp) decodes, so a half-programmed window never shows.
+// (The hardware stages this twice, UPDATE then ACT_REQ; every payload writes
+// both back to back, so one step is enough.)
+//
+// The rest of the DC is plain read-back storage, except the two words that
+// payloads poll: STATE_CONTROL (requests complete at once) and INT_STATUS
+// (a frame has always just ended).
+
+static constexpr uint32_t kDcCmdIntStatus     = 0x037;
+static constexpr uint32_t kDcCmdStateControl  = 0x041;
+static constexpr uint32_t kDcCmdWindowHeader  = 0x042;
+static constexpr uint32_t kDcIntFrameEndVBlank = (1u << 1) | (1u << 2);
+
+// Resolve a DC word index to the windows it addresses and the register-file
+// slot. False for anything that is not a window register.
+static bool dc_window_reg(const EmuState *state, uint32_t index,
+                          uint32_t *mask, uint32_t *slot) {
+  if (index >= 0x700 && index < 0x800) {
+    *mask = (state->dc_window_header >> 4) & 0xF;
+    *slot = index - 0x700;
+    return true;
+  }
+  if (index >= 0x800 && index < 0x840) {
+    *mask = (state->dc_window_header >> 4) & 0xF;
+    *slot = 0x100 + (index - 0x800);
+    return true;
+  }
+  static const uint32_t kDirect[3] = {0xB80, 0xD80, 0xF80};
+  for (uint32_t w = 0; w < 3; w++) {
+    uint32_t base = kDirect[w];
+    if (index >= base && index < base + 0x80) {
+      *mask = 1u << w;
+      *slot = index < base + 0x40 ? index - base : 0x100 + (index - base - 0x40);
+      return true;
+    }
+  }
+  return false;
+}
+
+static void dc_reset(EmuState *state) {
+  memset(state->dc_win, 0, sizeof(state->dc_win));
+  memset(state->dc_win_active, 0, sizeof(state->dc_win_active));
+  for (int w = 0; w < 4; w++)
+    state->dc_win[w][dcwin::BLEND_LAYER] =
+        state->dc_win_active[w][dcwin::BLEND_LAYER] = dcwin::BLEND_LAYER_RESET;
+  state->dc_window_header = 0;
+  state->dc_programmed = false;
+  state->vic_out_addr = 0;
+  state->vic_out_xform = 0;
+}
+
+// One line per window whose picture changed (not for moves: bdk slides its
+// log window in 16 pixels at a time).
+static void dc_log_window(int w, const uint32_t *r) {
+  if (!(r[dcwin::OPTIONS] & dcwin::WIN_ENABLE)) {
+    printf("[display] window %c off\n", 'A' + w);
+    return;
+  }
+  static const char *const kKind[4] = {"pitch", "tiled", "block", "?"};
+  uint32_t kind = r[dcwin::SURFACE_KIND];
+  printf("[display] window %c: %ux%u @ 0x%08X, %s", 'A' + w,
+         r[dcwin::SIZE] & 0x1FFF, (r[dcwin::SIZE] >> 16) & 0x1FFF,
+         r[dcwin::START_ADDR], kKind[kind & 3]);
+  if ((kind & 3) == 2)
+    printf(" (%u-GOB blocks)", 1u << ((kind >> 4) & 7));
+  printf(", stride %u, depth 0x%X, options 0x%X\n",
+         r[dcwin::LINE_STRIDE] & 0xFFFF, r[dcwin::COLOR_DEPTH] & 0x7F,
+         r[dcwin::OPTIONS]);
+}
 
 uint32_t display_read(EmuState *state, uint64_t addr) {
-  uint32_t offset = (uint32_t)(addr - DISPLAY_A_BASE);
-  if (offset == 0x800 * 4 || offset == 0x2000)
-    return (uint32_t)state->fb_addr;
-  return 0;
+  uint32_t index = (uint32_t)(addr - DISPLAY_A_BASE) / 4;
+  uint32_t mask, slot;
+  if (dc_window_reg(state, index, &mask, &slot)) {
+    for (int w = 0; w < 4; w++)
+      if (mask & (1u << w))
+        return state->dc_win[w][slot];
+    return 0;
+  }
+  switch (index) {
+  case kDcCmdIntStatus:    return kDcIntFrameEndVBlank;
+  case kDcCmdStateControl: return 0;
+  case kDcCmdWindowHeader: return state->dc_window_header;
+  default:                 return mmio_regs.get(addr);
+  }
 }
 
 void display_write(EmuState *state, uint64_t addr, uint32_t val) {
-  if (addr < 0x54200000 || addr >= 0x54240000)
+  uint32_t index = (uint32_t)(addr - DISPLAY_A_BASE) / 4;
+  uint32_t mask, slot;
+  if (dc_window_reg(state, index, &mask, &slot)) {
+    for (int w = 0; w < 4; w++)
+      if (mask & (1u << w))
+        state->dc_win[w][slot] = val;
     return;
-  uint32_t offset = (uint32_t)(addr - 0x54200000);
-  uint32_t index = offset / 4;
-
-  // DC_CMD_DISPLAY_WINDOW_HEADER (offset 0x042*4 = 0x108).
-  // Tracks which window's registers are currently selected.
-  if (offset == 0x108)
-    state->dc_window_sel = val;
-
-  if (offset >= 0x1C00 && offset < 0x1E00) {
-    uint32_t win_off = offset - 0x1C00;
-    if (win_off == 0x00)
-      state->pre_rot = val;
-    if (win_off == 0x14) {
-      state->pre_w = (val & 0x1FFF);
-      state->pre_h = ((val >> 16) & 0x1FFF);
+  }
+  if (index == kDcCmdWindowHeader) {
+    state->dc_window_header = val;
+  } else if (index == kDcCmdStateControl) {
+    uint32_t req = (val >> 1) & 0xF; // WIN_A..D_ACT_REQ
+    for (int w = 0; w < 4; w++) {
+      if (!(req & (1u << w)))
+        continue;
+      uint32_t *act = state->dc_win_active[w];
+      const uint32_t *asm_ = state->dc_win[w];
+      static const uint32_t kShown[] = {
+          dcwin::OPTIONS, dcwin::COLOR_DEPTH, dcwin::SIZE, dcwin::LINE_STRIDE,
+          dcwin::START_ADDR, dcwin::SURFACE_KIND};
+      bool changed = !state->dc_programmed;
+      for (uint32_t r : kShown)
+        changed |= act[r] != asm_[r];
+      memcpy(act, asm_, sizeof(state->dc_win_active[w]));
+      if (changed)
+        dc_log_window(w, act);
     }
-    if (win_off == 0x18)
-      state->pre_stride = val & 0xFFFF;
-    if (win_off == 0x2C) {
-      state->pre_sw = ((val & 0x7) == 2) ? 2 : 0;
-      // Tegra DC surface kind: tile in low bits; bits 4–7 = log2(block height in
-      // GOBs) for block-linear (values 1..5 → 2,4,8,16,32 GOBs).
-      unsigned log2bh = (val >> 4) & 0xF;
-      if (log2bh >= 1 && log2bh <= 5)
-        state->pre_bh = 1u << log2bh;
-      else
-        state->pre_bh = 0;
-    }
-  } else if (offset >= 0x2000 && offset < 0x2100) {
-    uint32_t buf_off = offset - 0x2000;
-    if (buf_off == 0x00) {
-      state->pre_addr = val;
-      if (val == 0xF6200000) {
-        printf("[display] WARNING: Guest wrote 0xF6200000 to pre_addr!\n");
-        // Print the guest PC to see where this comes from
-        uint32_t pc = 0;
-        uc_reg_read(state->uc, UC_ARM_REG_PC, &pc);
-        printf("[display] Guest PC: 0x%X\n", pc);
-        uint8_t code[16] = {0};
-        if (uc_mem_read(state->uc, pc - 8, code, 16) == UC_ERR_OK) {
-          printf("[display] Code: ");
-          for (int i=0; i<16; i++) printf("%02X ", code[i]);
-          printf("\n");
-        }
-      }
-    }
-    if (buf_off == 0x2C) {
-      state->pre_sw = ((val & 0x7) == 2) ? 2 : 0;
-      unsigned log2bh = (val >> 4) & 0xF;
-      if (log2bh >= 1 && log2bh <= 5)
-        state->pre_bh = 1u << log2bh;
-      else
-        state->pre_bh = 0;
-    }
-  } else if (index == 0x85) { // SIZE legacy
-    state->pre_w = (val & 0x1FFF);
-    state->pre_h = ((val >> 16) & 0x1FFF);
-  } else if (index == 0x41 || offset == 0x104) { // DC_CMD_STATE_CONTROL
-    // Latch when activation request bits are set (WIN_A_ACT_REQ=bit1,
-    // GENERAL_ACT_REQ=bit0)
-    if (val & 0x3) {
-      bool is_window_a = (state->dc_window_sel & 0x10) != 0; // Bit 4 = Window A
-      bool is_window_d = (state->dc_window_sel & 0x80) != 0; // Bit 7 = Window D
-
-      if (is_window_a && state->pre_addr) {
-        // Save Window A parameters as primary display surface.
-        state->winA_addr = state->pre_addr;
-        state->winA_w = state->pre_w;
-        state->winA_h = state->pre_h;
-        state->winA_stride = state->pre_stride;
-        state->winA_sw = state->pre_sw;
-        state->winA_rot = state->pre_rot;
-        state->winA_bh = state->pre_bh;
-      }
-
-      // Always latch to fb_* for display — but prefer Window A over Window D
-      // since Window D is just a transparent overlay in Hekate.
-      if (is_window_a || !is_window_d) {
-        state->fb_addr = state->pre_addr;
-        state->fb_width = state->pre_w;
-        state->fb_height = state->pre_h;
-        state->fb_stride = state->pre_stride;
-        state->fb_swizzle = state->pre_sw;
-        state->fb_rotation = state->pre_rot;
-        if (state->pre_bh)
-          state->fb_bh = state->pre_bh;
-      }
-      // If Window D is latched alone, don't override — keep Window A's surface.
-
+    if (req) {
+      state->dc_programmed = true;
       state->display_dirty = true;
-      printf("[display] LATCH (ACT_REQ): 0x%llX (%dx%d), WinSel: 0x%X, Sw: %d, "
-             "Str: %d\n",
-             (unsigned long long)state->fb_addr, state->fb_width,
-             state->fb_height, state->dc_window_sel, state->fb_swizzle,
-             state->fb_stride);
     }
   }
 }
@@ -1527,13 +1698,466 @@ void     dsi_write(EmuState *state, uint64_t addr, uint32_t val);
 // and the write path share one cursor.
 static uint32_t g_kfuse_keyaddr = 0;
 
+// ---- SD host controller registers beyond the command model ---------------
+//
+// A byte-exact shadow of each controller's 512-byte register block, for what
+// the command/data model below does not own: POWER_CONTROL, CLOCK_CONTROL,
+// SW_RESET, the interrupt enables, HOST_CONTROL2 and the Tegra vendor block
+// at 0x100..0x1FF (TRM 32.9.2). These all read 0 before, whatever was
+// written - and bdk decides the eMMC bus mode from them: POWER_CONTROL
+// reading "off" made _mmc_storage_enable_highspeed fall back to HS52, so the
+// eMMC ran at 51 MHz while claiming HS400. HS200 then needs the tuning
+// handshake, HS400 the tuned tap and a DLL calibration; all three are here.
+struct SdhciRegs {
+  uint8_t  b[0x200];
+  // Hardware tuning (TRM 32.9.2.14): iteration count since EXECUTE_TUNING
+  // was set, the 256-bit per-iteration pass map, the best window found.
+  uint32_t tune_i;
+  uint32_t tune_map[8];
+  uint8_t  win_first, win_last;
+  // A tuning block sent with the card clock stopped, delivered when it runs.
+  bool     tune_pending;
+};
+static SdhciRegs sdhci_regs[2];   // [0] SDMMC1, [1] SDMMC4
+
+// Trimmer taps at which the emulated eMMC's tuning block samples cleanly.
+// At 200 MHz a unit interval is ~70 taps; a healthy part passes over most
+// of one eye. Deterministic, so every run tunes to the same tap.
+static constexpr uint32_t kTunePassFirst = 26, kTunePassLast = 82;
+
+static SdhciRegs &sdhci_of(uint32_t base) {
+  return sdhci_regs[base == SDMMC4_BASE ? 1 : 0];
+}
+static uint32_t sdhci_get32(const SdhciRegs &r, uint32_t off) {
+  return (uint32_t)r.b[off] | ((uint32_t)r.b[off + 1] << 8) |
+         ((uint32_t)r.b[off + 2] << 16) | ((uint32_t)r.b[off + 3] << 24);
+}
+static void sdhci_put32(SdhciRegs &r, uint32_t off, uint32_t v) {
+  for (int i = 0; i < 4; i++)
+    r.b[off + i] = (uint8_t)(v >> (8 * i));
+}
+
+// Power-on state: the standard registers clear, the vendor block at its
+// TRM reset values (the SDMMC2/4 set, which carries the DLL registers).
+static void sdhci_reset_regs(SdhciRegs &r) {
+  memset(&r, 0, sizeof(r));
+  static const struct { uint16_t off; uint32_t val; } kReset[] = {
+      {0x100, 0x0000D02D}, {0x104, 0x38600002}, {0x10C, 0x00000007},
+      {0x11C, 0x00000C80}, {0x120, 0xFFFF0098}, {0x1AC, 0x00000015},
+      {0x1B0, 0x16083504}, {0x1B4, 0x60000000}, {0x1B8, 0x20208780},
+      {0x1BC, 0x10000000}, {0x1C0, 0x74020090}, {0x1C4, 0x00000023},
+      {0x1D0, 0x0000000F}, {0x1D4, 0x00201000}, {0x1D8, 0x00100804},
+      {0x1DC, 0x00000800}, {0x1E0, 0x88000001}, {0x1E4, 0x00010000},
+      {0x1F8, 0x00000032},
+  };
+  for (const auto &e : kReset)
+    sdhci_put32(r, e.off, e.val);
+}
+
+static bool sdhci_shadowed(uint32_t off) {
+  return (off >= 0x28 && off < 0x40) || (off >= 0x100 && off < 0x200);
+}
+
+static uint8_t sdhci_byte(EmuState *s, uint32_t base, uint32_t off) {
+  if (off >= 0x200)
+    return 0;
+  SdhciRegs &r = sdhci_of(base);
+  bool e = base == SDMMC4_BASE;
+  uint32_t nor = e ? s->sdmmc4_norintsts : s->sdmmc_norintsts;
+  uint32_t err = e ? s->sdmmc4_errintsts : s->sdmmc_errintsts;
+  switch (off) {
+  case 0x28:
+    return e ? s->sdmmc4_hostctl : s->sdmmc_hostctl;
+  case 0x2C: {
+    // CLOCK_CONTROL: the internal clock is stable as soon as it is enabled.
+    uint8_t c = r.b[0x2C] & ~0x02;
+    return (c & 0x01) ? (uint8_t)(c | 0x02) : c;
+  }
+  case 0x2F:
+    return 0;                     // SW_RESET: completes at once
+  case 0x30: case 0x31:
+    // NORMAL_INT_STATUS bit 15, ERR_INTERRUPT, is the OR of every error
+    // bit (SDHCI 2.2.18) - what BDK's _sdmmc_check_mask_interrupt tests.
+    return (uint8_t)((nor | (err ? 0x8000u : 0u)) >> (8 * (off - 0x30)));
+  case 0x32: case 0x33:
+    return (uint8_t)(err >> (8 * (off - 0x32)));
+  case 0x3C: case 0x3D:
+    return 0;                     // AUTO_CMD_ERROR_STATUS
+  case 0x1B3:
+    return r.b[off] & 0x7F;       // DLLCAL_CFG.CALIBRATE self-clears
+  case 0x1BF:
+    return r.b[off] & 0x7F;       // DLLCAL_CFG_STA.ACTIVE: calibration done
+  case 0x1C8: case 0x1C9: case 0x1CA: case 0x1CB: {
+    // VENDOR_TUNING_STATUS0: the pass map word TUNING_WORD_SEL selects.
+    uint32_t w = r.tune_map[r.b[0x1C0] & 7];
+    return (uint8_t)(w >> (8 * (off - 0x1C8)));
+  }
+  case 0x1CC: case 0x1CE: return r.win_first;   // start, after / before fine
+  case 0x1CD: case 0x1CF: return r.win_last;    // end,   after / before fine
+  case 0x1E7:
+    return r.b[off] & 0x7F;       // AUTO_CAL_CONFIG.START self-clears
+  case 0x1EC:
+    return 0x01;                  // AUTO_CAL_STATUS: done, pull-up code 1
+  case 0x1ED: case 0x1EE: case 0x1EF:
+    return 0;                     // ...ACTIVE (bit 31) clear
+  default:
+    return r.b[off];
+  }
+}
+
+static uint32_t sdhci_read(EmuState *s, uint32_t base, uint32_t off) {
+  uint32_t v = 0;
+  for (int i = 3; i >= 0; i--)
+    v = (v << 8) | sdhci_byte(s, base, off + (uint32_t)i);
+  return v;
+}
+
+// SW_RESET (0x2F). RESET_ALL puts the standard registers back to power-on
+// and leaves the vendor block's trims alone; RESET_CMD / RESET_DATA clear
+// the status their line owns (SDHCI 2.2.12).
+static void sdhci_sw_reset(EmuState *s, uint32_t base, uint8_t v) {
+  bool e = base == SDMMC4_BASE;
+  uint32_t &nor = e ? s->sdmmc4_norintsts : s->sdmmc_norintsts;
+  uint32_t &err = e ? s->sdmmc4_errintsts : s->sdmmc_errintsts;
+  if (v & 0x01) {
+    SdhciRegs &r = sdhci_of(base);
+    uint8_t vendor[0x100];
+    memcpy(vendor, r.b + 0x100, sizeof(vendor));  // vendor block survives
+    sdhci_reset_regs(r);
+    memcpy(r.b + 0x100, vendor, sizeof(vendor));
+    nor = err = 0;
+    (e ? s->sdmmc4_hostctl : s->sdmmc_hostctl) = 0;
+    return;
+  }
+  if (v & 0x02) {                 // CMD line: command complete, CMD errors
+    nor &= ~0x0001u;
+    err &= ~0x000Fu;
+  }
+  if (v & 0x04) {                 // DAT line: transfer/DMA/buffer, DAT errors
+    nor &= ~0x003Eu;
+    err &= ~0x0270u;
+  }
+}
+
+// A tuning block arriving: BUFFER_READ_READY.
+static void sdhci_deliver_tuning_block(EmuState *s, uint32_t base) {
+  (base == SDMMC4_BASE ? s->sdmmc4_norintsts : s->sdmmc_norintsts) |= 0x0020;
+}
+
+static void sdhci_write(EmuState *s, uint32_t base, uint32_t offset,
+                        uint64_t value, int size) {
+  SdhciRegs &r = sdhci_of(base);
+  for (int i = 0; i < size; i++) {
+    uint32_t off = offset + (uint32_t)i;
+    if (off >= 0x200)
+      break;
+    uint8_t v = (uint8_t)(value >> (8 * i));
+    switch (off) {
+    case 0x28:                                  // HOST_CONTROL: command model
+    case 0x30: case 0x31: case 0x32: case 0x33: // W1C status: command model
+    case 0x3C: case 0x3D:                       // read-only
+    case 0x1BC: case 0x1BD: case 0x1BE: case 0x1BF:
+    case 0x1C8: case 0x1C9: case 0x1CA: case 0x1CB:
+    case 0x1CC: case 0x1CD: case 0x1CE: case 0x1CF:
+    case 0x1EC: case 0x1ED: case 0x1EE: case 0x1EF:
+      break;
+    case 0x2C: {
+      bool was_on = r.b[0x2C] & 0x04;
+      r.b[0x2C] = v;
+      // Tegra sends a tuning command with SD_CLK stopped, resets CMD/DAT,
+      // then restarts the clock: the block comes in now.
+      if (!was_on && (v & 0x04) && r.tune_pending) {
+        r.tune_pending = false;
+        sdhci_deliver_tuning_block(s, base);
+      }
+      break;
+    }
+    case 0x2F:
+      sdhci_sw_reset(s, base, v);
+      break;
+    case 0x3E: {
+      // HOST_CONTROL2 low byte. EXECUTE_TUNING (bit 6) belongs to the
+      // hardware once set: writing 1 starts tuning - clearing the sampling
+      // clock select and the pass map - and only the tuning circuit clears
+      // it again. SAMPLING_CLOCK_SELECT (bit 7) takes what is written.
+      uint8_t cur = r.b[0x3E];
+      uint8_t nv = (uint8_t)((v & ~0x40) | (cur & 0x40));
+      if ((v & 0x40) && !(cur & 0x40)) {
+        nv = (uint8_t)((nv | 0x40) & ~0x80);
+        r.tune_i = 0;
+        memset(r.tune_map, 0, sizeof(r.tune_map));
+        r.win_first = r.win_last = 0;
+      }
+      r.b[0x3E] = nv;
+      break;
+    }
+    default:
+      r.b[off] = v;
+      break;
+    }
+  }
+}
+
+// SEND_TUNING_BLOCK (CMD19 SD, CMD21 eMMC HS200) with the Tegra tuning
+// circuit (TRM 32.9.2.14). With EXECUTE_TUNING set each block is one
+// iteration at the next trimmer tap - START_TAP_VAL plus 2^STEP_SIZE per
+// iteration when TAP_VAL_UPDATED_BY_HW is set, the programmed tap
+// otherwise - and SAMPLING_CLOCK_SELECT reports whether it sampled
+// cleanly. After NUM_TUNING_ITERATIONS blocks the circuit clears
+// EXECUTE_TUNING; in hardware-tap mode it then sets the final tap
+// first_pass + (last_pass - first_pass) * (MUL_M + 1) / 2^DIV_N and
+// leaves SAMPLING_CLOCK_SELECT set if any tap passed.
+static void sdhci_tuning_command(EmuState *s, uint32_t base) {
+  SdhciRegs &r = sdhci_of(base);
+  if (r.b[0x3E] & 0x40) {
+    static const uint16_t kTries[8] = {40, 64, 128, 192, 256, 256, 256, 256};
+    uint32_t tun0 = sdhci_get32(r, 0x1C0), tun1 = sdhci_get32(r, 0x1C4);
+    bool hw_tap = tun0 & (1u << 17);
+    uint32_t tries = kTries[(tun0 >> 13) & 7];
+    bool sdr50 = (r.b[0x3E] & 0x07) == 2;
+    uint32_t step = 1u << (sdr50 ? (tun1 & 7) : ((tun1 >> 4) & 7));
+    uint32_t clk = sdhci_get32(r, 0x100);
+    uint32_t i = r.tune_i;
+    uint32_t tap = hw_tap ? ((((tun0 >> 18) & 0xFF) + i * step) & 0xFF)
+                          : ((clk >> 16) & 0xFF);
+    bool pass = tap >= kTunePassFirst && tap <= kTunePassLast;
+    if (i < 256 && pass)
+      r.tune_map[i / 32] |= 1u << (i % 32);
+    if (hw_tap)
+      sdhci_put32(r, 0x100, (clk & ~0x00FF0000u) | (tap << 16));
+    r.b[0x3E] = (uint8_t)((r.b[0x3E] & ~0x80) | (pass ? 0x80 : 0));
+    r.tune_i = i + 1;
+    if (r.tune_i >= tries) {
+      r.b[0x3E] &= ~0x40;                     // tuning complete
+      if (hw_tap) {
+        int first = -1, last = -1;
+        uint32_t start = (tun0 >> 18) & 0xFF;
+        for (uint32_t k = 0; k < tries && k < 256; k++) {
+          if (!(r.tune_map[k / 32] & (1u << (k % 32))))
+            continue;
+          uint32_t t = (start + k * step) & 0xFF;
+          if (first < 0)
+            first = (int)t;
+          last = (int)t;
+        }
+        if (first >= 0) {
+          uint32_t m = (tun0 >> 6) & 0x7F, n = (tun0 >> 3) & 7;
+          uint32_t fin = (uint32_t)first +
+                         (((uint32_t)(last - first) * (m + 1)) >> n);
+          if (fin > (uint32_t)last)
+            fin = (uint32_t)last;
+          clk = sdhci_get32(r, 0x100);
+          sdhci_put32(r, 0x100, (clk & ~0x00FF0000u) | ((fin & 0xFF) << 16));
+          r.win_first = (uint8_t)first;
+          r.win_last = (uint8_t)last;
+          r.b[0x3E] |= 0x80;
+          printf("[sdmmc] SDMMC%c tuned: %u iterations, pass window taps "
+                 "%d..%d, tap %u\n", base == SDMMC4_BASE ? '4' : '1',
+                 tries, first, last, fin & 0xFF);
+        } else {
+          r.b[0x3E] &= ~0x80;
+          printf("[sdmmc] SDMMC%c tuning failed: no tap passed\n",
+                 base == SDMMC4_BASE ? '4' : '1');
+        }
+        fflush(stdout);
+      }
+    }
+  }
+  if (r.b[0x2C] & 0x04)
+    sdhci_deliver_tuning_block(s, base);
+  else
+    r.tune_pending = true;
+}
+
+// ---- The SD card's signalling voltage and switch functions ----------------
+//
+// A UHS-I card (SD Physical Layer 3.01). ACMD41 with S18R set answers S18A
+// while the card still signals at 3.3 V; CMD11 then moves it to 1.8 V, where
+// it stays until it loses power - bdk's supply GPIO (PE4) going low, or a
+// reset. A card re-initialised without a power cycle answers S18A = 0 but
+// keeps offering its UHS bus speeds, which is how hosts tell. CMD6
+// (SWITCH_FUNC) reports and selects one function per group: bus speed
+// (group 1: SDR12 and SDR25/HS, plus SDR50, SDR104 and DDR50 at 1.8 V),
+// driver strength (3: type B, plus A, C and D at 1.8 V) and power limit
+// (4: 0.72 W, plus 1.44 W at 1.8 V). CMD0 puts the functions back to their
+// defaults but not the signalling voltage.
+struct SdCard {
+  bool    s18a_offered = false; // the last ACMD41 answered S18A
+  bool    v18 = false;          // signalling at 1.8 V
+  bool    bus4 = false;         // ACMD6 set a 4-bit bus
+  uint8_t func[6] = {};         // current function, groups 1..6
+  bool    supplied = false;     // PE4 driving the card's VDD
+};
+static SdCard sd_card;
+
+static uint16_t sd_func_support(int group) {
+  static const uint16_t k33[6] = {0x8003, 0x8001, 0x8001, 0x8001, 0x8001, 0x8001};
+  static const uint16_t k18[6] = {0x801F, 0x8001, 0x800F, 0x8003, 0x8001, 0x8001};
+  return (sd_card.v18 ? k18 : k33)[group];
+}
+
+// The 64-byte CMD6 status (SD 4.3.10.4). arg bit 31: 0 check, 1 switch;
+// bits 4g+3..4g: the function wanted in group g+1, 0xF for "no change".
+static void sd_switch_func(uint32_t arg, uint8_t st[64]) {
+  memset(st, 0, 64);
+  st[1] = 100; // mA the selected functions draw; bdk refuses over 800
+  uint8_t res[6];
+  for (int g = 0; g < 6; g++) {
+    uint16_t sup = sd_func_support(g);
+    st[2 + (5 - g) * 2] = (uint8_t)(sup >> 8);
+    st[3 + (5 - g) * 2] = (uint8_t)sup;
+    uint32_t want = (arg >> (4 * g)) & 0xF;
+    res[g] = want == 0xF ? sd_card.func[g]
+           : ((sup >> want) & 1) ? (uint8_t)want : 0xF;
+  }
+  if (arg >> 31)
+    for (int g = 0; g < 6; g++)
+      if (res[g] != 0xF)
+        sd_card.func[g] = res[g];
+  st[14] = (uint8_t)(res[5] << 4 | res[4]);
+  st[15] = (uint8_t)(res[3] << 4 | res[2]);
+  st[16] = (uint8_t)(res[1] << 4 | res[0]);
+  st[17] = 1; // data structure version 1: busy status valid (none busy)
+}
+
+// The 64-byte SD status (ACMD13, SD 4.10.2): the bus width ACMD6 set, and
+// the card's grades - a Class 10, U1, V10 UHS-I card with 4 MB AUs.
+static void sd_status(uint8_t ss[64]) {
+  memset(ss, 0, 64);
+  ss[0]  = sd_card.bus4 ? 0x80 : 0x00; // DAT_BUS_WIDTH
+  ss[8]  = 4;                          // SPEED_CLASS: Class 10
+  ss[10] = 9 << 4;                     // AU_SIZE: 4 MB
+  ss[14] = 1 << 4 | 9;                 // UHS_SPEED_GRADE U1, UHS_AU_SIZE 4 MB
+  ss[15] = 10;                         // VIDEO_SPEED_CLASS: V10
+}
+
+// The SD card's CSD, version 2.0 (SD 5.3.3): an SDHC/SDXC card as big as
+// the image (32 GiB with none), command classes 0, 2, 4, 5, 7, 8 and 10 -
+// class 8, application commands, is what makes bdk read the SD status.
+// Laid out as the R2 response registers carry it, CSD[127:8]: bdk shifts
+// each word left by 8 to put the stripped CRC back.
+static void sd_csd(EmuState *state, uint32_t r[4]) {
+  uint64_t bytes = state->sd_fd >= 0 ? (uint64_t)file_size64(state->sd_fd)
+                                     : 32ull << 30;
+  uint64_t units = bytes / (512u << 10);
+  uint32_t c_size = units ? (uint32_t)std::min<uint64_t>(units - 1, 0x3FFFFF)
+                          : 0;
+  unsigned __int128 c = 0;
+  auto put = [&](unsigned hi, unsigned lo, uint64_t v) {
+    c |= (unsigned __int128)(v & ((1ull << (hi - lo + 1)) - 1)) << lo;
+  };
+  put(127, 126, 1);     // CSD_STRUCTURE: version 2.0
+  put(119, 112, 0x0E);  // TAAC: 1 ms
+  put(103, 96, 0x32);   // TRAN_SPEED: 25 MHz
+  put(95, 84, 0x5B5);   // CCC
+  put(83, 80, 9);       // READ_BL_LEN: 512
+  put(69, 48, c_size);  // C_SIZE: (C_SIZE + 1) x 512 KiB
+  put(46, 46, 1);       // ERASE_BLK_EN
+  put(45, 39, 0x7F);    // SECTOR_SIZE
+  put(28, 26, 2);       // R2W_FACTOR
+  put(25, 22, 9);       // WRITE_BL_LEN: 512
+  put(0, 0, 1);         // always 1
+  for (int i = 0; i < 4; i++)
+    r[i] = (uint32_t)(c >> (8 + 32 * i));
+}
+
+// Port E sits in GPIO bank 1: CNF 0x100, OE 0x110, OUT 0x120. PE4 high
+// powers the card; falling, the card loses its state.
+static void sd_card_gpio_update() {
+  uint32_t m = 1u << 4;
+  bool on = (mmio_regs.get(GPIO_BASE + 0x100) & m) &&
+            (mmio_regs.get(GPIO_BASE + 0x110) & m) &&
+            (mmio_regs.get(GPIO_BASE + 0x120) & m);
+  if (sd_card.supplied && !on)
+    sd_card = SdCard();
+  sd_card.supplied = on;
+}
+
+// ---- The eMMC's EXT_CSD -----------------------------------------------------
+//
+// The properties segment is fixed; the fields CMD6 SWITCH writes (bus
+// width, HS_TIMING, partition access, ...) keep what was written until the
+// card is reset, so a CMD8 after the bus-mode switches reads them back.
+static uint8_t g_ext_csd[512];
+static bool g_ext_csd_ready = false;
+
+static uint8_t *emmc_ext_csd() {
+  if (g_ext_csd_ready)
+    return g_ext_csd;
+  g_ext_csd_ready = true;
+  uint8_t *x = g_ext_csd;
+  memset(x, 0, 512);
+  x[192] = 7;          // EXT_CSD_REV: eMMC v5.0
+  x[196] = 0x57;       // CARD_TYPE: HS400_1.8V | HS200_1.8V | DDR_1.8V | HS_52 | HS_26
+  // 32GB worth of sectors (BDK only uses sec_cnt for sanity, not for read
+  // addressing).
+  uint32_t sec_cnt = 64 * 1024 * 1024;
+  x[212] = sec_cnt & 0xFF;
+  x[213] = (sec_cnt >> 8) & 0xFF;
+  x[214] = (sec_cnt >> 16) & 0xFF;
+  x[215] = (sec_cnt >> 24) & 0xFF;
+  // BOOT0/BOOT1 and RPMB are 4 MiB each on the Switch's eMMC: 32 x 128 KiB.
+  x[226] = 32;         // BOOT_SIZE_MULT
+  x[168] = 32;         // RPMB_SIZE_MULT
+  // Capability/health bytes a diagnostic payload reports on. Values
+  // measured from the eMMC in a real Mariko; left at 0 these read as
+  // "feature not supported", which looks like a reduced-firmware
+  // replacement part.
+  x[503] = 0x01;       // HPI_FEATURES: supported, CMD13 variant
+  x[231] = 0x55;       // SEC_FEATURE_SUPPORT: secure erase/trim/sanitize
+  x[232] = 0x02;       // TRIM_MULT
+  x[229] = 0x11;       // SEC_TRIM_MULT (measured)
+  x[162] = 0x01;       // RST_N_FUNCTION: permanently enabled
+  x[267] = 0x01;       // PRE_EOL_INFO: normal
+  x[268] = 0x01;       // DEVICE_LIFE_TIME_EST_TYP_A: 0-10%
+  x[269] = 0x01;       // DEVICE_LIFE_TIME_EST_TYP_B: 0-10%
+  return x;
+}
+
+// CMD0 / power-on: back to 1-bit legacy timing, in the user area.
+static void emmc_ext_csd_card_reset() {
+  uint8_t *x = emmc_ext_csd();
+  x[183] = 0;          // BUS_WIDTH
+  x[185] = 0;          // HS_TIMING
+  x[179] &= ~0x07;     // PARTITION_ACCESS
+}
+
+// CMD6 SWITCH, access modes 1 = set bits, 2 = clear bits, 3 = write byte,
+// to the fields a host may change.
+static void emmc_ext_csd_switch(uint32_t arg) {
+  uint32_t access = (arg >> 24) & 3, index = (arg >> 16) & 0xFF;
+  uint8_t value = (uint8_t)(arg >> 8);
+  switch (index) {
+  case 33:  // CACHE_CTRL
+  case 34:  // POWER_OFF_NOTIFICATION
+  case 161: // HPI_MGMT
+  case 163: // BKOPS_EN
+  case 175: // ERASE_GROUP_DEF
+  case 177: // BOOT_BUS_CONDITIONS
+  case 179: // PARTITION_CONFIG
+  case 183: // BUS_WIDTH
+  case 185: // HS_TIMING
+  case 187: // POWER_CLASS
+    break;
+  default:
+    return;
+  }
+  uint8_t *x = emmc_ext_csd();
+  if (access == 1)
+    x[index] |= value;
+  else if (access == 2)
+    x[index] &= (uint8_t)~value;
+  else if (access == 3)
+    x[index] = value;
+}
+
 uint32_t misc_read(EmuState *state, uint64_t addr) {
   // PINMUX (APB_MISC pad config range) — every write lands in the global
   // mmio_regs map at line 1726, so we just hand it back. Returning 0 here
   // (the old behavior) silently dropped the muxed function bits, which
   // broke any probe that read back PINMUX_AUX_* to confirm a pin's mode.
   if (addr >= PINMUX_BASE && addr < PINMUX_BASE + PINMUX_SIZE) {
-    return mmio_regs.count(addr) ? mmio_regs[addr] : pinmux_reset_default(addr);
+    return mmio_regs.get(addr, pinmux_reset_default(addr));
   }
   // APB_MISC_GP_HIDREV - hardware revision.
   // Bits 11:8 = chip ID (0x21 for both T210 / T210B01),
@@ -1548,13 +2172,18 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
   // Erista 0x00022117 (major 1, minor 2).
   if (addr == APB_MISC_BASE + 0x804)
     return state->is_mariko.load() ? 0x00012127u : 0x00022117u;
+  // The rest of APB_MISC (pad control, GP_* configuration, PINMUX_GLOBAL):
+  // R/W registers that read back what was written. They read 0 before even
+  // though every write was cached, so a read-modify-write lost its bits.
+  if (addr >= APB_MISC_BASE && addr < PINMUX_BASE)
+    return mmio_regs.get(addr);
 
   // UART
   if (addr >= 0x70006000 && addr < 0x70006500) {
     uint32_t offset = 0;
     int port = uart_port_of(addr, &offset);
     if (port < 0)  // the gaps between the five register blocks
-      return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+      return mmio_regs.get(addr);
     UartPort &up = uart_ports[port];
     // Anything on UART-D can observe the radio, so settle its state machine
     // (POR completion, RTS_N) before answering.
@@ -1580,6 +2209,13 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
       // read, which is why the payload sees 0x4F once right after its
       // loopback self-test and 0x40 on every quiet read afterwards.
       uint32_t msr = 0x40 | (up.cts ? 0x10 : 0) | up.msr_delta;
+      // In internal loopback the modem inputs come from this port's own
+      // outputs instead (TRM 36.x): RTS -> CTS, DTR -> DSR, OUT1 -> RI,
+      // OUT2 -> DCD.
+      if (up.mcr & 0x10)
+        msr = up.msr_delta | ((up.mcr & 0x02) ? 0x10 : 0) |
+              ((up.mcr & 0x01) ? 0x20 : 0) | ((up.mcr & 0x04) ? 0x40 : 0) |
+              ((up.mcr & 0x08) ? 0x80 : 0);
       up.msr_delta = 0;
       return msr;
     }
@@ -1589,12 +2225,25 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
     // divisor no longer POPS a byte off the receive FIFO. That silently ate
     // host bytes, which is corruption waiting to happen on a sideload.
     uint32_t base = uart_bases[port];
-    bool dlab = (mmio_regs.count(base + 0x0C) ? mmio_regs[base + 0x0C] : 0) & 0x80;
+    bool dlab = (mmio_regs.get(base + 0x0C)) & 0x80;
 
     if (offset == 0x00 && dlab)
       return up.divisor & 0xFF;         // DLL
     if (offset == 0x04 && dlab)
       return (up.divisor >> 8) & 0xFF;  // DLM
+    if (offset == 0x04)
+      return up.ier;
+    if (offset == 0x08) {
+      // IIR, read-only (FCR is the write-only register at the same offset):
+      // 7:6 set while the FIFOs are enabled, then the highest-priority
+      // pending interrupt - received data, then THR empty - or 1 for none.
+      uint32_t iir = (up.fcr & 0x01) ? 0xC0 : 0x00;
+      if ((up.ier & 0x01) && !state->uart_rx_fifo[port].empty())
+        return iir | 0x04;
+      if (up.ier & 0x02)
+        return iir | 0x02;
+      return iir | 0x01;
+    }
 
     if (offset == 0x00) {
       // RBR: pop the next queued byte; empty FIFO returns 0 (the payload
@@ -1611,7 +2260,7 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
     // latches, and a payload that reports its own UART config - baud divisor,
     // word length, DLAB state - got zeros before this, so it decoded as
     // "0 baud, word=5".
-    return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+    return mmio_regs.get(addr);
   }
   // DSI
   if (addr >= DSI_BASE && addr < DSI_BASE + DSI_SIZE) {
@@ -1628,14 +2277,17 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
     // (Erista/Mariko/Lite/OLED).
     if (offset == 0x50)
       return 4096;
-    return 0;
+    // The rest are configuration registers (arbitration, latency allowance,
+    // carveouts, the EMEM address map sdram_init programs from the BCT):
+    // they read back what was written.
+    return mmio_regs.get(addr);
   }
   // PWM controller (LCD backlight on PWM0, optional fan on PWM1). Same
   // story as PINMUX above — the writes are captured by the global cache
   // already; return whatever was last written so the payload can read
   // back its own duty cycle / enable bit.
   if (addr >= PWM_BASE && addr < PWM_BASE + 0x1000) {
-    return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+    return mmio_regs.get(addr);
   }
   // TSEC (Tegra Security Co-processor) — base 0x54500000 per Hekate bdk/soc/t210.h.
   // The TSEC microcontroller's firmware blob runs HDCP-based key derivation that
@@ -1690,8 +2342,6 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
 
     uint32_t *rsp =
         (base == SDMMC4_BASE) ? state->sdmmc4_rsp : state->sdmmc_rsp;
-    uint32_t &norintsts = (base == SDMMC4_BASE) ? state->sdmmc4_norintsts
-                                                : state->sdmmc_norintsts;
     uint16_t blksize =
         (base == SDMMC4_BASE) ? state->sdmmc4_blksize : state->sdmmc_blksize;
     uint16_t blkcnt =
@@ -1700,7 +2350,9 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
         (base == SDMMC4_BASE) ? state->sdmmc4_trnmod : state->sdmmc_trnmod;
 
     uint32_t result = 0;
-    if (offset == 0x00)
+    if (sdhci_shadowed(offset))
+      result = sdhci_read(state, base, offset);
+    else if (offset == 0x00)
       result = (base == SDMMC4_BASE) ? state->sdmmc4_sysad : state->sdmmc_sysad;
     else if (offset == 0x04)
       result = (blkcnt << 16) | blksize;
@@ -1721,34 +2373,13 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
       else
         result = 0x01F70000; // CARD_PRESENT | CD_STABLE | CD_LVL | DAT_LINE_LEVEL
     }
-    else if (offset == 0x28) {
-      // HOSTCTL. sdmmc_get_bus_width() reads this register directly to decide
-      // 1 / 4 / 8-bit (SDHCI_CTRL_4BITBUS = BIT(1), SDHCI_CTRL_8BITBUS =
-      // BIT(5)). It had no read handler at all, so every payload saw a 1-bit
-      // bus even after a successful 4-bit SD / 8-bit eMMC negotiation - and an
-      // eMMC HS400-vs-bus-width cross-check would call that a fault.
-      result = (base == SDMMC4_BASE) ? state->sdmmc4_hostctl
-                                     : state->sdmmc_hostctl;
-    }
-    else if (offset == 0x2C)
-      result = 0x0003; // SDHCI_CLOCK_INT_EN | SDHCI_CLOCK_INT_STABLE
     else if (offset == 0x40)
       result =
           0x376CD08C; // Full Tegra capabilities (64-bit, SDMA, ADMA2, etc.)
     else if (offset == 0x44)
       result = 0x10002F73; // CAP1
-    else if (offset == 0x30)
-      result = ((base == SDMMC4_BASE ? state->sdmmc4_errintsts
-                                     : state->sdmmc_errintsts)
-                << 16) |
-               norintsts;
-    else if (offset == 0x32)
-      result = (base == SDMMC4_BASE) ? state->sdmmc4_errintsts
-                                     : state->sdmmc_errintsts;
     else if (offset >= 0x10 && offset <= 0x1C)
       result = rsp[(offset - 0x10) / 4];
-    else if (offset == 0x1EC)
-      result = 0x00000001; // AUTOCAL_STS
     else if (offset == 0xFE)
       result = 0x0303; // SDHCI Version 4.0
 
@@ -1758,6 +2389,28 @@ uint32_t misc_read(EmuState *state, uint64_t addr) {
     return result;
   }
   return 0;
+}
+
+// Where a single-buffer data phase (EXT_CSD, CMD6 status, ACMD13, SCR) lands.
+// Tegra's SDMA takes its system address from 0x58 (bdk _sdmmc_dma_init
+// writes it there, SD Host Controller v4 style), falling back to the
+// standard 0x00 SDMA register. Under ADMA2 it is the first descriptor's
+// buffer: 32-bit address in an 8-byte descriptor, 64-bit in a 12-byte one.
+static uint64_t sdmmc_dma_target(uc_engine *uc, uint8_t hostctl,
+                                 uint64_t adma_addr, uint32_t sysad) {
+  uint32_t dmasel = hostctl & 0x18;
+  if (dmasel == 0x10 || dmasel == 0x18) {
+    uint8_t d[12] = {0};
+    if (uc_mem_read(uc, adma_addr, d, dmasel == 0x18 ? 12 : 8) != UC_ERR_OK)
+      return 0;
+    uint64_t a = (uint64_t)d[4] | ((uint64_t)d[5] << 8) |
+                 ((uint64_t)d[6] << 16) | ((uint64_t)d[7] << 24);
+    if (dmasel == 0x18)
+      a |= ((uint64_t)d[8] | ((uint64_t)d[9] << 8) | ((uint64_t)d[10] << 16) |
+            ((uint64_t)d[11] << 24)) << 32;
+    return a;
+  }
+  return adma_addr ? adma_addr : sysad;
 }
 
 void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
@@ -1798,20 +2451,14 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
     uint64_t &adma_addr = (base == SDMMC4_BASE) ? state->sdmmc4_adma_addr
                                                 : state->sdmmc_adma_addr;
 
+    if (sdhci_shadowed(offset))
+      sdhci_write(state, base, offset, value, size);
     if (offset == 0x00)
       sysad = val;
     if (offset == 0x28)
       // 0x3E, not 0x1E: the old mask dropped SDHCI_CTRL_8BITBUS (BIT(5)), so
       // an eMMC 8-bit bus could never be represented.
       hostctl = val & 0x3E;
-    if (offset == 0x2F) {
-      // Software Reset. Clear immediately to signify completion.
-      mmio_regs[base + 0x2C] &= ~(val << 24);
-    }
-    if (offset == 0x2C && size == 4) {
-      // If reset bits were set in 4-byte write, clear them for subsequent reads
-      mmio_regs[base + 0x2C] &= ~0x07000000;
-    }
     if (offset == 0x04) {
       if (size == 4) {
         blksize = val & 0x0FFF;
@@ -1878,6 +2525,32 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
 
       switch (cmd) {
       case 0:
+        // GO_IDLE_STATE: the eMMC comes back in its user area (PARTITION_
+        // ACCESS = 0). Leaving BOOT0 selected made the next init read the
+        // GPT - and write user data - into the boot partition's image.
+        if (base == SDMMC4_BASE) {
+          state->emmc_partition = 0;
+          emmc_ext_csd_card_reset();
+        } else {
+          // Functions back to default; the signalling voltage stays.
+          memset(sd_card.func, 0, sizeof(sd_card.func));
+          sd_card.s18a_offered = false;
+          sd_card.bus4 = false;
+        }
+        break;
+      case 11: // SD VOLTAGE_SWITCH (R1, card in READY)
+        if (base == SDMMC1_BASE && sd_card.s18a_offered) {
+          sd_card.v18 = true;
+          sd_card.s18a_offered = false;
+          rsp[0] = r1_base | (1 << 9);
+        } else {
+          rsp[0] = r1_base | (1 << 9) | (1u << 22); // ILLEGAL_COMMAND
+        }
+        break;
+      case 19: // SD SEND_TUNING_BLOCK
+      case 21: // eMMC SEND_TUNING_BLOCK_HS200
+        sdhci_tuning_command(state, base);
+        rsp[0] = r1_base | (4 << 9) | (1u << 8);
         break;
       case 8:
         rsp[0] = (base == SDMMC4_BASE) ? 0x00000900 : arg;
@@ -1886,33 +2559,7 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
         // bails with storage->initialized = 0 — which silently breaks all
         // later sdmmc_storage_read calls (returns 0 without issuing CMD18).
         if (base == SDMMC4_BASE) {
-          uint8_t ext_csd[512] = {0};
-          // Set a few fields BDK actually parses (most others can be 0):
-          //   EXT_CSD_REV = 192 (offset 192)
-          //   EXT_CSD_CARD_TYPE = 196 (HS-52 + HS200 + HS400 supported)
-          //   EXT_CSD_SEC_CNT = 212..215 (sector count, little-endian u32)
-          ext_csd[192] = 7;  // eMMC v5.0
-          ext_csd[196] = 0x57; // HS400_1.8V | HS200_1.8V | HS_52 | HS_DDR
-          // 32GB worth of sectors (0x3A380000 = 977MB; for the user's actual
-          // dump size we'd want the real value, but BDK only uses sec_cnt for
-          // sanity, not for read addressing).
-          uint32_t sec_cnt = 64 * 1024 * 1024; // 32GB / 512B = 64M sectors
-          ext_csd[212] = sec_cnt & 0xFF;
-          ext_csd[213] = (sec_cnt >> 8) & 0xFF;
-          ext_csd[214] = (sec_cnt >> 16) & 0xFF;
-          ext_csd[215] = (sec_cnt >> 24) & 0xFF;
-          // Capability/health bytes a diagnostic payload reports on. Values
-          // measured from the eMMC in a real Mariko; left at 0 these read as
-          // "feature not supported", which looks like a reduced-firmware
-          // replacement part.
-          ext_csd[503] = 0x01; // HPI_FEATURES: supported, CMD13 variant
-          ext_csd[231] = 0x55; // SEC_FEATURE_SUPPORT: secure erase/trim/sanitize
-          ext_csd[232] = 0x02; // TRIM_MULT
-          ext_csd[229] = 0x11; // SEC_TRIM_MULT (measured)
-          ext_csd[162] = 0x01; // RST_N_FUNCTION: permanently enabled
-          ext_csd[267] = 0x01; // PRE_EOL_INFO: normal
-          ext_csd[268] = 0x01; // DEVICE_LIFE_TIME_EST_TYP_A: 0-10%
-          ext_csd[269] = 0x01; // DEVICE_LIFE_TIME_EST_TYP_B: 0-10%
+          const uint8_t *ext_csd = emmc_ext_csd();
 
           uint64_t dma_addr = 0;
           // Tegra's SDMMC uses register 0x58 as the SDMA system-address
@@ -1921,7 +2568,7 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
           // captures that write, so it IS the destination, not a descriptor
           // pointer. Fall back to sysad (SDHCI standard 0x00) if 0x58 wasn't
           // programmed.
-          dma_addr = adma_addr ? adma_addr : sysad;
+          dma_addr = sdmmc_dma_target(uc, hostctl, adma_addr, sysad);
           if (dma_addr) uc_mem_write(uc, dma_addr, ext_csd, 512);
           norintsts |= 0x0002; // TRANSFER_COMPLETE
         }
@@ -2007,6 +2654,10 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
         // bits 18-21 of my rspreg3. Set those to 0100 (=4) so storage->csd.
         // mmca_vsn >= CSD_SPEC_VER_4 and sdmmc_storage_init_mmc reaches
         // storage->initialized = 1 instead of the early-return at line 688.
+        if (base == SDMMC1_BASE) {
+          sd_csd(state, rsp);
+          break;
+        }
         rsp[0] = 0x400E0032;
         rsp[1] = 0x5B590000;
         rsp[2] = 0x00007F80;
@@ -2016,25 +2667,11 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
         bool is_acmd = (base == SDMMC1_BASE) ? state->last_cmd_was_55
                                              : state->last_cmd4_was_55;
         if (is_acmd) {
-          uint8_t ss[64] = {0};
-          ss[0] = 0x80; // 4-bit support (bit 511:510 = 10)
-          uint64_t dma_addr = 0;
-          if (trnmod & 0x0001) {
-            if ((hostctl & 0x18) == 0x10) { // ADMA2
-              uint8_t desc[12];
-              if (uc_mem_read(uc, adma_addr, desc, 12) == UC_ERR_OK) {
-                uint32_t low = *(uint32_t *)(desc + 4);
-                uint32_t high = *(uint32_t *)(desc + 8);
-                dma_addr = ((uint64_t)high << 32) | low;
-              }
-            } else { // SDMA
-              dma_addr = sysad;
-            }
-            if (dma_addr)
-              uc_mem_write(uc, dma_addr, ss, 64);
-          } else {
-            uc_mem_write(uc, sysad, ss, 64);
-          }
+          uint8_t ss[64];
+          sd_status(ss);
+          uint64_t dma_addr = sdmmc_dma_target(uc, hostctl, adma_addr, sysad);
+          if (dma_addr)
+            uc_mem_write(uc, dma_addr, ss, 64);
           norintsts |= 0x0002;
         }
         rsp[0] = r1_base | (4 << 9); // TRAN state
@@ -2059,40 +2696,25 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
         bool is_acmd = (base == SDMMC1_BASE) ? state->last_cmd_was_55
                                              : state->last_cmd4_was_55;
         if (is_acmd) {
-          // ACMD6: SET_BUS_WIDTH
+          // ACMD6: SET_BUS_WIDTH (arg 2 = 4-bit)
+          if (base == SDMMC1_BASE)
+            sd_card.bus4 = (arg & 3) == 2;
           rsp[0] = r1_base | (4 << 9);
         } else if (base == SDMMC1_BASE) {
           // CMD6: SWITCH_FUNC (SD)
-          uint8_t status[64] = {0};
-          status[12] = 0x00;
-          status[13] = 0x02; // HS Support
-          status[16] = 0x01; // Group 1 switched to HS
+          uint8_t status[64];
+          sd_switch_func(arg, status);
 
-          uint64_t dma_addr = 0;
-          if (trnmod & 0x0001) {            // DMA Enabled
-            if ((hostctl & 0x18) == 0x10) { // ADMA2
-              uint8_t desc[12];
-              if (uc_mem_read(uc, adma_addr, desc, 12) == UC_ERR_OK) {
-                uint32_t low = *(uint32_t *)(desc + 4);
-                uint32_t high = *(uint32_t *)(desc + 8);
-                dma_addr = ((uint64_t)high << 32) | low;
-              }
-            } else { // SDMA
-              dma_addr = sysad;
-            }
-            if (dma_addr)
-              uc_mem_write(uc, dma_addr, status, 64);
-          } else { // PIO
-            uc_mem_write(uc, sysad, status, 64);
-          }
+          uint64_t dma_addr = sdmmc_dma_target(uc, hostctl, adma_addr, sysad);
+          if (dma_addr)
+            uc_mem_write(uc, dma_addr, status, 64);
           norintsts |= 0x0002; // Transfer Complete
           rsp[0] = r1_base | (4 << 9);
         } else if (base == SDMMC4_BASE) {
           // CMD6: SWITCH (eMMC)
-          uint8_t index = (arg >> 16) & 0xFF;
-          uint8_t val = (arg >> 8) & 0xFF;
-          if (index == 179) { // PARTITION_CONFIG
-            state->emmc_partition = val & 0x7;
+          emmc_ext_csd_switch(arg);
+          if (((arg >> 16) & 0xFF) == 179) { // PARTITION_CONFIG
+            state->emmc_partition = emmc_ext_csd()[179] & 0x7;
             TRACE("[sdmmc] eMMC Partition Switch: %u\n",
                    state->emmc_partition);
           }
@@ -2108,8 +2730,10 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
           state->last_cmd4_was_55 = true;
         break;
       }
-      case 41:
-        rsp[0] = 0xC0FF8000;
+      case 41: // SD_SEND_OP_COND: powered up, CCS, 2.7-3.6 V; S18A per S18R
+        sd_card.s18a_offered = base == SDMMC1_BASE && (arg & (1u << 24)) &&
+                               !sd_card.v18;
+        rsp[0] = 0xC0FF8000 | (sd_card.s18a_offered ? (1u << 24) : 0);
         break;
       case 42:
         rsp[0] = r1_base | (4 << 9);
@@ -2121,12 +2745,13 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
           // SD SCR: byte 0 low nibble = SD_SPEC (2 => v2.00), byte 1 low
           // nibble = SD_BUS_WIDTHS (5 => 1-bit + 4-bit). This is what makes
           // hekate switch the bus to 4-bit; without it the init falls back to
-          // 1-bit HS25 and hwtest flags "1-bit (dirty slot?)".
-          uint8_t scr[8] = {0x02, 0x35, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+          // 1-bit HS25 and hwtest flags "1-bit (dirty slot?)". Byte 2 bit 7,
+          // SD_SPEC3: Physical Layer 3.0x, as a UHS-I card is.
+          uint8_t scr[8] = {0x02, 0x35, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00};
           // Tegra drives this small read over SDMA with the destination in
           // register 0x58 (captured here as adma_addr), NOT the SDHCI-standard
           // sysad (0x00), which Tegra leaves unused. Matches the EXT_CSD path.
-          uint64_t dma_addr = adma_addr ? adma_addr : sysad;
+          uint64_t dma_addr = sdmmc_dma_target(uc, hostctl, adma_addr, sysad);
           if (dma_addr)
             uc_mem_write(uc, dma_addr, scr, 8);
           norintsts |= 0x0002;
@@ -2155,7 +2780,7 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
             fd = -2; // GPP (handled below)
         }
 
-        if (fd != -1) {
+        {   // fd == -1: no image behind it - do_io serves it as blank
           uint64_t sector = arg;
           uint64_t file_off = sector * 512;
           uint16_t bcnt =
@@ -2170,8 +2795,36 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
           }
           size_t xfer_len = bcnt * 512;
 
+          // A write that did not land, or a DMA address nothing backs, ends
+          // the command with a data error instead of a silent "complete".
+          bool io_err = false;
+          // Read `len` bytes at `off` of one image file into buf. Anything
+          // past its end reads as blank, as on a card larger than its dump.
+          auto file_read = [&](int f, uint64_t off, uint8_t *buf, size_t len) {
+            ssize_t res = pread(f, buf, len, (off_t)off);
+            if (res < 0)
+              res = 0;
+            if ((size_t)res < len)
+              TRACE("[sdmmc] short read at 0x%llX: %zd of %zu bytes\n",
+                    (unsigned long long)off, res, len);
+          };
+          auto file_write = [&](int f, uint64_t off, const uint8_t *buf,
+                                size_t len) {
+            ssize_t res = pwrite(f, buf, len, (off_t)off);
+            if (res != (ssize_t)len) {
+              printf("[sdmmc] write of %zu bytes at 0x%llX failed (%zd)\n", len,
+                     (unsigned long long)off, res);
+              io_err = true;
+            }
+          };
+
           auto do_io = [&](int current_fd, uint64_t current_off,
                            uint64_t dma_addr, size_t len) {
+            std::vector<uint8_t> io_buf(len, 0);
+            if (!is_read && uc_mem_read(uc, dma_addr, io_buf.data(), len) != UC_ERR_OK) {
+              io_err = true;
+              return;
+            }
             if (current_fd == -2) { // GPP Spanning
               // No rawnand image loaded: serve a synthesized valid GPT so the
               // [eMMC GPT] probe sees "EFI PART" with good CRCs instead of
@@ -2180,92 +2833,100 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
                 if (is_read) {
                   size_t glen = 0;
                   const uint8_t *gpt = emmc_synth_gpt(&glen);
-                  std::vector<uint8_t> io_buf(len, 0);
                   for (size_t o = 0; o < len; o++) {
                     uint64_t abs = current_off + o;
                     if (abs < glen) io_buf[o] = gpt[abs];
                   }
-                  uc_mem_write(uc, dma_addr, io_buf.data(), len);
                 }
-                return;
-              }
-              // Hekate-style rawnand splitting can use 2GB or 4GB chunks.
-              // Stat the first part once and cache; assumes all but the last
-              // part are the same size (true for both Hekate's standard
-              // 4GB-FAT32-friendly splits and tools that use 2GB chunks).
-              static size_t part_size = 0;
-              if (!part_size && !state->emmc_gpp_fds.empty()) {
-                struct stat st;
-                if (fstat(state->emmc_gpp_fds[0], &st) == 0 && st.st_size > 0)
-                  part_size = (size_t)st.st_size;
-                else
-                  part_size = 4ULL * 1024 * 1024 * 1024;
-                TRACE("[sdmmc] GPP part size detected: %zu bytes\n", part_size);
-              }
-              if (!part_size) return; // No GPP files — nothing to read.
-              int part_idx = (int)(current_off / part_size);
-              uint64_t part_off = current_off % part_size;
-              if (part_idx < (int)state->emmc_gpp_fds.size()) {
-                int real_fd = state->emmc_gpp_fds[part_idx];
-                std::vector<uint8_t> io_buf(len);
-                if (is_read) {
-                  ssize_t res = pread(real_fd, io_buf.data(), len, part_off);
-                  if (res != (ssize_t)len)
-                    TRACE("[sdmmc] eMMC GPP READ ERROR: res=%zd, "
-                           "expected=%zu, off=0x%llX\n",
-                           res, len, (unsigned long long)part_off);
-                  uc_mem_write(uc, dma_addr, io_buf.data(), len);
-                } else {
-                  uc_mem_read(uc, dma_addr, io_buf.data(), len);
-                  ssize_t res = pwrite(real_fd, io_buf.data(), len, part_off);
-                  if (res != (ssize_t)len)
-                    TRACE("[sdmmc] eMMC GPP WRITE ERROR: res=%zd, "
-                           "expected=%zu, off=0x%llX\n",
-                           res, len, (unsigned long long)part_off);
+              } else {
+                // Hekate-style rawnand splitting can use 2GB or 4GB chunks.
+                // Stat the first part once and cache; assumes all but the
+                // last part are the same size (true for both Hekate's
+                // standard 4GB-FAT32-friendly splits and tools that use 2GB
+                // chunks).
+                static uint64_t part_size = 0;
+                if (!part_size) {
+                  int64_t sz = file_size64(state->emmc_gpp_fds[0]);
+                  part_size = sz > 0 ? (uint64_t)sz : 4ULL * 1024 * 1024 * 1024;
+                  TRACE("[sdmmc] GPP part size detected: %llu bytes\n",
+                        (unsigned long long)part_size);
+                }
+                // A transfer can straddle two parts (a 2 GiB split falls in
+                // the middle of SYSTEM): go part by part. Past the last part
+                // the device is blank; writes there have nowhere to go.
+                size_t done = 0;
+                while (done < len) {
+                  uint64_t off = current_off + done;
+                  size_t idx = (size_t)(off / part_size);
+                  uint64_t part_off = off % part_size;
+                  size_t n = (size_t)std::min<uint64_t>(len - done, part_size - part_off);
+                  if (idx < state->emmc_gpp_fds.size()) {
+                    int real_fd = state->emmc_gpp_fds[idx];
+                    if (is_read)
+                      file_read(real_fd, part_off, io_buf.data() + done, n);
+                    else
+                      file_write(real_fd, part_off, io_buf.data() + done, n);
+                  } else if (!is_read) {
+                    printf("[sdmmc] eMMC write past the last rawnand part "
+                           "(0x%llX) dropped\n", (unsigned long long)off);
+                    io_err = true;
+                  }
+                  done += n;
                 }
               }
             } else if (current_fd >= 0) {
-              std::vector<uint8_t> io_buf(len);
-              if (is_read) {
-                ssize_t res =
-                    pread(current_fd, io_buf.data(), len, current_off);
-                if (res != (ssize_t)len)
-                  TRACE("[sdmmc] SD/BOOT READ ERROR: res=%zd, expected=%zu, "
-                         "off=0x%llX\n",
-                         res, len, (unsigned long long)current_off);
-                uc_mem_write(uc, dma_addr, io_buf.data(), len);
-              } else {
-                uc_mem_read(uc, dma_addr, io_buf.data(), len);
-                ssize_t res =
-                    pwrite(current_fd, io_buf.data(), len, current_off);
-                if (res != (ssize_t)len)
-                  TRACE("[sdmmc] SD/BOOT WRITE ERROR: res=%zd, expected=%zu, "
-                         "off=0x%llX\n",
-                         res, len, (unsigned long long)current_off);
-              }
+              if (is_read)
+                file_read(current_fd, current_off, io_buf.data(), len);
+              else
+                file_write(current_fd, current_off, io_buf.data(), len);
             }
+            // No image behind this partition (BOOT1, a BOOT0 not given):
+            // it reads as blank and swallows writes.
+            if (is_read && uc_mem_write(uc, dma_addr, io_buf.data(), len) != UC_ERR_OK)
+              io_err = true;
           };
 
           if (trnmod & 0x0001) {            // DMA Enabled (Bit 0 of TRNMOD)
-            if ((hostctl & 0x18) == 0x10) { // ADMA2
-              // Parse ADMA2 descriptors
+            uint32_t dmasel = hostctl & 0x18;
+            if (dmasel == 0x10 || dmasel == 0x18) {
+              // ADMA2 (SD Host Controller spec 1.13): each descriptor is
+              // attr (bit 0 Valid, bit 1 End, 5:4 Act: 10b transfer, 11b
+              // link), a 16-bit length (0 = 64 KiB) and the address - 32
+              // bits in an 8-byte descriptor, 64 in a 12-byte one. The walk
+              // is bounded: a table with no End bit must not run through all
+              // of DRAM.
+              bool d64 = dmasel == 0x18;
               uint64_t desc_addr = adma_addr;
-              uint8_t desc[12];
-              while (true) {
-                if (uc_mem_read(uc, desc_addr, desc, 12) != UC_ERR_OK)
+              for (int n = 0; n < 4096; n++) {
+                uint8_t desc[12] = {0};
+                if (uc_mem_read(uc, desc_addr, desc, d64 ? 12 : 8) != UC_ERR_OK) {
+                  errintsts |= 1u << 9;   // ADMA error
                   break;
-                uint16_t attr = desc[0];
-                uint16_t len = *(uint16_t *)(desc + 2);
-                uint32_t low = *(uint32_t *)(desc + 4);
-                uint32_t high = *(uint32_t *)(desc + 8);
-                uint64_t dma_addr = ((uint64_t)high << 32) | low;
-                if ((attr & 0x3) == 0x2) { // Action: Transfer
-                  do_io(fd, file_off, dma_addr, len);
-                  file_off += len;
                 }
-                if (attr & 0x02)
-                  break; // End bit is bit 1
-                desc_addr += 12;
+                uint16_t attr = (uint16_t)(desc[0] | (desc[1] << 8));
+                uint32_t dlen = (uint32_t)(desc[2] | (desc[3] << 8));
+                if (!dlen)
+                  dlen = 65536;
+                uint64_t addr = (uint64_t)desc[4] | ((uint64_t)desc[5] << 8) |
+                                ((uint64_t)desc[6] << 16) | ((uint64_t)desc[7] << 24);
+                if (d64)
+                  addr |= ((uint64_t)desc[8] | ((uint64_t)desc[9] << 8) |
+                           ((uint64_t)desc[10] << 16) | ((uint64_t)desc[11] << 24)) << 32;
+                if (!(attr & 0x01)) {     // not Valid: the engine stops, in error
+                  errintsts |= 1u << 9;
+                  break;
+                }
+                uint32_t act = (attr >> 4) & 3;
+                if (act == 2) {           // transfer
+                  do_io(fd, file_off, addr, dlen);
+                  file_off += dlen;
+                } else if (act == 3) {    // link to the next table
+                  desc_addr = addr;
+                  continue;
+                }
+                if (attr & 0x02)          // End
+                  break;
+                desc_addr += d64 ? 12 : 8;
               }
             } else { // SDMA
               do_io(fd, file_off, adma_addr, xfer_len);
@@ -2273,7 +2934,13 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
           } else { // PIO
             do_io(fd, file_off, sysad, xfer_len);
           }
+          if (io_err)
+            errintsts |= 1u << 4;         // data timeout
         }
+        // R1 for the read/write command itself: TRAN, READY_FOR_DATA, no
+        // error bits. bdk checks this cached response after every transfer;
+        // it used to hold whatever the previous command had answered.
+        rsp[0] = r1_base | (4 << 9) | (1u << 8);
         norintsts |= 0x0002; // Transfer Complete
         break;
       }
@@ -2293,24 +2960,37 @@ void misc_write(uc_engine *uc, EmuState *state, uint64_t addr, int64_t value,
 
 // ==================== PMC ====================
 
+// APBDEV_RTC (TRM 11.x). SECONDS counts once per second and is writable;
+// reading MILLI_SECONDS snapshots SECONDS into SHADOW_SECONDS, which is how
+// bdk's get_tmr_ms() reads both halves of one instant. The RTC is always-on:
+// it keeps counting across a SoC reset (rtc_base_us carries the time over).
+static uint64_t rtc_base_us = 0;       // RTC time at emu_usec == 0
+static int64_t  rtc_sec_adjust = 0;    // SECONDS writes, as an offset
+static uint32_t rtc_shadow_seconds = 0;
+
+static uint32_t rtc_seconds(EmuState *state) {
+  return (uint32_t)((int64_t)((rtc_base_us + state->emu_usec) / 1000000) +
+                    rtc_sec_adjust);
+}
+
 uint32_t rtc_read(EmuState *state, uint64_t addr) {
   uint32_t offset = (uint32_t)(addr - RTC_BASE);
-  uint64_t ms = state->emu_usec / 1000;
-
   switch (offset) {
+  case 0x08:
+    return rtc_seconds(state); // APBDEV_RTC_SECONDS
   case 0x0C:
-    return (uint32_t)(ms / 1000); // APBDEV_RTC_SHADOW_SECONDS
-  case 0x10:
-    return (uint32_t)(ms % 1000); // APBDEV_RTC_MILLI_SECONDS
+    return rtc_shadow_seconds; // APBDEV_RTC_SHADOW_SECONDS
+  case 0x10:                   // APBDEV_RTC_MILLI_SECONDS
+    rtc_shadow_seconds = rtc_seconds(state);
+    return (uint32_t)(((rtc_base_us + state->emu_usec) / 1000) % 1000);
   default:
-    return 0;
+    return mmio_regs.get(addr);
   }
 }
 
 void rtc_write(EmuState *state, uint64_t addr, uint32_t val) {
-  (void)state;
-  (void)addr;
-  (void)val;
+  if ((uint32_t)(addr - RTC_BASE) == 0x08)
+    rtc_sec_adjust += (int64_t)val - (int64_t)rtc_seconds(state);
 }
 
 // ---- power partitions and I/O-pad deep power down --------------------------
@@ -2323,8 +3003,18 @@ void rtc_write(EmuState *state, uint64_t addr, uint32_t val) {
 // IO_DPD_REQ/STATUS park pad groups in deep power down. Both reset to 0 (no
 // pad parked), and writes carry a 2-bit command in bits 31:30: 1 = DPD OFF
 // (wake the named pads), 2 = DPD ON (park them).
-static uint32_t pmc_pwrgate_status = 0;
+// Bit 3 (PCIE) is already ungated at RCM entry - measured on both an Erista
+// and a Mariko (hwtest's Wi-Fi probe reads PWRGATE_STATUS before touching it).
+static uint32_t pmc_pwrgate_status = 1u << 3;
 static uint32_t pmc_io_dpd_status[2] = {0, 0};
+// Everything else in the PMC is plain read/write storage: the scratch
+// registers payloads leave notes in, the secure scratch the SE deposits its
+// context key in, pad and timing configuration.
+static uint32_t pmc_regs[PMC_SIZE / 4];
+
+bool pmc_partition_on(int part) {
+  return part >= 0 && part < 32 && ((pmc_pwrgate_status >> part) & 1);
+}
 
 uint32_t pmc_read(EmuState *state, uint64_t addr) {
   (void)state;
@@ -2339,19 +3029,30 @@ uint32_t pmc_read(EmuState *state, uint64_t addr) {
     return pmc_io_dpd_status[0];  // APBDEV_PMC_IO_DPD_STATUS
   case 0x1C4:
     return pmc_io_dpd_status[1];  // APBDEV_PMC_IO_DPD2_STATUS
-  case 0x50:
-    return pmc_scratch0; // APBDEV_PMC_SCRATCH0
-  case 0x1A0:
-    return 0; // PMC_PWR_DET - all rails OK
+  case 0x2BC:
+    // APBDEV_PMC_GLB_AMAP_CFG: which CCPLEX apertures decode as MMIO or DRAM
+    // (TRM 12.6.172). Measured 0x00020000 in RCM; bits 1..3 clear means the
+    // three PCIe apertures are MMIO for the CPU, which CPU0's accesses to
+    // the root complex depend on.
+    return 0x00020000;
   default:
-    return 0;
+    return offset < PMC_SIZE ? pmc_regs[offset / 4] : 0;
   }
+}
+
+void pmc_secure_scratch_write(unsigned n, uint32_t value) {
+  static const uint16_t kOffset[8] = {0xB0, 0xB4, 0xB8, 0xBC,
+                                      0xC0, 0xC4, 0x224, 0x228};
+  if (n < 8)
+    pmc_regs[kOffset[n] / 4] = value;
 }
 
 // ==================== PMC ====================
 
 void pmc_write(EmuState *state, uint64_t addr, uint32_t val) {
   uint32_t offset = (uint32_t)(addr - PMC_BASE);
+  if (offset < PMC_SIZE)
+    pmc_regs[offset / 4] = val;
   switch (offset) {
   case 0x00:
     // APBDEV_PMC_CNTRL — bit 4 = MAIN_RST. Hekate writes this from
@@ -2360,7 +3061,7 @@ void pmc_write(EmuState *state, uint64_t addr, uint32_t val) {
     if (val & (1u << 4)) {
       printf("[emu] PMC MAIN_RST written - rebooting payload\n");
       fflush(stdout);
-      state->reboot_requested = true;
+      request_reboot(state, false);
     }
     break;
   case 0x30: {
@@ -2370,8 +3071,12 @@ void pmc_write(EmuState *state, uint64_t addr, uint32_t val) {
     if (val & (1u << 8)) {
       uint32_t part = val & 0x1F;
       pmc_pwrgate_status ^= (1u << part);
+      bool on = (pmc_pwrgate_status >> part) & 1;
       if (part == 3) // POWER_RAIL_PCIE
-        pcie_set_powergate((pmc_pwrgate_status & (1u << 3)) != 0);
+        pcie_set_powergate(on);
+      // CRAIL / CE0 / C0NC carry CPU0: gating one under a running core
+      // takes the core down with it.
+      ccplex_partition_changed(state, (int)part, on);
     }
     break;
   }
@@ -2385,12 +3090,6 @@ void pmc_write(EmuState *state, uint64_t addr, uint32_t val) {
       pmc_io_dpd_status[bank] |= mask;    // DPD ON: park them
     break;
   }
-  case 0x50:
-    pmc_scratch0 = val;
-    break;
-  case 0x120:
-    pmc_scratch37 = val;
-    break;
   }
 }
 
@@ -2407,54 +3106,128 @@ static constexpr uint32_t HALT_MSEC = 1u << 24;
 static constexpr uint32_t HALT_USEC = 1u << 25;
 static constexpr uint32_t HALT_TIMED = HALT_SEC | HALT_MSEC | HALT_USEC;
 
-// FLOW_CTLR_RAM_REPAIR (0x40): bit 0 = REQ, bit 1 = STS.
-// ccplex_boot_cpu0() requests RAM repair for the fast cluster and then spins
-// on STS with no timeout (bdk soc/ccplex.c). Reads used to fall through to 0,
-// so anything that brings up the CCPLEX - e.g. a payload running its memory
-// test on the A57s - hung there forever. Latch REQ and report the repair as
-// complete straight away.
+// FLOW_CTLR_RAM_REPAIR (0x40, TRM 17.2.9, reset 0x4 = BYPASS_EN). Software
+// sets REQ (bit 0); hardware repairs every segment, sets STS (bit 1, read-
+// only) and clears REQ again. ccplex_boot_cpu0() sets REQ and spins on STS
+// with no timeout (bdk soc/ccplex.c), so the repair completes at once.
 static constexpr uint32_t RAM_REPAIR_REQ = 1u << 0;
 static constexpr uint32_t RAM_REPAIR_STS = 1u << 1;
-static uint32_t flow_ram_repair = 0;
+static constexpr uint32_t RAM_REPAIR_RESET = 1u << 2;   // BYPASS_EN
+static uint32_t flow_ram_repair = RAM_REPAIR_RESET;
+
+// ---- 1 MHz timers TMR0..TMR9 ----------------------------------------------
+//
+// Only what a halted BPMP needs: bdk's timer_usleep() arms TMR8 and stops
+// the core with FLOW_MODE_STOP_UNTIL_IRQ until it fires. PTV (TRM 8.7.1):
+// bit 31 EN, bit 30 PER (periodic), 28:0 the count, in an n+1 scheme.
+static const uint16_t kTmrPtv[10] = {0x88, 0x00, 0x08, 0x50, 0x58,
+                                     0x60, 0x68, 0x70, 0x78, 0x80}; // TMR0..9
+static uint64_t tmr_armed_us[10];
+static constexpr uint32_t TMR_EN = 1u << 31, TMR_PER = 1u << 30;
+
+static void tmr_write(EmuState *state, uint64_t addr, uint32_t val) {
+  uint32_t off = (uint32_t)(addr - TMR_BASE);
+  for (int t = 0; t < 10; t++)
+    if (off == kTmrPtv[t] && (val & TMR_EN))
+      tmr_armed_us[t] = state->emu_usec;
+}
+
+// The first armed timer to fire: its expiry time. One-shot timers disarm,
+// periodic ones re-arm from their expiry.
+static bool tmr_fire_next(EmuState *state, uint64_t *when) {
+  int best = -1;
+  uint64_t best_at = 0;
+  for (int t = 0; t < 10; t++) {
+    uint32_t ptv = mmio_regs.get(TMR_BASE + kTmrPtv[t]);
+    if (!(ptv & TMR_EN))
+      continue;
+    uint64_t at = tmr_armed_us[t] + (ptv & 0x1FFFFFFF) + 1;
+    if (best < 0 || at < best_at) {
+      best = t;
+      best_at = at;
+    }
+  }
+  if (best < 0)
+    return false;
+  uint64_t addr = TMR_BASE + kTmrPtv[best];
+  uint32_t ptv = mmio_regs.get(addr);
+  if (ptv & TMR_PER)
+    tmr_armed_us[best] = best_at;
+  else
+    mmio_regs[addr] = ptv & ~TMR_EN;
+  *when = best_at > state->emu_usec ? best_at : state->emu_usec;
+  return true;
+}
 
 static uint32_t flow_read(EmuState *state, uint64_t addr) {
   (void)state;
   uint32_t offset = (uint32_t)(addr - 0x60007000);
   if (offset == 0x40)
-    return flow_ram_repair | (flow_ram_repair & RAM_REPAIR_REQ ? RAM_REPAIR_STS : 0);
-  return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+    return flow_ram_repair;
+  return mmio_regs.get(addr);
 }
 
 static void flow_write(EmuState *state, uint64_t addr, uint32_t val) {
   uint32_t offset = (uint32_t)(addr - 0x60007000);
   if (offset == 0x40) {
-    flow_ram_repair = val;
+    flow_ram_repair = (val & ~(RAM_REPAIR_REQ | RAM_REPAIR_STS)) |
+                      (flow_ram_repair & RAM_REPAIR_STS);
+    if (val & RAM_REPAIR_REQ)
+      flow_ram_repair |= RAM_REPAIR_STS;
     return;
   }
   if (offset == 0x04) {
-    // Two very different things get written here and they must not be
-    // conflated:
+    // HALT_COP_EVENTS: MODE in 31:29 (TRM 17.2.2).
+    //   0 NONE, 1 RUN_AND_INT       - no halt at all
+    //   2/3 WAITEVENT(_AND_INT)     - stop until an event source fires
+    //   4/5 STOP_UNTIL_IRQ(_AND_INT), 6 STOP_UNTIL_EVENT_AND_IRQ
+    // Three different things arrive here:
     //
     //  1. bpmp_usleep() / bpmp_msleep() park the BPMP with a TIMER event
     //     source (HALT_USEC / HALT_MSEC / HALT_SEC) plus a delay count, to
     //     sleep with the core clock-gated. The timer event wakes the core
-    //     and execution continues. This is a routine sleep and happens all
-    //     over the BDK - treating it as terminal killed any payload that
-    //     slept this way (e.g. a 200 ms bpmp_msleep = 0x410000C8).
-    //
-    //  2. bpmp_halt() writes WAITEVENT | JTAG with no timer source and is
+    //     and execution continues.
+    //  2. timer_usleep() arms TMR8 and waits in STOP_UNTIL_IRQ for its
+    //     interrupt, the only interrupt source modelled here.
+    //  3. bpmp_halt() writes WAITEVENT | JTAG with no timer source and is
     //     followed by `while(true);`. That one really is "payload done"
-    //     (power-off / reboot / fatal), so we exit cleanly.
+    //     (power-off / reboot / fatal) - unless CPU0 is still running, as
+    //     after fusee's or hekate's L4T handoff, which then carries on
+    //     alone.
+    uint32_t mode = val >> 29;
+    if (mode <= 1)
+      return;
+    if (state->reboot_requested) {
+      // power_set_state() halts right after writing MAIN_RST or SFT_RST:
+      // the reset is on its way, so this is not the end of the run.
+      if (g_bus_master == BUS_BPMP)
+        uc_emu_stop(state->uc);
+      return;
+    }
+    uint64_t wake = 0;
     if (val & HALT_TIMED) {
       // Advance the emulated microsecond counter by the requested delay so
       // TIMERUS-based delta loops observe the time actually passing, then
       // let the CPU run on.
       uint32_t delay = val & 0xFF;
-      uint64_t us = (val & HALT_USEC)   ? (uint64_t)delay
-                    : (val & HALT_MSEC) ? (uint64_t)delay * 1000ULL
-                                        : (uint64_t)delay * 1000000ULL;
-      state->emu_usec += us;
-      state->bpmp_slept_us += us; // feeds the ACTMON BPMP-load model
+      wake = state->emu_usec +
+             ((val & HALT_USEC)   ? (uint64_t)delay
+              : (val & HALT_MSEC) ? (uint64_t)delay * 1000ULL
+                                  : (uint64_t)delay * 1000000ULL);
+    } else if (mode >= 4 && !tmr_fire_next(state, &wake)) {
+      wake = 0;
+    }
+    if (wake) {
+      state->bpmp_slept_us += wake - state->emu_usec; // ACTMON BPMP load
+      state->emu_usec = wake;
+      bpmp_clock_jumped();
+      return;
+    }
+    if (ccplex_cpu0_running()) {
+      printf("[flow] BPMP halted for good (val=0x%08X); CPU0 runs on\n", val);
+      fflush(stdout);
+      state->bpmp_halted = true;
+      bpmp_yield();
       return;
     }
     printf("[flow] BPMP HALT/WaitEvent (val=0x%08X), shutting down emulator\n",
@@ -2468,32 +3241,80 @@ static void flow_write(EmuState *state, uint64_t addr, uint32_t val) {
 
 // ==================== Clock/Reset ====================
 
-// ---- RST_DEVICES_U / CLK_OUT_ENB_U -----------------------------------------
+// ---- Reset and clock-enable banks (TRM 5.2) ---------------------------------
 //
-// bdk never writes these two directly: clock_enable() goes through the SET and
-// CLR aliases (RST_DEV_U_SET 0x310 / _CLR 0x314, CLK_ENB_U_SET 0x330 / _CLR
-// 0x334). With clk_rst_write a no-op and both reads hardcoded, enabling a _U
-// peripheral had no observable effect at all -- clock_enable_uart(UART_D) ran
-// to completion and the payload's own "is this port clocked?" gate then read
-// CLK_U_UARTD clear and aborted. Both seeds are the values measured on a real
-// console at that point in the sweep.
+// RST_DEVICES_x and CLK_OUT_ENB_x for banks L, H, U, V, W, X and Y. Each is
+// written directly or through its SET and CLR strobes, and all three read
+// back the bank: "for reads, you can use either method to retrieve the
+// reset/clock-enable state" (TRM 5.2.100). bdk relies on both halves -
+// clock_enable() goes through the strobes, clock_sdmmc_is_active() reads
+// RST_DEV_L_SET and CLK_ENB_L_SET, and display_init() tears the panel down
+// first when CLK_OUT_ENB_L already has DISP1 on.
 //
-// Note the previous CLK_OUT_ENB_U value force-set bit 15 with a comment about
-// keeping SDMMC4 alive; bit 15 of the _U register is DTV (deprecated). SDMMC4
-// is CLK_L bit 15, which the hardcoded _L value 0x9802D1B0 already carries, so
-// dropping the forced bit costs the storage model nothing and lets _U match
-// hardware exactly.
-static uint32_t car_rst_u = 0x828EC5F8;
-static uint32_t car_enb_u = 0x01F00200;
+// The PCIe and CPU models keep reset banks V, W and Y and clock bank V,
+// because their preconditions depend on them; the table only routes reads
+// of those strobes to them. The rest start from the TRM reset values
+// (unknown bits as 0), except bank U, which is what a real console read.
+// The L, H and X clock banks used to be real-console readings too, but
+// taken after a payload had brought the display up - so every payload
+// found DISP1 already clocked at RCM entry and began with a panel teardown.
+struct CarBank {
+  uint16_t reg, set, clr;
+  bool own;       // false: another model holds this bank
+  uint32_t seed;
+};
+static const CarBank kCarBanks[] = {
+    {0x004, 0x300, 0x304, true,  0x1CD3D2C8}, // RST_DEVICES_L
+    {0x008, 0x308, 0x30C, true,  0x87D1F326}, // RST_DEVICES_H
+    {0x00C, 0x310, 0x314, true,  0x828EC5F8}, // RST_DEVICES_U (measured)
+    {0x358, 0x430, 0x434, false, 0},          // RST_DEVICES_V (pcie.cpp)
+    {0x35C, 0x438, 0x43C, false, 0},          // RST_DEVICES_W (pcie.cpp)
+    {0x28C, 0x290, 0x294, true,  0x01E42049}, // RST_DEVICES_X
+    {0x2A4, 0x2A8, 0x2AC, false, 0},          // RST_DEVICES_Y (pcie.cpp)
+    {0x010, 0x320, 0x324, true,  0x80000130}, // CLK_OUT_ENB_L
+    {0x014, 0x328, 0x32C, true,  0x00000080}, // CLK_OUT_ENB_H
+    {0x018, 0x330, 0x334, true,  0x01F00200}, // CLK_OUT_ENB_U (measured)
+    {0x360, 0x440, 0x444, false, 0},          // CLK_OUT_ENB_V (ccplex.cpp)
+    {0x364, 0x448, 0x44C, true,  0x402000FC}, // CLK_OUT_ENB_W
+    {0x280, 0x284, 0x288, true,  0x23000780}, // CLK_OUT_ENB_X
+    {0x298, 0x29C, 0x2A0, true,  0x00000300}, // CLK_OUT_ENB_Y
+};
+constexpr size_t kCarBankCount = sizeof(kCarBanks) / sizeof(kCarBanks[0]);
+
+struct CarBanks {
+  uint32_t v[kCarBankCount];
+  CarBanks() {
+    for (size_t i = 0; i < kCarBankCount; ++i)
+      v[i] = kCarBanks[i].seed;
+  }
+};
+static CarBanks car_banks;
+
+static const CarBank *car_bank_of(uint32_t off) {
+  for (const CarBank &b : kCarBanks)
+    if (off == b.reg || off == b.set || off == b.clr)
+      return &b;
+  return nullptr;
+}
+
+// The EMC clock as CAR sets it (EMC section below).
+static uint32_t emc_rate_khz();
 
 uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
   uint32_t offset = (uint32_t)(addr - CLK_RST_BASE);
+  if (const CarBank *b = car_bank_of(offset)) {
+    if (b->own)
+      return car_banks.v[b - kCarBanks];
+    if (offset != b->reg) // a strobe of a bank another model keeps
+      return clk_rst_read(state, CLK_RST_BASE + b->reg);
+  }
   // PLL_BASE registers (per Hekate bdk/soc/clock.h): each PLL has an _BASE
   // register where bit 30 = ENABLE and bit 27 = LOCK. After enabling a PLL
-  // the boot code polls bit 27 until set. Real silicon locks within ~1ms; we
-  // simulate "always locked + always enabled" so the polls return immediately.
+  // the boot code polls bit 27 until set. Real silicon locks within ~1ms;
+  // here a PLL is locked as soon as it is enabled.
   // Offsets: PLLC=0x80, PLLM=0x90, PLLP=0xA0, PLLA=0xB0, PLLU=0xC0, PLLD=0xD0,
-  //          PLLX=0xE0, PLLE=0xE8, PLLD2=0x4B8, PLLREFE=0x4C4.
+  //          PLLX=0xE0, PLLE=0xE8, PLLD2=0x4B8, PLLREFE=0x4C4, PLLC2=0x4E8,
+  //          PLLC3=0x4FC, PLLDP=0x590, PLLC4=0x5A4, PLLMB=0x5E8, PLLA1=0x6A4.
   bool mariko = state && state->pmic_otp.load() == 0x53;
 
   // On a real console in RCM most PLLs are DOWN - measured on a Mariko, only
@@ -2512,31 +3333,80 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
   //   PLLU 0xC0  down              enabled + locked
   //   PLLD 0xD0  enabled + locked  enabled + locked
   //   PLLX/D2/DP/RE               down on both
+  // PLLE_BASE (0xE8) and PLLREFE_BASE (0x4C4) are not in this list: bit 30
+  // is PLLE's LOCK_OVERRIDE, bit 27 sits inside a divider field in both
+  // (PLDIV_CML / KCP, TRM 5.2), and they report lock in their _MISC
+  // registers - pcie_car_read() answers for those. Forcing bit 27 on here
+  // handed back, and invited a read-modify-write to store, a divider the
+  // payload never programmed.
+  if (offset == 0xE8 || offset == 0x4C4)
+    return mmio_regs.get(addr);
   switch (offset) {
-  case 0x80: case 0xB0: case 0xE0: case 0xE8:
-  case 0x4B8: case 0x4C4: {
-    uint32_t w = mmio_regs.count(addr) ? mmio_regs[addr] : 0;
-    if (w & (1u << 30))
-      return w | (1u << 27);          // payload brought it up -> locked
-    return w;                          // measured: down on both
+  case 0x80: case 0xB0: case 0xE0: case 0x4B8: case 0x4E8: case 0x4FC:
+  case 0x590: case 0x5A4: case 0x6A4: {
+    // PLLC, PLLA, PLLX, PLLD2 (measured down on both), PLLC2, PLLC3,
+    // PLLDP, PLLC4 and PLLA1: locked once the payload enables them (bit
+    // 30). Bit 27 is LOCK or FREQ_LOCK on all of them; PLLA1 also has LOCK
+    // in 26, and PLLDP and PLLC4 FREQLOCK in 28 and a LOCK_OVERRIDE in 24
+    // (TRM 5.2). PLLC4 does not run in IDDQ (bit 18): bdk clears that,
+    // enables it for the eMMC's HS200/HS400 clock and waits for the lock
+    // with no timeout.
+    uint32_t lock = 1u << 27;
+    if (offset == 0x6A4)
+      lock |= 1u << 26;
+    if (offset == 0x590 || offset == 0x5A4)
+      lock |= 1u << 28;
+    uint32_t w = mmio_regs.get(addr) & ~lock;
+    bool on = (w & (1u << 30)) && !(offset == 0x5A4 && (w & (1u << 18)));
+    if ((offset == 0x590 || offset == 0x5A4) && (w & (1u << 24)))
+      on = true;
+    return on ? w | lock : w;
   }
   case 0x90: { // PLLM
-    uint32_t w = mmio_regs.count(addr) ? mmio_regs[addr] : 0;
-    if (w & (1u << 30))
-      return w | (1u << 27);
-    // Erista leaves PLLM enabled but unlocked at this point; Mariko has it off.
-    return mariko ? 0u : (1u << 30);
+    // Until the payload programs it: Erista leaves PLLM enabled but
+    // unlocked at this point, Mariko has it off. Once written, it reads
+    // back what was written - the dividers too, before ENABLE is set.
+    if (!mmio_regs.count(addr))
+      return mariko ? 0u : (1u << 30);
+    uint32_t w = mmio_regs.get(addr);
+    return (w & (1u << 30)) ? w | (1u << 27) : w;
   }
   case 0xC0: { // PLLU
-    uint32_t w = mmio_regs.count(addr) ? mmio_regs[addr] : 0;
-    if (w & (1u << 30))
-      return w | (1u << 27);
-    return mariko ? 0u : ((1u << 30) | (1u << 27));
+    if (!mmio_regs.count(addr))
+      return mariko ? 0u : ((1u << 30) | (1u << 27));
+    uint32_t w = mmio_regs.get(addr);
+    return (w & (1u << 30)) ? w | (1u << 27) : w;
   }
   case 0xA0: // PLLP_BASE - same value on both
     return 0x48115408u;
   case 0xD0: // PLLD_BASE - up on both
     return (1u << 30) | (1u << 27);
+  case 0x5E8: { // PLLMB_BASE (TRM 5.2.230), reset 0x00002A02: down
+    // Minerva moves the EMC onto PLLMB for a DRAM frequency change and
+    // spins on PLLMB_LOCK after enabling it. LOCK and FREQ_LOCK (bits 27,
+    // 26) are read-only: set once the PLL is enabled, or forced by
+    // PLLMB_MISC1.LOCK_OVERRIDE.
+    uint32_t w = mmio_regs.get(addr, 0x00002A02) & ~(3u << 26);
+    uint32_t misc1 = mmio_regs.get(CLK_RST_BASE + 0x5EC, 0x00010000);
+    if ((w & (1u << 30)) || (misc1 & (1u << 18)))
+      w |= 3u << 26;
+    return w;
+  }
+  case 0x52C: { // UTMIPLL_HW_PWRDN_CFG0 (TRM 5.2.202), reset 0x0000000F
+    // UTMIPLL_LOCK (bit 31) and SEQ_STATE (27:26) are read-only. The USB
+    // PLL locks unless software holds it in IDDQ (IDDQ_SWCTL with
+    // IDDQ_OVERRIDE_VALUE, the reset state); bdk's usb code clears the
+    // override, then clock_enable_utmipll() waits for the lock.
+    uint32_t w = mmio_regs.get(addr, 0x0000000F) & ~(1u << 31 | 3u << 26);
+    return (w & 3) == 3 ? w : w | (1u << 31);
+  }
+  case 0x5EC: // PLLMB_MISC1, reset 0x00010000 (EN_LCKDET)
+    return mmio_regs.get(addr, 0x00010000);
+  case 0x19C: // CLK_SOURCE_EMC, reset 0x60180000 (TRM 5.2.73)
+    return mmio_regs.get(addr, 0x60180000);
+  case 0x664: // CLK_SOURCE_EMC_DLL, reset 0x60000000
+  case 0x724: // CLK_SOURCE_EMC_SAFE, reset 0x60000000
+    return mmio_regs.get(addr, 0x60000000);
   }
 
   // Informational clock registers, measured on a real Mariko. These read back
@@ -2544,24 +3414,15 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
   {
     switch (offset) {
     case 0xA4:  return 0x00000003; // PLLP_OUTA
-    case 0x68:  return 0x00005C00; // PLLP_OUTB
+    case 0x68:  return 0x00005C00; // PLLE_SS_CNTL (TRM reset value)
     // SCLK_BURST differs slightly by generation (measured).
     case 0x28:  return mariko ? 0x20003333u : 0x20003330u;
     case 0x2C:  return 0x80000000; // SUPER_SCLK_DIVIDER
     case 0x30:  return 0x00000002; // CLK_SYSTEM_RATE
-    case 0x14:  return 0x030180C1; // CLK_OUT_ENB_H
-    case 0x280: return 0x23024780; // CLK_OUT_ENB_X
-    // _L carries the SDMMC clock-enable bits the storage model depends on:
-    // SDMMC1 is bit 14 and SDMMC4 is bit 15, and the measured value has both.
-    case 0x10:  return 0x9802D1B0;
-    // _U and its reset counterpart are live, so a payload that enables a _U
-    // peripheral (UART-D, I2C3, SDMMC3, ...) can see that it worked.
-    case 0x0C:  return car_rst_u;  // RST_DEVICES_U
-    case 0x18:  return car_enb_u;  // CLK_OUT_ENB_U
     // CLK_SOURCE_UARTD. clock_uart_use_src_div() programs PLLP_OUT0 with
     // CLK_SRC_DIV(2) here (0x00000002) and sets UART_SRC_CLK_DIV_EN for the
     // 1M/3M rates; the payload reads it back to confirm the port's source.
-    case 0x1C0: return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+    case 0x1C0: return mmio_regs.get(addr);
     }
   }
 
@@ -2578,13 +3439,16 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
   // "not running" answer (CCLK_G really is idle - the A57s are off - and
   // PLLP_OBS is not routed).
   if (offset == 0x64) {
-    uint32_t cntl = mmio_regs.count(CLK_RST_BASE + 0x60)
-                        ? mmio_regs[CLK_RST_BASE + 0x60] : 0;
+    uint32_t cntl = mmio_regs.get(CLK_RST_BASE + 0x60);
     uint32_t src = (cntl >> 14) & 0x1FF;   // PTO_SRC_SEL
     uint32_t khz = 0;
     switch (src) {
     case 0x1C: khz = mariko ? 407971 : 407980; break; // SCLK / BPMP
-    case 0x24: khz = mariko ? 203991 : 204001; break; // EMC (DRAM)
+    case 0x24: // EMC (DRAM): the modelled clock; measured at the boot clock
+      khz = emc_rate_khz();
+      if (khz == 204000)
+        khz = mariko ? 203991 : 204001;
+      break;
     case 0x23: khz = mariko ? 199673 : 199677; break; // SDMMC4 (eMMC)
     case 0x20: khz = mariko ? 199671 : 199694; break; // SDMMC1 (SD)
     case 0x12: khz = 0; break;   // CCLK_G - A57 cluster is off in RCM
@@ -2606,40 +3470,53 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
   if (offset == 0x5C)
     return 2343;  // -> 38.4 MHz, BUSY clear (we answer instantly)
 
+  // OSC_CTRL: 31:28 OSC_FREQ, 5 = 38.4 MHz, the Switch's crystal (TRM
+  // 5.2.x, reset 0x500003f1; bdk hw_init() writes 0x50000071). This used to
+  // answer 4, which decodes as 19.2 MHz and contradicted OSC_FREQ_DET.
   if (offset == 0x50)
-    return (4 << 28); // OSC_CTRL, informational
-  if (offset == 0x04)
-    return 0; // RST_DEVICES_L (none in reset)
+    return mmio_regs.get(addr, 0x500003F1);
+
+  // CPU complex clock/reset state (CLK_OUT_ENB_V, RST_CPUG_CMPLX, ...).
+  {
+    uint32_t v = 0;
+    if (ccplex_car_read(offset, &v))
+      return v;
+  }
 
   // PLLE and PLLREFE report lock in their _MISC registers, not in _BASE bit
   // 27 like the PLLs handled above, so the PCIe model answers for them.
   {
-    uint32_t v = mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+    uint32_t v = mmio_regs.get(addr);
     if (pcie_car_read(offset, &v))
       return v;
   }
-  (void)state;
-  return 0;
+  // Everything else is a plain R/W register (the CLK_SOURCE_* dividers,
+  // PLL MISC words, ...): it reads back what was written.
+  return mmio_regs.get(addr);
 }
+
+// A CLK_SOURCE_EMC write is the CAR/EMC clock-change handshake (EMC below).
+static void emc_clock_source_write(EmuState *state, uint32_t val);
 
 void clk_rst_write(EmuState *state, uint64_t addr, uint32_t val) {
   (void)state;
   uint32_t offset = (uint32_t)(addr - CLK_RST_BASE);
-  // Only the _U pair is live so far; everything else stays a no-op, and the
-  // generic mmio_regs cache in the write hook still serves the CLK_SOURCE_*
-  // read-backs. bdk reaches these through the SET/CLR aliases exclusively.
-  switch (offset) {
-  case 0x00C: car_rst_u  =  val; break; // RST_DEVICES_U, direct write
-  case 0x018: car_enb_u  =  val; break; // CLK_OUT_ENB_U, direct write
-  case 0x310: car_rst_u |=  val; break; // RST_DEV_U_SET
-  case 0x314: car_rst_u &= ~val; break; // RST_DEV_U_CLR
-  case 0x330: car_enb_u |=  val; break; // CLK_ENB_U_SET
-  case 0x334: car_enb_u &= ~val; break; // CLK_ENB_U_CLR
-  default: break;
+  // The reset and clock-enable banks, and CLK_SOURCE_EMC, which starts an
+  // EMC clock change. Everything else only lands in the write hook's
+  // mmio_regs cache, which clk_rst_read hands back.
+  if (const CarBank *b = car_bank_of(offset); b && b->own) {
+    uint32_t &bank = car_banks.v[b - kCarBanks];
+    if (offset == b->reg)      bank = val;
+    else if (offset == b->set) bank |= val;
+    else                       bank &= ~val;
   }
+  if (offset == 0x19C)
+    emc_clock_source_write(state, val);
   // The PCIe root complex depends on PLLE, PLLREFE and the PCIE/AFI/
   // PCIEXCLK/UPHY/padctl reset+enable bits, so it shadows the same writes.
-  pcie_car_write(offset, val);
+  pcie_car_write(state, offset, val);
+  // The CPU complex: CPU reset/clock enables, PLLX and CCLK.
+  ccplex_car_write(state, offset, val);
 }
 
 // ==================== Fuse ====================
@@ -2666,7 +3543,16 @@ uint32_t fuse_read(EmuState *state, uint64_t addr) {
     return 0;
   }
   if (offset >= EmuState::FUSE_WORDS * 4) return 0;
-  return state->fuse_at(offset).load();
+  uint32_t v = state->fuse_at(offset).load();
+  // FUSE_RESERVED_ODM28_B01 bit 0 tells bdk which MAX77812 is fitted: clear
+  // means the PHASE31 part at I2C_5 0x31, set the PHASE211 retail part at
+  // 0x33 (bdk power/max7762x.c _max77812_get_address). This model only
+  // answers at 0x33, so a Mariko must read the bit set; left clear, every
+  // bdk regulator call went to a NAKing 0x31 and the CPU rail could never
+  // be enabled - which is exactly what booting CPU0 needs.
+  if (offset == 0x240 && state->is_mariko.load())
+    v |= 1u;
+  return v;
 }
 
 void fuse_write(EmuState *state, uint64_t addr, uint32_t val) {
@@ -2675,61 +3561,243 @@ void fuse_write(EmuState *state, uint64_t addr, uint32_t val) {
   if (offset == 0x04) g_fuse_ctrl_addr = val; // FUSE_ADDR
 }
 
-// ==================== EMC (DRAM mode register reads) ====================
+// ==================== EMC ====================
 //
-// Hekate's HW-info screen calls sdram_read_mrx(MRx), which:
-//   1. writes EMC(EMC_MRR) with (rank << 30) | (mrx << 16) on the broadcast
-//      bank at EMC_BASE,
-//   2. polls EMC(EMC_EMC_STATUS) bit 20 (MRR_DIVLD) until set,
-//   3. reads EMC_CH0(EMC_MRR) and EMC_CH1(EMC_MRR) from the per-channel
-//      banks at EMC0_BASE / EMC1_BASE.
+// A register file - reads return what was written - with the controller's
+// own behaviour on top (TRM 18.11):
 //
-// We capture the requested mode register on the EMC_MRR write and route the
-// per-channel reads back to the matching EmuState atomic.
+//   Banks. EMC_BASE is the broadcast bank: a write there reaches both
+//   channels. EMC0_BASE / EMC1_BASE address one channel each. mmio_regs
+//   holds every bank's words (the write hook stores the raw address), and a
+//   broadcast write is mirrored into both channel banks.
+//
+//   Mode registers. EMC_MRW and EMC_MRW2..15 send an MRW to the DRAM.
+//   EMC_MRR sends an MRR, after which the channel's EMC_MRR holds the answer
+//   (both x16 dies' bytes, bits 15:0) and its EMC_EMC_STATUS.MRR_DIVLD stays
+//   set until that data is read. MR4 reports the normal-temperature refresh
+//   rate, MR5-8 the configured DRAM ID, MR18/MR19 the DQS interval
+//   oscillator count, and any other mode register what was last written.
+//
+//   Digital DLL. It locks as soon as it is (re)started: EMC_DIG_DLL_STATUS
+//   reports DLL_LOCK and DLL_PRIV_UPDATED. Its code, DLL_OUT (10:0), is
+//   where calibration starts, the channel's EMC_DLL_CFG_1
+//   DDLLCAL_CTRL_START_TRIM (10:0, reset 0x20, TRM 18.11.2.219): with no
+//   delay line to drift, calibration has nothing to move it by.
+//
+//   Clock change. A new source or divisor in CAR CLK_SOURCE_EMC starts the
+//   CAR/EMC clock-change handshake: the EMC replays the writes queued in its
+//   clock-change FIFO (EMC_CCFIFO_DATA, then EMC_CCFIFO_ADDR) and raises
+//   CLKCHANGE_COMPLETE in EMC_INTSTATUS (sticky, write 1 to clear).
+//
+//   EMC_EMC_STATUS otherwise reports timing updates done, the DRAM active
+//   (not powered down, not in self-refresh) and the state machines idle.
+//
+// bdk's sdram_read_mrx needs the MRR path. Minerva, hekate's DRAM training
+// and frequency-switching module, needs the rest: it spins on DLL lock and
+// on the DLL-enable bit it writes, waits for the clock-change handshake,
+// and divides by the oscillator count.
 
-static constexpr uint32_t EMC_ADR_CFG       = 0x010;
-static constexpr uint32_t EMC_MRR           = 0x0EC;
-static constexpr uint32_t EMC_EMC_STATUS    = 0x2B4;
-static constexpr uint32_t EMC_FBIO_CFG7     = 0x584;
-static constexpr uint32_t EMC_STATUS_MRR_DIVLD = 1u << 20;
+static constexpr uint32_t EMC_INTSTATUS      = 0x000;
+static constexpr uint32_t EMC_MRW            = 0x0E8;
+static constexpr uint32_t EMC_MRR            = 0x0EC;
+static constexpr uint32_t EMC_EMC_STATUS     = 0x2B4;
+static constexpr uint32_t EMC_CFG_DIG_DLL    = 0x2BC;
+static constexpr uint32_t EMC_DIG_DLL_STATUS = 0x2C4;
+static constexpr uint32_t EMC_CCFIFO_ADDR    = 0x3E8;
+static constexpr uint32_t EMC_CCFIFO_DATA    = 0x3EC;
+static constexpr uint32_t EMC_CCFIFO_STATUS  = 0x3F0;
+static constexpr uint32_t EMC_FBIO_CFG7      = 0x584;
+static constexpr uint32_t EMC_DLL_CFG_1      = 0x5E8;
 
-static uint32_t g_last_mrr_mrx = 5;
+static constexpr uint32_t EMC_INT_CLKCHANGE_COMPLETE = 1u << 4;
+static constexpr uint32_t EMC_INT_MRR_DIVLD          = 1u << 5;
+static constexpr uint32_t EMC_INT_CCFIFO_OVERFLOW    = 1u << 8;
+static constexpr uint32_t EMC_STATUS_MRR_DIVLD       = 1u << 20;
+// The TRM calls the clock-change FIFO 32 deep, but CCFIFO_COUNT is 7 bits
+// and NVIDIA's own DVFS sequence (which Minerva ports) queues up to 65
+// entries per change, so the model takes as many as the count can report.
+static constexpr size_t   kEmcCcfifoDepth            = 127;
 
-static uint8_t emc_mrx_value(EmuState *state, uint32_t mrx) {
-  switch (mrx) {
-  case 5: return state->dram_vendor.load();
-  case 6: return state->dram_rev_id1.load();
-  case 7: return state->dram_rev_id2.load();
-  case 8: return state->dram_density.load();
-  default: return 0;
+// CAR CLK_SOURCE_EMC (TRM 5.2.73). A clock change starts when
+// EMC_2X_CLK_SRC, MC_EMC_SAME_FREQ or EMC_2X_CLK_DIVISOR changes, or on
+// FORCE_CC_TRIGGER; rewriting the same value does nothing.
+static constexpr uint32_t CAR_CLK_SOURCE_EMC       = 0x19C;
+static constexpr uint32_t CAR_CLK_SOURCE_EMC_RESET = 0x60180000; // CLK_M
+static constexpr uint32_t CAR_EMC_CC_FIELDS        = 0xE00100FF;
+static constexpr uint32_t CAR_EMC_FORCE_CC_TRIGGER = 1u << 27;
+
+// The LPDDR4's DQS-to-DQ delay, what the DQS interval oscillator measures.
+// JEDEC allows 200-800 ps; this is mid-range.
+static constexpr uint32_t kDramTdqs2dqPs = 400;
+
+struct EmcState {
+  uint8_t  mr[256] = {};          // mode registers, as last written by MRW
+  uint32_t mrr_ma[2] = {5, 5};    // per channel: MA of the last MRR
+  bool     mrr_valid[2] = {};     // per channel: MRR_DIVLD
+  uint32_t intstatus = 0;
+  uint32_t ccfifo_data = 0;
+  std::vector<std::pair<uint32_t, uint32_t>> ccfifo; // (offset, data)
+  uint32_t clk_source = CAR_CLK_SOURCE_EMC_RESET;    // CAR, as last applied
+};
+static EmcState emc;
+
+static bool emc_is_mrw(uint32_t offset) {
+  switch (offset) {
+  case 0x0E8: case 0x134: case 0x138: case 0x13C: // MRW, MRW2-4
+  case 0x4A0: case 0x4A4: case 0x4A8: case 0x4AC: // MRW5-8
+  case 0x4B0: case 0x4B4: case 0x4B8: case 0x4BC: // MRW9-12
+  case 0x4C0: case 0x4C4: case 0x4D0:             // MRW13-15
+    return true;
+  default:
+    return false;
   }
+}
+
+// The EMC clock, from CAR. EMC_2X_CLK_SRC picks the input; the _UD inputs
+// bypass the 7.1 EMC_2X_CLK_DIVISOR. The PLLs run at
+// 38.4 MHz / DIVM * DIVN / (DIVP + 1), as Minerva's own table computes.
+static uint32_t emc_rate_khz() {
+  auto pll = [](uint32_t off) -> uint32_t {
+    uint32_t b = mmio_regs.get(CLK_RST_BASE + off);
+    uint32_t m = b & 0xFF, n = (b >> 8) & 0xFF, p = (b >> 20) & 0x1F;
+    return m ? (uint32_t)(38400ull * n / m / (p + 1)) : 0;
+  };
+  uint32_t src = emc.clk_source, in = 0;
+  bool ud = false;
+  switch (src >> 29) {
+  case 0: in = pll(0x090); break;             // PLLM_OUT0
+  case 1: in = pll(0x080); break;             // PLLC_OUT0
+  case 2: in = 408000; break;                 // PLLP_OUT0
+  case 3: in = 38400; break;                  // CLK_M
+  case 4: in = pll(0x090); ud = true; break;  // PLLM_UD
+  case 5: in = pll(0x5E8); ud = true; break;  // PLLMB_UD
+  case 6: in = pll(0x5E8); break;             // PLLMB_OUT0
+  case 7: in = 408000; ud = true; break;      // PLLP_UD
+  }
+  return ud ? in : (uint32_t)(in * 2ull / ((src & 0xFF) + 2));
+}
+
+// MR18/MR19: the DQS interval oscillator count, run time / (2 x tDQS2DQ)
+// (JEDEC LPDDR4). The run time is MR23's setting in clocks (16 x OP up to
+// 63, then 2048, 4096 or 8192) at the current DRAM clock. MR23 = 0 means
+// "stopped by MPC"; that is counted as the 2048-clock setting.
+static uint32_t emc_dqs_osc_count() {
+  uint32_t op = emc.mr[23];
+  uint32_t clocks = op == 0 ? 2048 : op < 64 ? 16 * op
+                  : op < 128 ? 2048 : op < 192 ? 4096 : 8192;
+  uint32_t khz = emc_rate_khz();
+  if (!khz)
+    khz = 204000;
+  uint64_t tck_ps = 1000000000ull / khz;
+  uint64_t count = clocks * tck_ps / (2 * kDramTdqs2dqPs);
+  return (uint32_t)std::min<uint64_t>(std::max<uint64_t>(count, 1), 0xFFFF);
+}
+
+static uint32_t emc_mr_value(EmuState *state, uint32_t ma) {
+  uint32_t v;
+  switch (ma) {
+  case 4:  v = 0x03; break;                        // refresh 1x: normal temp
+  case 5:  v = state->dram_vendor.load(); break;
+  case 6:  v = state->dram_rev_id1.load(); break;
+  case 7:  v = state->dram_rev_id2.load(); break;
+  case 8:  v = state->dram_density.load(); break;
+  case 18: v = emc_dqs_osc_count() & 0xFF; break;
+  case 19: v = emc_dqs_osc_count() >> 8; break;
+  default: v = emc.mr[ma & 0xFF]; break;
+  }
+  return (v & 0xFF) << 8 | (v & 0xFF);            // both dies answer
+}
+
+// Which bank an address is in: -1 broadcast, 0 / 1 a channel.
+static int emc_bank(uint64_t addr) {
+  return addr >= EMC1_BASE ? 1 : addr >= EMC0_BASE ? 0 : -1;
 }
 
 uint32_t emc_read(EmuState *state, uint64_t addr) {
   uint32_t offset = (uint32_t)(addr & 0xFFF);
-  bool per_channel = (addr >= EMC0_BASE);
-
-  if (per_channel) {
-    if (offset == EMC_MRR)
-      return emc_mrx_value(state, g_last_mrr_mrx);
-    return 0;
-  }
-
+  int ch = std::max(emc_bank(addr), 0);   // a broadcast read sees channel 0
   switch (offset) {
-  case EMC_ADR_CFG:    return 0;                          // single rank
-  case EMC_FBIO_CFG7:  return (1u << 1) | (1u << 2);      // ch0 + ch1 enabled
-  case EMC_EMC_STATUS: return EMC_STATUS_MRR_DIVLD;       // MRR data always valid
-  case EMC_MRR:        return emc_mrx_value(state, g_last_mrr_mrx);
-  default:             return 0;
+  case EMC_INTSTATUS:
+    return emc.intstatus;
+  case EMC_MRR:
+    emc.mrr_valid[ch] = false;
+    return emc_mr_value(state, emc.mrr_ma[ch]);
+  case EMC_EMC_STATUS: {
+    // ACPD/DSR FSMs idle (27:24), ZQ FSM idle (22), no outstanding
+    // transactions (2), request FIFO empty (0).
+    uint32_t v = (0xFu << 24) | (1u << 22) | (1u << 2) | (1u << 0);
+    return emc.mrr_valid[ch] ? v | EMC_STATUS_MRR_DIVLD : v;
+  }
+  case EMC_CFG_DIG_DLL:
+    // Bits 31, 30, 26, 4 and 1 are write-1 triggers; they read 0.
+    return mmio_regs.get(addr) & ~0xC4000012u;
+  case EMC_DIG_DLL_STATUS: {
+    // DLL_PRIV_UPDATED | DLL_LOCK, and DLL_OUT at the calibration start.
+    uint32_t cfg1 = mmio_regs.get((ch ? EMC1_BASE : EMC0_BASE) + EMC_DLL_CFG_1,
+                                  0x20);
+    return (1u << 17) | (1u << 15) | (cfg1 & 0x7FF);
+  }
+  case EMC_DLL_CFG_1:
+    return mmio_regs.get(addr, 0x20);
+  case EMC_CCFIFO_STATUS:
+    return (uint32_t)emc.ccfifo.size();
+  case EMC_FBIO_CFG7:
+    return mmio_regs.get(addr, (1u << 1) | (1u << 2)); // both channels
+  default:
+    return mmio_regs.get(addr);
   }
 }
 
 void emc_write(EmuState *state, uint64_t addr, uint32_t val) {
   (void)state;
   uint32_t offset = (uint32_t)(addr & 0xFFF);
-  if (offset == EMC_MRR && addr < EMC0_BASE) {
-    g_last_mrr_mrx = (val >> 16) & 0xFF;
+  int bank = emc_bank(addr);
+  switch (offset) {
+  case EMC_INTSTATUS:
+    emc.intstatus &= ~val;                 // write 1 to clear
+    return;
+  case EMC_MRR:
+    for (int c = 0; c < 2; c++) {
+      if (bank < 0 || bank == c) {
+        emc.mrr_ma[c] = (val >> 16) & 0xFF;
+        emc.mrr_valid[c] = true;
+      }
+    }
+    emc.intstatus |= EMC_INT_MRR_DIVLD;
+    break;
+  case EMC_CCFIFO_DATA:
+    emc.ccfifo_data = val;
+    break;
+  case EMC_CCFIFO_ADDR:
+    if (emc.ccfifo.size() < kEmcCcfifoDepth)
+      emc.ccfifo.emplace_back(val & 0xFFFF, emc.ccfifo_data);
+    else
+      emc.intstatus |= EMC_INT_CCFIFO_OVERFLOW;
+    break;
+  default:
+    if (emc_is_mrw(offset))
+      emc.mr[(val >> 16) & 0xFF] = (uint8_t)val;
+    break;
   }
+  mmio_regs[addr] = val;
+  if (bank < 0) {
+    mmio_regs[EMC0_BASE + offset] = val;
+    mmio_regs[EMC1_BASE + offset] = val;
+  }
+}
+
+// CAR CLK_SOURCE_EMC was written (clk_rst_write).
+static void emc_clock_source_write(EmuState *state, uint32_t val) {
+  bool change = ((val ^ emc.clk_source) & CAR_EMC_CC_FIELDS) ||
+                (val & CAR_EMC_FORCE_CC_TRIGGER);
+  emc.clk_source = val;
+  if (!change)
+    return;
+  std::vector<std::pair<uint32_t, uint32_t>> fifo;
+  fifo.swap(emc.ccfifo);
+  for (const auto &e : fifo)
+    emc_write(state, EMC_BASE + (e.first & 0xFFF), e.second);
+  emc.intstatus |= EMC_INT_CLKCHANGE_COMPLETE;
 }
 
 // ==================== DSI (display panel ID over MIPI-DSI) ====================
@@ -2815,93 +3883,190 @@ static void se_write(EmuState *state, uint64_t addr, uint32_t val) {
 
 // ==================== MMIO Hook Callbacks ====================
 
-static uint64_t vic_src_addr = 0;
-static uint64_t vic_dst_addr = 0;
+// ==================== VIC ====================
+//
+// bdk (vic.c) drives VIC through the Falcon private-register window:
+// VIC(0x1000 + (priv >> 6)) = data. PVIC_FALCON_ADDR supplies the low bits
+// for registers that need them; none of the ones modelled here do. The model
+// keeps what a compose needs - the config struct's address (PRAMBASE), the
+// slots' source surfaces and the target surface - and, on COMPOSE_START,
+// reads the config struct from guest memory and draws the enabled slots
+// into the target with the output flip/transpose. Surfaces are pitch or
+// block linear (BlkKind 1, BlkHeight = log2 GOBs per block). That is what Nyx
+// relies on: its 1280x720 GUI is turned into the panel's 720x1280 portrait
+// framebuffer by a 270-degree VIC rotation (flip X, then transpose).
+//
+// Config struct layout (bdk vic_config_t; all fields little-endian u64
+// bitfields):
+//   0x10 OutputConfig         u64 0: FlipX b48, FlipY b49, Transpose b50
+//                             u64 1: TargetRect L b0, R b16, T b32, B b48
+//   0x20 OutputSurfaceConfig  u64 0: format b0, BlkKind b11, BlkHeight b15,
+//                                    W-1 b32, H-1 b46
+//   0x90 + n * 0xB0  slot n:  u64 0: SlotEnable b0
+//                             u64 4/5: SourceRect L|R, T|B (16.16, b0/b32)
+//                             u64 6: DestRect L b0, R b16, T b32, B b48
+//        + 0x40 SlotSurfaceConfig: as OutputSurfaceConfig
+// Rects are inclusive. The output surface size is given pre-transpose, so a
+// transposed target is (H x W) pixels, which is how the DC reads it back.
+
+static constexpr uint32_t kVicPramBase  = 0x1500; // VIC_SC_PRAMBASE      0x14000
+static constexpr uint32_t kVicSfcBase0  = 0x150C; // VIC_SC_SFC0_BASE_LUMA 0x14300 + n * 0x100
+static constexpr uint32_t kVicTarget    = 0x1880; // VIC_BL_TARGET_BASADR 0x22000
+static constexpr uint32_t kVicCompose   = 0x1400; // VIC_FC_COMPOSE       0x10000
+
+struct VicRegs {
+  uint64_t cfg = 0;         // config struct address
+  uint64_t sfc[8] = {};     // slot n luma surface
+  uint64_t target = 0;      // output surface
+};
+static VicRegs vic;
 
 static uint32_t vic_read(EmuState *state, uint64_t addr) {
   (void)state;
   (void)addr;
+  return 0; // PVIC_FALCON_IDLESTATE: composes finish at once
+}
+
+// Bytes per pixel of a VIC pixel format (bdk vic.h), 0 if not modelled.
+static uint32_t vic_bpp(uint32_t fmt) {
+  if (fmt == 1)
+    return 1; // L8
+  if (fmt >= 21 && fmt <= 24)
+    return 2; // X1B5G5R5 .. B5G5R5X1
+  if (fmt >= 31 && fmt <= 38)
+    return 4; // A8B8G8R8 .. R8G8B8X8
   return 0;
 }
 
-// VIC registers using Falcon PA translated offsets (1000 + untranslated >> 6)
-// VIC registers using Falcon PA translated offsets (1000 + untranslated >> 6)
-static uint64_t vic_config_addr = 0;
-static uint32_t vic_config_size = 0;
-static uint32_t vic_last_falcon_addr = 0;
-
-struct vic_out_config_struct {
-  uint32_t raw[2];
-};
-
-struct vic_out_sfc_config_struct {
-  uint32_t raw[2];
-};
-
-static void vic_write_internal(EmuState *state, uint32_t translated_off,
-                               uint32_t val);
-
-static void vic_write(EmuState *state, uint64_t addr, uint32_t val) {
-  uint32_t offset = (uint32_t)(addr - VIC_BASE);
-
-  if (offset == 0x10AC) { // PVIC_FALCON_ADDR
-    vic_last_falcon_addr = val;
-  } else if (offset == 0x10B0) { // PVIC_FALCON_DATA
-    uint32_t translated_off = (vic_last_falcon_addr >> 6) + 0x1000;
-    vic_write_internal(state, translated_off, val);
-  } else {
-    vic_write_internal(state, offset, val);
-  }
+// A host pointer to [addr, addr + len) of emulated DRAM, or null.
+static uint8_t *vic_dram(EmuState *state, uint64_t addr, uint64_t len) {
+  if (!state->dram_low_ptr || addr < DRAM_BASE ||
+      addr + len > DRAM_BASE + DRAM_WINDOW_SIZE)
+    return nullptr;
+  return state->dram_low_ptr + (addr - DRAM_BASE);
 }
 
-static void vic_write_internal(EmuState *state, uint32_t offset, uint32_t val) {
+static void vic_compose(EmuState *state) {
+  uint64_t c[0x610 / 8];
+  if (!vic.cfg || uc_mem_read(state->uc, vic.cfg, c, sizeof(c)) != UC_ERR_OK)
+    return;
+  auto bits = [](uint64_t v, unsigned lo, unsigned n) {
+    return (uint32_t)((v >> lo) & ((1ull << n) - 1));
+  };
 
-  if (offset == 0x1500) { // VIC_SC_PRAMBASE
-    vic_config_addr = (uint64_t)val << 8;
-  } else if (offset == 0x1504) { // VIC_SC_PRAMSIZE
-    vic_config_size = val << 6;
-  } else if (offset == 0x150C) { // VIC_SC_SFC0_BASE_LUMA
-    vic_src_addr = (uint64_t)val << 8;
-  } else if (offset == 0x1880) { // VIC_BL_TARGET_BASADR
-    vic_dst_addr = (uint64_t)val << 8;
-  } else if ((offset == 0x1400 || offset == 0x1440) &&
-             val == 1) { // VIC_FC_COMPOSE
-    if (vic_src_addr >= 0x40000000 && vic_dst_addr >= 0x40000000) {
-      uint32_t sfc[2] = {0};
-      uc_mem_read(state->uc, vic_config_addr + 0x18, sfc, 8);
+  bool flip_x = bits(c[2], 48, 1), flip_y = bits(c[2], 49, 1);
+  bool transpose = bits(c[2], 50, 1);
+  uint32_t tl = bits(c[3], 0, 14), tr = bits(c[3], 16, 14);
+  uint32_t tt = bits(c[3], 32, 14), tb = bits(c[3], 48, 14);
+  uint32_t ofmt = bits(c[4], 0, 7), okind = bits(c[4], 11, 4);
+  uint32_t ogob = 1u << std::min(bits(c[4], 15, 4), 5u);
+  uint32_t ow = bits(c[4], 32, 14) + 1, oh = bits(c[4], 46, 14) + 1;
+  uint32_t bpp = vic_bpp(ofmt);
 
-      uint32_t dw = (sfc[1] & 0x3FFF), dh = ((sfc[1] >> 14) & 0x3FFF);
-      bool fb_fb = false;
-      if (dw < 16 || dh < 16 || dw > 2048 || dh > 2048) {
-        dw = state->fb_width;
-        dh = state->fb_height;
-        fb_fb = true;
-        if (dw < 16)
-          dw = 720;
-        if (dh < 16)
-          dh = 1280;
-      }
+  static uint64_t logged = ~0ull;
+  auto log_once = [&](const char *what) {
+    uint64_t key = vic.target ^ ((uint64_t)ofmt << 40) ^ ((uint64_t)okind << 48);
+    if (logged != key) {
+      logged = key;
+      printf("[vic] compose skipped: %s\n", what);
+    }
+  };
+  // BlkKind 0 is pitch, 1 the Tegra 16Bx2 block-linear layout; BlkHeight is
+  // log2 of the block height in GOBs.
+  if (!bpp || okind > 1)
+    return log_once("output surface format or layout not modelled");
 
-      printf("[vic] Compose: 0x%llX -> 0x%llX (%dx%d) %s\n",
-             (unsigned long long)vic_src_addr, (unsigned long long)vic_dst_addr,
-             dw, dh, fb_fb ? "(FALLBACK)" : "");
+  // The output as laid out in memory: a transposed target is oh x ow.
+  uint32_t out_w = transpose ? oh : ow, out_h = transpose ? ow : oh;
+  uint32_t out_pitch = out_w * bpp, out_gobs = (out_pitch + 63) / 64;
+  uint64_t out_len = okind ? bl_size(out_gobs, ogob, out_h)
+                           : (uint64_t)out_pitch * out_h;
+  uint8_t *dst = vic_dram(state, vic.target, out_len);
+  if (!dst)
+    return log_once("target outside DRAM");
+  if (tr >= ow)
+    tr = ow - 1;
+  if (tb >= oh)
+    tb = oh - 1;
 
-      // Hekate configures VIC with SlotBlkKind=PITCH, OutBlkKind=PITCH.
-      // This is a straight pitch-to-pitch copy (possibly with rotation/flip
-      // handled by the real VIC FCE microcode, but we just copy here).
-      size_t sz = (size_t)dw * dh * 4;
-      if (sz > 32 * 1024 * 1024)
-        return;
-      std::vector<uint8_t> buf(sz);
-      if (uc_mem_read(state->uc, vic_src_addr, buf.data(), sz) == UC_ERR_OK) {
-        uc_mem_write(state->uc, vic_dst_addr, buf.data(), sz);
-
-
-        state->display_dirty = true;
+  for (int n = 0; n < 8; n++) {
+    const uint64_t *sl = &c[(0x90 + n * 0xB0) / 8];
+    if (!(sl[0] & 1) || !vic.sfc[n])
+      continue;
+    uint32_t sfmt = bits(sl[8], 0, 7), skind = bits(sl[8], 11, 4);
+    uint32_t sgob = 1u << std::min(bits(sl[8], 15, 4), 5u);
+    uint32_t sw = bits(sl[8], 32, 14) + 1, sh = bits(sl[8], 46, 14) + 1;
+    if (skind > 1 || vic_bpp(sfmt) != bpp) {
+      log_once("slot surface layout not modelled, or not the output's size "
+               "of pixel");
+      continue;
+    }
+    uint32_t src_pitch = sw * bpp, src_gobs = (src_pitch + 63) / 64;
+    const uint8_t *src = vic_dram(state, vic.sfc[n],
+                                  skind ? bl_size(src_gobs, sgob, sh)
+                                        : (uint64_t)src_pitch * sh);
+    if (!src)
+      continue;
+    uint32_t sl_l = bits(sl[4], 16, 14), sl_r = bits(sl[4], 48, 14);
+    uint32_t sl_t = bits(sl[5], 16, 14), sl_b = bits(sl[5], 48, 14);
+    uint32_t dl = bits(sl[6], 0, 14), dr = bits(sl[6], 16, 14);
+    uint32_t dt = bits(sl[6], 32, 14), db = bits(sl[6], 48, 14);
+    if (sl_r < sl_l || sl_b < sl_t || dr < dl || db < dt)
+      continue;
+    uint32_t x0 = std::max(dl, tl), x1 = std::min(dr, tr);
+    uint32_t y0 = std::max(dt, tt), y1 = std::min(db, tb);
+    if (x0 > x1 || y0 > y1)
+      continue;
+    // Nearest-neighbour scaling from the source rect onto the dest rect;
+    // the column map is worked out once per compose, not per pixel.
+    static std::vector<uint32_t> sxs;
+    sxs.resize(x1 - x0 + 1);
+    for (uint32_t tx = x0; tx <= x1; tx++)
+      sxs[tx - x0] = sl_l + (uint32_t)((uint64_t)(tx - dl) *
+                                       (sl_r - sl_l + 1) / (dr - dl + 1));
+    for (uint32_t ty = y0; ty <= y1; ty++) {
+      uint32_t sy = sl_t + (uint32_t)((uint64_t)(ty - dt) * (sl_b - sl_t + 1) /
+                                      (db - dt + 1));
+      if (sy >= sh)
+        continue;
+      uint32_t fy = flip_y ? oh - 1 - ty : ty;
+      for (uint32_t tx = x0; tx <= x1; tx++) {
+        uint32_t sx = sxs[tx - x0];
+        if (sx >= sw)
+          continue;
+        uint32_t fx = flip_x ? ow - 1 - tx : tx;
+        uint32_t col = transpose ? fy : fx, row = transpose ? fx : fy;
+        uint64_t o = okind ? bl_offset(col * bpp, row, out_gobs, ogob)
+                           : (uint64_t)row * out_pitch + (uint64_t)col * bpp;
+        uint64_t i = skind ? bl_offset(sx * bpp, sy, src_gobs, sgob)
+                           : (uint64_t)sy * src_pitch + (uint64_t)sx * bpp;
+        memcpy(dst + o, src + i, bpp);
       }
     }
   }
-  printf("[vic] W: 0x%08X = 0x%08X\n", offset, val);
+
+  uint32_t xf = (flip_x ? dcwin::XF_FLIP_X : 0) |
+                (flip_y ? dcwin::XF_FLIP_Y : 0) |
+                (transpose ? dcwin::XF_TRANSPOSE : 0);
+  if (state->vic_out_addr != vic.target || state->vic_out_xform != xf)
+    printf("[vic] compose: %ux%u -> 0x%08llX%s%s%s\n", ow, oh,
+           (unsigned long long)vic.target, flip_x ? ", flip X" : "",
+           flip_y ? ", flip Y" : "", transpose ? ", transpose" : "");
+  state->vic_out_addr = vic.target;
+  state->vic_out_xform = xf;
+  state->display_dirty = true;
+}
+
+static void vic_write(EmuState *state, uint64_t addr, uint32_t val) {
+  uint32_t offset = (uint32_t)(addr - VIC_BASE);
+  if (offset == kVicPramBase)
+    vic.cfg = (uint64_t)val << 8;
+  else if (offset >= kVicSfcBase0 && offset < kVicSfcBase0 + 8 * 4)
+    vic.sfc[(offset - kVicSfcBase0) / 4] = (uint64_t)val << 8;
+  else if (offset == kVicTarget)
+    vic.target = (uint64_t)val << 8;
+  else if (offset == kVicCompose && (val & 1))
+    vic_compose(state);
 }
 
 // ==================== APE audio hub: I2S, ADMAIF, ADMA ====================
@@ -2921,7 +4086,7 @@ static uint32_t i2s_read(EmuState *state, uint64_t addr) {
   (void)state;
   // Read back what the payload programmed. mmio_regs is populated by the
   // write hook before dispatch, so this needs no state of its own.
-  return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+  return mmio_regs.get(addr);
 }
 
 static void i2s_write(EmuState *state, uint64_t addr, uint32_t val) {
@@ -2949,7 +4114,7 @@ static uint32_t admaif_read(EmuState *state, uint64_t addr) {
   case 0x744:            // TX ACIF FIFO_FULL - never full, so PIO never spins
     return 0;
   default:
-    return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+    return mmio_regs.get(addr);
   }
 }
 
@@ -3014,6 +4179,12 @@ static void audio_play_take(void) {
   // No ALLOW_ANY_CHANGE: SDL_QueueAudio does not convert, so a device opened
   // at a different rate or format would replay the take at the wrong pitch.
   // Better to fail and keep the WAV than to play something misleading.
+  // One device at a time: a new take replaces the one still playing
+  // instead of leaking a device per take.
+  if (audio_dev) {
+    SDL_CloseAudioDevice(audio_dev);
+    audio_dev = 0;
+  }
   audio_dev = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
   if (!audio_dev) {
     printf("[audio] no device (%s) - WAV only\n", SDL_GetError());
@@ -3110,7 +4281,7 @@ static uint32_t adma_read(EmuState *state, uint64_t addr) {
   uint32_t offset = (uint32_t)(addr - ADMA_BASE);
   if (offset == 0xC04)   // global soft reset - completed
     return 0;
-  return mmio_regs.count(addr) ? mmio_regs[addr] : 0;
+  return mmio_regs.get(addr);
 }
 
 static void adma_write(EmuState *state, uint64_t addr, uint32_t val) {
@@ -3140,10 +4311,12 @@ static void adma_write(EmuState *state, uint64_t addr, uint32_t val) {
 // FLOW_CTLR timed halt (bpmp_usleep / bpmp_msleep, tracked in bpmp_slept_us).
 // A payload that measures load while spinning therefore sees a high number,
 // and one that measures while sleeping sees a low one - which is exactly what
-// an ACTMON test is checking for.
+// an ACTMON test is checking for. The COP monitor is the exception: it counts
+// the halted time instead, as the hardware does.
 static constexpr uint32_t ACTMON_OFF_IN_SYSREG = 0x800;
 static constexpr uint32_t ACTMON_FULL_COUNT = 1920000; // 100.0 % for one period
 static constexpr int ACTMON_NDEV = 7;
+static constexpr int ACTMON_DEV_COP = 1;   // device order: CPU, COP, AHB, ...
 
 struct ActmonDev {
   uint32_t ctrl = 0;
@@ -3162,7 +4335,7 @@ static uint32_t actmon_glb_period = 0;
 // Recompute count/avg_count for `d` from the activity in the window that has
 // elapsed since the last sample. Windows shorter than 200 us reuse the last
 // value so back-to-back reads stay coherent.
-static void actmon_sample(EmuState *state, ActmonDev &d) {
+static void actmon_sample(EmuState *state, ActmonDev &d, bool counts_halt) {
   uint64_t now = state->emu_usec;
   uint64_t slept = state->bpmp_slept_us;
   if (!d.seeded) {
@@ -3171,15 +4344,21 @@ static void actmon_sample(EmuState *state, ActmonDev &d) {
     d.seeded = true;
     return;
   }
-  uint64_t window = now - d.last_us;
-  if (window < 200)
+  // `now` can step back when CPU0 takes the bus (it trails the BPMP by up to
+  // a slice); an unsigned difference would wrap into a huge window.
+  if (now < d.last_us + 200)
     return;
+  uint64_t window = now - d.last_us;
   uint64_t win_slept = slept - d.last_slept;
   if (win_slept > window)
     win_slept = window;
   uint64_t active = window - win_slept;
+  // The BPMP (COP) monitor counts the cycles the BPMP-Lite spends halted,
+  // not running (TRM 41.x: "counts the clock cycles when BPMP-Lite is in
+  // halt state"); the others count activity.
+  uint64_t counted = counts_halt ? win_slept : active;
 
-  uint32_t c = (uint32_t)((active * ACTMON_FULL_COUNT) / window);
+  uint32_t c = (uint32_t)((counted * ACTMON_FULL_COUNT) / window);
   d.count = c;
   // avg_count trails count with a simple IIR (bdk asks for a 128-sample
   // average via K_VAL; an exponential decay is a fair stand-in).
@@ -3210,10 +4389,10 @@ static uint32_t actmon_read(EmuState *state, uint32_t off) {
     case 0x0C: return d.init_avg;
     case 0x18: return d.count_weight;
     case 0x1C:
-      if (d.ctrl & (1u << 31)) actmon_sample(state, d);
+      if (d.ctrl & (1u << 31)) actmon_sample(state, d, dev == ACTMON_DEV_COP);
       return d.count;
     case 0x20:
-      if (d.ctrl & (1u << 31)) actmon_sample(state, d);
+      if (d.ctrl & (1u << 31)) actmon_sample(state, d, dev == ACTMON_DEV_COP);
       return d.avg_count;
     default: return d.regs[(f / 4) & 15];
     }
@@ -3238,7 +4417,7 @@ static void actmon_write(EmuState *state, uint32_t off, uint32_t val) {
         d.seeded = false;
         d.count = 0;
         d.avg_count = 0;
-        actmon_sample(state, d);
+        actmon_sample(state, d, dev == ACTMON_DEV_COP);
       }
       break;
     case 0x0C: d.init_avg = val; break;
@@ -3253,6 +4432,9 @@ static uint32_t sysreg_read(EmuState *state, uint64_t addr) {
   uint32_t offset = (uint32_t)(addr - SYSREG_BASE);
   if (offset >= ACTMON_OFF_IN_SYSREG)
     return actmon_read(state, offset - ACTMON_OFF_IN_SYSREG);
+  // SB (secure boot) block at +0x200: CSR and the CCPLEX reset vector.
+  if (offset >= 0x200 && offset < 0x300)
+    return ccplex_sb_read(offset - 0x200);
   return 0;
 }
 
@@ -3260,6 +4442,10 @@ static void sysreg_write(EmuState *state, uint64_t addr, uint32_t val) {
   uint32_t offset = (uint32_t)(addr - SYSREG_BASE);
   if (offset >= ACTMON_OFF_IN_SYSREG) {
     actmon_write(state, offset - ACTMON_OFF_IN_SYSREG, val);
+    return;
+  }
+  if (offset >= 0x200 && offset < 0x300) {
+    ccplex_sb_write(state, offset - 0x200, val);
     return;
   }
   TRACE("[sysreg] W: 0x%08X = 0x%08X\n", offset, val);
@@ -3360,560 +4546,588 @@ static void bpmp_cache_write(EmuState *state, uint64_t addr, uint32_t val) {
   (void)val;
 }
 
-static void hook_mmio_read(uc_engine *uc, uc_mem_type type, uint64_t address,
-                           int size, int64_t value, void *user_data) {
-  EmuState *state = (EmuState *)user_data;
-  uint32_t result = 0;
+// ==================== Bus dispatch ====================
+//
+// One dispatch serves every master. It used to live inside a pair of Unicorn
+// UC_HOOK_MEM_READ / UC_HOOK_MEM_WRITE callbacks over plain RAM pages, with
+// the read result smuggled back by uc_mem_write()-ing it into the page before
+// the load completed. That had two costs well beyond the handlers themselves:
+//
+//  - Unicorn routes EVERY guest load and store through its slow path while
+//    any memory hook exists, so IRAM and DRAM traffic paid for MMIO's hooks;
+//  - each read did a uc_mem_write, i.e. a linear walk of Unicorn's mapped
+//    region list, which is dozens of entries long here.
+//
+// The windows are now uc_mmio_map() regions: loads and stores to RAM run on
+// the translator's fast path, and an MMIO access is one callback. The same
+// callbacks serve CPU0's engine, which is what lets the two cores share one
+// set of register models.
+
+// I2C4 and I2C6: controllers with nothing modelled behind them. Every
+// transaction completes at once with the address NACKed, so a bus scan finds
+// an empty bus instead of a device at every address (a 0 STATUS reads as
+// "ACK"). CNFG reads back without SEND, which the hardware clears when done.
+static uint32_t i2c_empty_bus_read(uint64_t address) {
+  switch ((uint32_t)(address & 0xFF)) {
+  case 0x00: return mmio_regs.get(address) & ~(1u << 9);
+  case 0x1C: return I2C_STATUS_NOACK;
+  case 0x8C: return 0;   // CONFIG_LOAD self-clears
+  default:   return mmio_regs.get(address);
+  }
+}
+
+uint32_t mmio_bus_read(EmuState *state, uint64_t address, unsigned size) {
+  (void)size;
+  if (address >= TMR_BASE && address < TMR_BASE + TMR_SIZE) {
+    // TIMERUS_CNTR_1US. The rest of the timer block reads 0. The BPMP's
+    // reads go through the clock's poll pacing; CPU0 has its own clock.
+    uint32_t off = (uint32_t)(address - TMR_BASE);
+    if (off == 0x14)                  // TIMERUS_USEC_CFG, reset 0x0000000C
+      return mmio_regs.get(address, 0x0000000C);
+    if (off != 0x10)
+      return mmio_regs.get(address);
+    return g_bus_master == BUS_BPMP ? bpmp_timerus_read(state)
+                                    : (uint32_t)ccplex_now_us();
+  }
+  if (address >= GPIO_BASE && address < GPIO_BASE + GPIO_SIZE)
+    return gpio_read(state, address);
+  if ((address >= PCIE_BLOCK_BASE &&
+       address < PCIE_BLOCK_BASE + PCIE_BLOCK_SIZE) ||
+      (address >= PCIE_CS_BASE && address < PCIE_CS_BASE + PCIE_CS_MODEL_SIZE) ||
+      (address >= PCIE_MEM_BASE && address < PCIE_MEM_BASE + PCIE_MEM_MODEL_SIZE))
+    return pcie_read(state, address);
+  if (address >= XUSB_PADCTL_BASE &&
+      address < XUSB_PADCTL_BASE + XUSB_PADCTL_SIZE)
+    return padctl_read(state, address);
+  if (address >= USB_OTG_BASE && address < USB_OTG_BASE + USB_OTG_SIZE)
+    return usb2d_read(state, address, size);
+  if (address >= XUSB_DEV_BASE && address < XUSB_DEV_BASE + XUSB_DEV_SIZE)
+    return xusbd_read(state, address, size);
+  if (address >= MSELECT_BASE && address < MSELECT_BASE + MSELECT_SIZE)
+    return mselect_read(state, address);
+  if (address >= VIC_BASE && address < VIC_BASE + VIC_SIZE)
+    return vic_read(state, address);
+  if (address >= SYSREG_BASE && address < SYSREG_BASE + SYSREG_SIZE)
+    return sysreg_read(state, address);
+  if (address >= BPMP_CACHE_BASE && address < BPMP_CACHE_BASE + BPMP_CACHE_SIZE)
+    return bpmp_cache_read(state, address);
+  if (address >= SOC_THERM_BASE && address < SOC_THERM_BASE + SOC_THERM_SIZE)
+    return soc_therm_read(state, address);
+  if (address >= FLOW_CTLR_BASE && address < FLOW_CTLR_BASE + FLOW_CTLR_SIZE)
+    return flow_read(state, address);
+  if (address >= I2S_BASE && address < I2S_BASE + I2S_SIZE)
+    return i2s_read(state, address);
+  if (address >= ADMAIF_BASE && address < ADMAIF_BASE + ADMAIF_SIZE)
+    return admaif_read(state, address);
+  if (address >= ADMA_BASE && address < ADMA_BASE + ADMA_SIZE)
+    return adma_read(state, address);
+  if (address >= RTC_BASE && address < RTC_BASE + RTC_SIZE)
+    return rtc_read(state, address);
+  // I²C2 / BH1730 ambient light sensor (slave 0x29).
+  if (address >= I2C2_BASE && address < I2C2_BASE + I2C2_SIZE)
+    return i2c2_read(state, address);
+  // I²C3 / STMFTS touchscreen (slave 0x49). Must be tested before the I²C1
+  // branch, which would otherwise swallow the I²C3 page.
+  if (address >= I2C3_BASE && address < I2C3_BASE + I2C3_SIZE)
+    return i2c3_read(state, address);
+  if (address >= I2C1_BASE && address < I2C1_BASE + 0x100)
+    return i2c_read(state, address);
+  if (address >= I2C5_BASE && address < I2C5_BASE + I2C_CTRL_SIZE)
+    return i2c_read(state, address);
+  if ((address >= I2C4_BASE && address < I2C4_BASE + I2C_CTRL_SIZE) ||
+      (address >= I2C6_BASE && address < I2C6_BASE + I2C_CTRL_SIZE))
+    return i2c_empty_bus_read(address);
+  if (address >= DISPLAY_A_BASE && address < DISPLAY_A_BASE + DISPLAY_SIZE)
+    return display_read(state, address);
+  if (address >= PMC_BASE && address < PMC_BASE + PMC_SIZE)
+    return pmc_read(state, address);
+  if (address >= CLK_RST_BASE && address < CLK_RST_BASE + CLK_RST_SIZE)
+    return clk_rst_read(state, address);
+  if (address >= FUSE_BASE && address < FUSE_BASE + FUSE_SIZE)
+    return fuse_read(state, address);
+  if ((address >= EMC_BASE && address < EMC_BASE + EMC_SIZE) ||
+      (address >= EMC0_BASE && address < EMC0_BASE + EMC_SIZE) ||
+      (address >= EMC1_BASE && address < EMC1_BASE + EMC_SIZE))
+    return emc_read(state, address);
+  if (address >= SE_BASE && address < SE_BASE + SE_SIZE)
+    return se_read(state, address);
+  return misc_read(state, address);
+}
+
+// THR writes on any of the five UARTs.
+static void uart_write(EmuState *state, uint64_t address, uint32_t val) {
+  uint32_t offset = 0;
+  int port = uart_port_of(address, &offset);
+  if (port < 0)
+    return;
+  // Note offset 0 is the divisor latch LSB - not the transmit register -
+  // whenever DLAB is set, so writing the baud divisor must not be mistaken
+  // for a character to print. Every register (including this one) was
+  // already cached by the caller; the divisor is additionally kept in
+  // UartPort because a later THR write overwrites that cache entry.
+  UartPort &up = uart_ports[port];
+  uint32_t ubase = uart_bases[port];
+  bool dlab = mmio_regs.get(ubase + 0x0C) & 0x80;
+
+  if (offset == 0x00 && dlab) {
+    up.divisor = (uint16_t)((up.divisor & 0xFF00) | (val & 0xFF));
+  } else if (offset == 0x04 && dlab) {
+    up.divisor = (uint16_t)((up.divisor & 0x00FF) | ((val & 0xFF) << 8));
+  } else if (offset == 0x04) {
+    up.ier = (uint8_t)val;
+  } else if (offset == 0x08) {
+    up.fcr = (uint8_t)val;
+    // FCR. RX_CLR is honoured only on the BT port, where the receive FIFO is
+    // fed by an emulated device and dropping it is exactly what the hardware
+    // does. On the console ports that FIFO models a human at a terminal, and
+    // bdk's uart_init() issues an unconditional RX_CLR - which would silently
+    // eat scripted keystrokes.
+    if (port == UART_D && (val & 0x02))
+      state->uart_rx_fifo[port].clear();
+  } else if (offset == 0x10) {
+    uint8_t old_mcr = up.mcr;
+    up.mcr = (uint8_t)val;
+    // Entering or leaving 16550 internal loopback swings all four modem
+    // inputs at once - MCR[3:0] are tied onto MSR[7:4] while it is on - so
+    // every delta bit latches. That is what makes the payload's first MSR
+    // read after its loopback self-test 0x4F, not 0x40.
+    if ((old_mcr ^ up.mcr) & 0x10)
+      up.msr_delta |= 0x0F;
+  }
+
+  if (offset != 0 || dlab)
+    return;
+
+  uint8_t b = (uint8_t)val;
+  if (up.mcr & 0x10) {
+    // Internal loopback: the byte is tied straight back to this port's own
+    // receiver inside the controller and never reaches a pad. It must NOT be
+    // handed to whatever is on the far end, or the BT chip's H4 parser
+    // desyncs on the A5 5A 00 FF test pattern - and it must not reach the TX
+    // log either, since it is not something the payload actually transmitted.
+    state->uart_rx_fifo[port].push_back(b);
+    return;
+  }
+
+  // UART-D is the Bluetooth radio's H4 transport.
+  if (port == UART_D)
+    bt_chip_rx(state, b);
+
+  // Append every byte to the per-port TX log — the console window renders
+  // this as scrolling text. Trim from the front if it grows past 64 KB so
+  // ImGui rendering stays responsive.
+  std::string &log = state->uart_tx_log[port];
+  if (b == '\n' || (b >= 0x20 && b < 0x7F))
+    log.push_back((char)b);
+  if (log.size() > 64 * 1024)
+    log.erase(0, log.size() - 48 * 1024);
+
+  // Mirror to host stdout in line-buffered form so existing `grep '[uart]'`
+  // workflows still work.
+  static char uart_line[EmuState::N_UARTS][512];
+  static size_t uart_len[EmuState::N_UARTS] = {0};
+  auto flush_uart_line = [&](int p) {
+    if (uart_len[p] > 0) {
+      uart_line[p][uart_len[p]] = 0;
+      printf("[uart%c] %s\n", 'A' + (char)p, uart_line[p]);
+      fflush(stdout);
+      uart_len[p] = 0;
+    }
+  };
+  if (b == '\n' || b == '\r') {
+    flush_uart_line(port);
+  } else if (b >= 0x20 && b < 0x7F) {
+    if (uart_len[port] + 1 >= sizeof(uart_line[port]))
+      flush_uart_line(port);
+    uart_line[port][uart_len[port]++] = (char)b;
+  }
+}
+
+void mmio_bus_write(EmuState *state, uint64_t address, unsigned size,
+                    uint64_t value) {
+  uint32_t val = (uint32_t)value;
+  mmio_regs[address] = val; // read-back cache for the simple registers
 
   if (address >= TMR_BASE && address < TMR_BASE + TMR_SIZE) {
-    uint32_t offset = (uint32_t)(address - TMR_BASE);
-    if (offset == 0x10)
-      result = (uint32_t)state->emu_usec; // TIMERUS_CNTR_1US
-    else
-      result = 0;
+    tmr_write(state, address, val);
+  } else if (address >= GPIO_BASE && address < GPIO_BASE + GPIO_SIZE) {
+    gpio_write(state, address, val);
+  } else if ((address >= PCIE_BLOCK_BASE &&
+              address < PCIE_BLOCK_BASE + PCIE_BLOCK_SIZE) ||
+             (address >= PCIE_CS_BASE &&
+              address < PCIE_CS_BASE + PCIE_CS_MODEL_SIZE) ||
+             (address >= PCIE_MEM_BASE &&
+              address < PCIE_MEM_BASE + PCIE_MEM_MODEL_SIZE)) {
+    pcie_write(state, address, val);
+  } else if (address >= XUSB_PADCTL_BASE &&
+             address < XUSB_PADCTL_BASE + XUSB_PADCTL_SIZE) {
+    padctl_write(state, address, val);
+  } else if (address >= USB_OTG_BASE && address < USB_OTG_BASE + USB_OTG_SIZE) {
+    usb2d_write(state, address, size, val);
+  } else if (address >= XUSB_DEV_BASE && address < XUSB_DEV_BASE + XUSB_DEV_SIZE) {
+    xusbd_write(state, address, size, val);
+  } else if (address >= MSELECT_BASE && address < MSELECT_BASE + MSELECT_SIZE) {
+    mselect_write(state, address, val);
+  } else if ((address >= SDMMC1_BASE && address < SDMMC1_BASE + 0x200) ||
+             (address >= SDMMC4_BASE && address < SDMMC4_BASE + 0x200)) {
+    // DMA targets IRAM/DRAM, which every engine maps from the same host
+    // memory, so the BPMP engine can move the data for either master.
+    misc_write(state->uc, state, address, (int64_t)value, (int)size);
+  } else if (address >= 0x70006000 && address < 0x70006500) {
+    uart_write(state, address, val);
+  } else if (address >= VIC_BASE && address < VIC_BASE + VIC_SIZE) {
+    vic_write(state, address, val);
+  } else if (address >= SYSREG_BASE && address < SYSREG_BASE + SYSREG_SIZE) {
+    sysreg_write(state, address, val);
+  } else if (address >= BPMP_CACHE_BASE &&
+             address < BPMP_CACHE_BASE + BPMP_CACHE_SIZE) {
+    bpmp_cache_write(state, address, val);
+  } else if (address >= SOC_THERM_BASE &&
+             address < SOC_THERM_BASE + SOC_THERM_SIZE) {
+    soc_therm_write(state, address, val);
+  } else if (address >= I2S_BASE && address < I2S_BASE + I2S_SIZE) {
+    i2s_write(state, address, val);
+  } else if (address >= ADMAIF_BASE && address < ADMAIF_BASE + ADMAIF_SIZE) {
+    admaif_write(state, address, val);
+  } else if (address >= ADMA_BASE && address < ADMA_BASE + ADMA_SIZE) {
+    adma_write(state, address, val);
+  } else if (address >= RTC_BASE && address < RTC_BASE + RTC_SIZE) {
+    rtc_write(state, address, val);
+  } else if (address >= I2C2_BASE && address < I2C2_BASE + I2C2_SIZE) {
+    i2c2_write(state, address, val);
+  } else if (address >= I2C3_BASE && address < I2C3_BASE + I2C3_SIZE) {
+    i2c3_write(state, address, val);
+  } else if (address >= I2C1_BASE && address < I2C1_BASE + 0x100) {
+    i2c_write(state, address, val);
+  } else if (address >= I2C5_BASE && address < I2C5_BASE + I2C_CTRL_SIZE) {
+    i2c_write(state, address, val);
+  } else if (address >= DISPLAY_A_BASE &&
+             address < DISPLAY_A_BASE + DISPLAY_SIZE) {
+    display_write(state, address, val);
+  } else if (address >= DSI_BASE && address < DSI_BASE + DSI_SIZE) {
+    dsi_write(state, address, val);
+  } else if (address >= PMC_BASE && address < PMC_BASE + PMC_SIZE) {
+    pmc_write(state, address, val);
+  } else if (address >= FLOW_CTLR_BASE &&
+             address < FLOW_CTLR_BASE + FLOW_CTLR_SIZE) {
+    flow_write(state, address, val);
+  } else if (address >= CLK_RST_BASE && address < CLK_RST_BASE + CLK_RST_SIZE) {
+    clk_rst_write(state, address, val);
+  } else if (address >= FUSE_BASE && address < FUSE_BASE + FUSE_SIZE) {
+    fuse_write(state, address, val);
+  } else if ((address >= EMC_BASE && address < EMC_BASE + EMC_SIZE) ||
+             (address >= EMC0_BASE && address < EMC0_BASE + EMC_SIZE) ||
+             (address >= EMC1_BASE && address < EMC1_BASE + EMC_SIZE)) {
+    emc_write(state, address, val);
+  } else if (address >= SE_BASE && address < SE_BASE + SE_SIZE) {
+    se_write(state, address, val);
   } else {
-    uint32_t pc;
-    uc_reg_read(uc, UC_ARM_REG_PC, &pc);
-
-    if (mmio_regs.count(address)) {
-      result = mmio_regs[address];
+    // The TRACE is the only output here. Its fflush used to sit outside the
+    // macro, so every write to an unmodelled register forced a write(2) of
+    // whatever stdout had buffered even with tracing off.
+    if (emu_trace_enabled &&
+        !((address >= SDMMC1_BASE && address < SDMMC1_BASE + 0x1000) ||
+          (address >= SDMMC4_BASE && address < SDMMC4_BASE + 0x1000) ||
+          (address >= I2C1_BASE && address < I2C1_BASE + 0x1000) ||
+          (address >= I2C5_BASE && address < I2C5_BASE + 0x1000))) {
+      printf("[mmio] W: 0x%08llX = 0x%08X (%s)\n", (unsigned long long)address,
+             val, g_bus_master == BUS_CPU0 ? "CPU0" : "BPMP");
+      fflush(stdout);
     }
-
-    if (address >= GPIO_BASE && address < GPIO_BASE + GPIO_SIZE) {
-      result = gpio_read(state, address);
-    } else if ((address >= PCIE_BLOCK_BASE &&
-                address < PCIE_BLOCK_BASE + PCIE_BLOCK_SIZE) ||
-               (address >= PCIE_CS_BASE &&
-                address < PCIE_CS_BASE + PCIE_CS_MODEL_SIZE) ||
-               (address >= PCIE_MEM_BASE &&
-                address < PCIE_MEM_BASE + PCIE_MEM_MODEL_SIZE)) {
-      result = pcie_read(state, address);
-    } else if (address >= XUSB_PADCTL_BASE &&
-               address < XUSB_PADCTL_BASE + XUSB_PADCTL_SIZE) {
-      result = padctl_read(state, address);
-    } else if (address >= MSELECT_BASE &&
-               address < MSELECT_BASE + MSELECT_SIZE) {
-      result = mselect_read(state, address);
-    } else if (address >= VIC_BASE && address < VIC_BASE + VIC_SIZE) {
-      result = vic_read(state, address);
-    } else if (address >= SYSREG_BASE && address < SYSREG_BASE + SYSREG_SIZE) {
-      result = sysreg_read(state, address);
-    } else if (address >= BPMP_CACHE_BASE &&
-               address < BPMP_CACHE_BASE + BPMP_CACHE_SIZE) {
-      result = bpmp_cache_read(state, address);
-    } else if (address >= SOC_THERM_BASE &&
-               address < SOC_THERM_BASE + SOC_THERM_SIZE) {
-      result = soc_therm_read(state, address);
-    } else if (address >= 0x60007000 && address < 0x60007000 + 0x1000) {
-      result = flow_read(state, address);
-    } else if (address >= I2S_BASE && address < I2S_BASE + I2S_SIZE) {
-      result = i2s_read(state, address);
-    } else if (address >= ADMAIF_BASE && address < ADMAIF_BASE + ADMAIF_SIZE) {
-      result = admaif_read(state, address);
-    } else if (address >= ADMA_BASE && address < ADMA_BASE + ADMA_SIZE) {
-      result = adma_read(state, address);
-    } else if (address >= RTC_BASE && address < RTC_BASE + RTC_SIZE) {
-      result = rtc_read(state, address);
-    } else if (address >= I2C2_BASE && address < I2C2_BASE + I2C2_SIZE) {
-      // I²C2 / BH1730 ambient light sensor (slave 0x29).
-      result = i2c2_read(state, address);
-    } else if (address >= I2C3_BASE && address < I2C3_BASE + I2C3_SIZE) {
-      // I²C3 / STMFTS touchscreen (slave 0x49). Must be tested before the I²C1
-      // branch, which would otherwise swallow the I²C3 page.
-      result = i2c3_read(state, address);
-    } else if (address >= I2C1_BASE && address < I2C1_BASE + 0x100) {
-      result = i2c_read(state, address);
-    } else if (address >= I2C5_BASE && address < I2C5_BASE + I2C_SIZE) {
-      result = i2c_read(state, address);
-    } else if (address >= DISPLAY_A_BASE &&
-               address < DISPLAY_A_BASE + DISPLAY_SIZE) {
-      result = display_read(state, address);
-    } else if (address >= PMC_BASE && address < PMC_BASE + PMC_SIZE) {
-      result = pmc_read(state, address);
-    } else if (address >= CLK_RST_BASE &&
-               address < CLK_RST_BASE + CLK_RST_SIZE) {
-      result = clk_rst_read(state, address);
-    } else if (address >= FUSE_BASE && address < FUSE_BASE + FUSE_SIZE) {
-      result = fuse_read(state, address);
-    } else if ((address >= EMC_BASE  && address < EMC_BASE  + EMC_SIZE) ||
-               (address >= EMC0_BASE && address < EMC0_BASE + EMC_SIZE) ||
-               (address >= EMC1_BASE && address < EMC1_BASE + EMC_SIZE)) {
-      result = emc_read(state, address);
-    } else if (address >= SE_BASE && address < SE_BASE + SE_SIZE) {
-      result = se_read(state, address);
-    } else {
-      result = misc_read(state, address);
-    }
-    // TRACE("[mmio] R: 0x%08llX = 0x%08X (PC=0x%08X)\n", (unsigned long
-    // long)address, result, pc);
+    misc_write(state->uc, state, address, (int64_t)val, (int)size);
   }
-
-  uc_mem_write(uc, address, &result, size);
 }
 
-static void hook_mmio_write(uc_engine *uc, uc_mem_type type, uint64_t address,
-                            int size, int64_t value, void *user_data) {
+// ==================== Unicorn MMIO windows ====================
+
+namespace {
+
+// One per uc_mmio_map() call. Unicorn hands the callbacks an offset relative
+// to the start of the mapping, so each window remembers its base.
+struct MmioWindow {
+  EmuState *state;
+  uint64_t base;
+  uc_engine *uc;
+};
+std::vector<std::unique_ptr<MmioWindow>> g_windows;
+
+uint64_t mmio_cb_read(uc_engine *uc, uint64_t offset, unsigned size,
+                      void *user_data) {
+  (void)uc;
+  const MmioWindow *w = (const MmioWindow *)user_data;
+  uint64_t addr = w->base + offset;
+  if (g_bus_master == BUS_CPU0)
+    ccplex_bus_tick(w->state);
+  if (size == 8) {
+    // A 64-bit load from CPU0 reaches these 32-bit register files as two
+    // consecutive word accesses, low word first.
+    uint64_t lo = mmio_bus_read(w->state, addr, 4);
+    uint64_t hi = mmio_bus_read(w->state, addr + 4, 4);
+    return lo | (hi << 32);
+  }
+  uint32_t v = mmio_bus_read(w->state, addr, size);
+  if (size < 4)
+    v &= (1u << (size * 8)) - 1;
+  return v;
+}
+
+void mmio_cb_write(uc_engine *uc, uint64_t offset, unsigned size,
+                   uint64_t value, void *user_data) {
+  (void)uc;
+  const MmioWindow *w = (const MmioWindow *)user_data;
+  uint64_t addr = w->base + offset;
+  if (g_bus_master == BUS_CPU0)
+    ccplex_bus_tick(w->state);
+  if (size == 8) {
+    mmio_bus_write(w->state, addr, 4, value & 0xFFFFFFFFu);
+    mmio_bus_write(w->state, addr + 4, 4, value >> 32);
+    return;
+  }
+  mmio_bus_write(w->state, addr, size, value);
+}
+
+uc_err map_window(uc_engine *uc, EmuState *state, uint64_t base,
+                  uint64_t size) {
+  g_windows.push_back(std::make_unique<MmioWindow>(MmioWindow{state, base, uc}));
+  MmioWindow *w = g_windows.back().get();
+  return uc_mmio_map(uc, base, size, mmio_cb_read, w, mmio_cb_write, w);
+}
+
+// Every peripheral window a payload is known to touch. Overlaps and
+// duplicates are fine: the list is flattened to 4 KiB pages below.
+const struct {
+  uint64_t base;
+  uint64_t size;
+} kRegions[] = {
+    {CLK_RST_BASE, CLK_RST_SIZE},
+    {TMR_BASE, TMR_SIZE},
+    {GPIO_BASE, GPIO_SIZE},
+    {PINMUX_BASE, PINMUX_SIZE},
+    {UART_A_BASE, UART_SIZE},
+    {I2C1_BASE, I2C_SIZE},
+    {I2C5_BASE, I2C_SIZE},
+    {PWM_BASE, PWM_SIZE},
+    {RTC_BASE, RTC_SIZE},
+    {PMC_BASE, PMC_SIZE},
+    {FUSE_BASE, FUSE_SIZE},
+    {FLOW_CTLR_BASE, FLOW_CTLR_SIZE},
+    {EXCP_VEC_BASE, EXCP_VEC_SIZE},
+    {EMC_BASE, EMC_SIZE},
+    {EMC0_BASE, EMC_SIZE},
+    {EMC1_BASE, EMC_SIZE},
+    {MC_BASE, MC_SIZE},
+    {DISPLAY_A_BASE, DISPLAY_SIZE},
+    {DSI_BASE, DSI_SIZE},
+    {I2C2_BASE, I2C2_SIZE},
+    {SOC_THERM_BASE, SOC_THERM_SIZE},
+    {MIPI_CAL_BASE, MIPI_CAL_SIZE},
+    {SOR_BASE, SOR_SIZE},
+    {SDMMC1_BASE, SDMMC_SIZE},
+    {SDMMC4_BASE, SDMMC_SIZE},
+    {APB_MISC_BASE, APB_MISC_SIZE},
+    {HOST1X_BASE, HOST1X_SIZE},
+    {VIC_BASE, VIC_SIZE},
+    {SYSREG_BASE, SYSREG_SIZE},
+    {I2S_BASE, I2S_SIZE},
+    {ADMAIF_BASE, ADMAIF_SIZE},
+    {ADMA_BASE, ADMA_SIZE},
+    {SE_BASE, SE_SIZE},
+    {TSEC_BASE, TSEC_SIZE},
+    {SYSCTR0_BASE, SYSCTR0_SIZE},
+    {BPMP_CACHE_BASE, BPMP_CACHE_SIZE},
+    {XUSB_PADCTL_BASE, XUSB_PADCTL_SIZE},
+    {USB_OTG_BASE, USB_OTG_SIZE},
+    {XUSB_DEV_BASE, XUSB_DEV_SIZE},
+    {MSELECT_BASE, MSELECT_SIZE},
+    // PCIe. T210 puts the root complex at the BOTTOM of the address map,
+    // below every other peripheral.
+    {PCIE_BLOCK_BASE, PCIE_BLOCK_SIZE},
+    {PCIE_CS_BASE, PCIE_CS_MODEL_SIZE},
+    {PCIE_MEM_BASE, PCIE_MEM_MODEL_SIZE},
+};
+
+// TZRAM is SRAM, not registers, and every master sees the same 64 KiB. It
+// used to be an MMIO window whose "contents" were the register cache, which
+// only held whole words at the exact address last written.
+uint8_t *g_tzram = nullptr;
+
+bool in_mmio_band(uint64_t a) { return a >= 0x50000000 && a < 0x80000000; }
+
+// Unmapped BPMP access. Addresses in the peripheral band get an MMIO page of
+// their own, so the generic register cache and misc handlers see them like
+// any other register; anything else becomes plain RAM, as before.
+bool hook_unmapped(uc_engine *uc, uc_mem_type type, uint64_t address, int size,
+                   int64_t value, void *user_data) {
   EmuState *state = (EmuState *)user_data;
-  uint32_t val = (uint32_t)value;
-  uint32_t pc;
+  uint32_t pc = 0;
   uc_reg_read(uc, UC_ARM_REG_PC, &pc);
-  // TRACE("[mmio] W: 0x%08llX = 0x%08X (PC=0x%08X)\n", (unsigned long
-  // long)address, val, pc); fflush(stdout);
-
-  if (address >= IRAM_BASE && address < IRAM_BASE + 0x40000) {
-    // Log IRAM writes if debugging
-  } else {
-    mmio_regs[address] = val; // Persistent storage
-
-    if (address >= GPIO_BASE && address < GPIO_BASE + GPIO_SIZE) {
-      gpio_write(state, address, val);
-    } else if ((address >= PCIE_BLOCK_BASE &&
-                address < PCIE_BLOCK_BASE + PCIE_BLOCK_SIZE) ||
-               (address >= PCIE_CS_BASE &&
-                address < PCIE_CS_BASE + PCIE_CS_MODEL_SIZE) ||
-               (address >= PCIE_MEM_BASE &&
-                address < PCIE_MEM_BASE + PCIE_MEM_MODEL_SIZE)) {
-      pcie_write(state, address, val);
-    } else if (address >= XUSB_PADCTL_BASE &&
-               address < XUSB_PADCTL_BASE + XUSB_PADCTL_SIZE) {
-      padctl_write(state, address, val);
-    } else if (address >= MSELECT_BASE &&
-               address < MSELECT_BASE + MSELECT_SIZE) {
-      mselect_write(state, address, val);
-    } else if (address >= SDMMC1_BASE && address < SDMMC1_BASE + 0x200) {
-      misc_write(uc, state, address, value, size);
-    } else if (address >= SDMMC4_BASE && address < SDMMC4_BASE + 0x200) {
-      misc_write(uc, state, address, value, size);
-    } else if (address >= 0x70006000 && address < 0x70006500) {
-      uint32_t offset = 0;
-      int port = uart_port_of(address, &offset);
-      // Note offset 0 is the divisor latch LSB - not the transmit register -
-      // whenever DLAB is set, so writing the baud divisor must not be
-      // mistaken for a character to print. Every register (including this
-      // one) was already cached above; the divisor is additionally kept in
-      // UartPort because a later THR write overwrites that cache entry.
-      if (port >= 0) {
-        UartPort &up = uart_ports[port];
-        uint32_t ubase = uart_bases[port];
-        bool dlab = (mmio_regs.count(ubase + 0x0C) ? mmio_regs[ubase + 0x0C] : 0) & 0x80;
-
-        if (offset == 0x00 && dlab) {
-          up.divisor = (uint16_t)((up.divisor & 0xFF00) | (val & 0xFF));
-        } else if (offset == 0x04 && dlab) {
-          up.divisor = (uint16_t)((up.divisor & 0x00FF) | ((val & 0xFF) << 8));
-        } else if (offset == 0x08) {
-          // FCR. RX_CLR is honoured only on the BT port, where the receive
-          // FIFO is fed by an emulated device and dropping it is exactly what
-          // the hardware does. On the console ports that FIFO models a human
-          // at a terminal, and bdk's uart_init() issues an unconditional
-          // RX_CLR - which would silently eat scripted keystrokes.
-          if (port == UART_D && (val & 0x02))
-            state->uart_rx_fifo[port].clear();
-        } else if (offset == 0x10) {
-          uint8_t old_mcr = up.mcr;
-          up.mcr = (uint8_t)val;
-          // Entering or leaving 16550 internal loopback swings all four modem
-          // inputs at once - MCR[3:0] are tied onto MSR[7:4] while it is on -
-          // so every delta bit latches. That is what makes the payload's
-          // first MSR read after its loopback self-test 0x4F, not 0x40.
-          if ((old_mcr ^ up.mcr) & 0x10)
-            up.msr_delta |= 0x0F;
-        }
-
-        if (offset == 0 && !dlab) {
-          uint8_t b = (uint8_t)val;
-
-          if (up.mcr & 0x10) {
-            // Internal loopback: the byte is tied straight back to this
-            // port's own receiver inside the controller and never reaches a
-            // pad. It must NOT be handed to whatever is on the far end, or
-            // the BT chip's H4 parser desyncs on the A5 5A 00 FF test
-            // pattern - and it must not reach the TX log either, since it is
-            // not something the payload actually transmitted.
-            state->uart_rx_fifo[port].push_back(b);
-          } else {
-            // UART-D is the Bluetooth radio's H4 transport.
-            if (port == UART_D)
-              bt_chip_rx(state, b);
-
-            // Append every byte to the per-port TX log — the console window
-            // renders this as scrolling text. Trim from the front if it grows
-            // past 64 KB so ImGui rendering stays responsive.
-            std::string &log = state->uart_tx_log[port];
-            if (b == '\n' || (b >= 0x20 && b < 0x7F))
-              log.push_back((char)b);
-            if (log.size() > 64 * 1024)
-              log.erase(0, log.size() - 48 * 1024);
-
-            // Mirror to host stdout in line-buffered form so existing
-            // `grep '[uart]'` workflows still work.
-            static char uart_line[EmuState::N_UARTS][512];
-            static size_t uart_len[EmuState::N_UARTS] = {0};
-            auto flush_uart_line = [&](int p) {
-              if (uart_len[p] > 0) {
-                uart_line[p][uart_len[p]] = 0;
-                printf("[uart%c] %s\n", 'A' + (char)p, uart_line[p]);
-                fflush(stdout);
-                uart_len[p] = 0;
-              }
-            };
-            if (b == '\n' || b == '\r') {
-              flush_uart_line(port);
-            } else if (b >= 0x20 && b < 0x7F) {
-              if (uart_len[port] + 1 >= sizeof(uart_line[port])) flush_uart_line(port);
-              uart_line[port][uart_len[port]++] = (char)b;
-            }
-          }
-        }
-      }
-    } else if (address >= VIC_BASE && address < VIC_BASE + VIC_SIZE) {
-      vic_write(state, address, val);
-    } else if (address >= SYSREG_BASE && address < SYSREG_BASE + SYSREG_SIZE) {
-      sysreg_write(state, address, val);
-    } else if (address >= BPMP_CACHE_BASE &&
-               address < BPMP_CACHE_BASE + BPMP_CACHE_SIZE) {
-      bpmp_cache_write(state, address, val);
-    } else if (address >= SOC_THERM_BASE &&
-               address < SOC_THERM_BASE + SOC_THERM_SIZE) {
-      soc_therm_write(state, address, val);
-    } else if (address >= I2S_BASE && address < I2S_BASE + I2S_SIZE) {
-      i2s_write(state, address, val);
-    } else if (address >= ADMAIF_BASE && address < ADMAIF_BASE + ADMAIF_SIZE) {
-      admaif_write(state, address, val);
-    } else if (address >= ADMA_BASE && address < ADMA_BASE + ADMA_SIZE) {
-      adma_write(state, address, val);
-    } else if (address >= RTC_BASE && address < RTC_BASE + RTC_SIZE) {
-      rtc_write(state, address, val);
-    } else if (address >= I2C2_BASE && address < I2C2_BASE + I2C2_SIZE) {
-      i2c2_write(state, address, val);
-    } else if (address >= I2C3_BASE && address < I2C3_BASE + I2C3_SIZE) {
-      i2c3_write(state, address, val);
-    } else if (address >= I2C1_BASE && address < I2C1_BASE + 0x100) {
-      i2c_write(state, address, val);
-    } else if (address >= I2C5_BASE && address < I2C5_BASE + I2C_SIZE) {
-      i2c_write(state, address, val);
-    } else if (address >= DISPLAY_A_BASE &&
-               address < DISPLAY_A_BASE + DISPLAY_SIZE) {
-      display_write(state, address, val);
-    } else if (address >= DSI_BASE && address < DSI_BASE + DSI_SIZE) {
-      dsi_write(state, address, val);
-    } else if (address >= PMC_BASE && address < PMC_BASE + PMC_SIZE) {
-      pmc_write(state, address, val);
-    } else if (address >= 0x60007000 && address < 0x60007000 + 0x1000) {
-      flow_write(state, address, val);
-    } else if (address >= CLK_RST_BASE &&
-               address < CLK_RST_BASE + CLK_RST_SIZE) {
-      clk_rst_write(state, address, val);
-    } else if (address >= FUSE_BASE && address < FUSE_BASE + FUSE_SIZE) {
-      fuse_write(state, address, val);
-    } else if ((address >= EMC_BASE  && address < EMC_BASE  + EMC_SIZE) ||
-               (address >= EMC0_BASE && address < EMC0_BASE + EMC_SIZE) ||
-               (address >= EMC1_BASE && address < EMC1_BASE + EMC_SIZE)) {
-      emc_write(state, address, val);
-    } else if (address >= SE_BASE && address < SE_BASE + SE_SIZE) {
-      se_write(state, address, val);
-    } else {
-      // Log other MMIO writes but don't duplicate SDMMC/I2C/etc.
-      if (!((address >= SDMMC1_BASE && address < SDMMC1_BASE + 0x1000) ||
-            (address >= SDMMC4_BASE && address < SDMMC4_BASE + 0x1000) ||
-            (address >= I2C1_BASE && address < I2C1_BASE + 0x1000) ||
-            (address >= I2C5_BASE && address < I2C5_BASE + 0x1000) ||
-            (address >= SE_BASE && address < SE_BASE + SE_SIZE) ||
-            (address >= RTC_BASE && address < RTC_BASE + RTC_SIZE))) {
-        TRACE("[mmio] W: 0x%08llX = 0x%08X (PC=0x%08X)\n",
-               (unsigned long long)address, val, pc);
-        fflush(stdout);
-      }
-      misc_write(uc, state, address, val, size);
-    }
-  }
-}
-
-static bool hook_unmapped(uc_engine *uc, uc_mem_type type, uint64_t address,
-                          int size, int64_t value, void *user_data) {
-  uint32_t pc;
-  uc_reg_read(uc, UC_ARM_REG_PC, &pc);
-  if (type == UC_MEM_READ_UNMAPPED) {
-    TRACE("[mmio] UNMAPPED R: 0x%08lX (PC=0x%08X)\n", (unsigned long)address,
-           pc);
+  if (type == UC_MEM_READ_UNMAPPED || type == UC_MEM_FETCH_UNMAPPED) {
+    TRACE("[mmio] UNMAPPED R: 0x%08lX (PC=0x%08X)\n", (unsigned long)address, pc);
   } else {
     TRACE("[mmio] UNMAPPED W: 0x%08lX = 0x%08llX (PC=0x%08X)\n",
-           (unsigned long)address, (unsigned long long)value, pc);
+          (unsigned long)address, (unsigned long long)value, pc);
   }
   uint64_t page = address & ~0xFFFULL;
-  uc_mem_map(uc, page, 0x1000, UC_PROT_ALL);
-  if (type == UC_MEM_WRITE_UNMAPPED) {
+  if (in_mmio_band(page) && type != UC_MEM_FETCH_UNMAPPED)
+    return map_window(uc, state, page, 0x1000) == UC_ERR_OK;
+  if (uc_mem_map(uc, page, 0x1000, UC_PROT_ALL) != UC_ERR_OK)
+    return false;
+  if (type == UC_MEM_WRITE_UNMAPPED)
     uc_mem_write(uc, address, &value, size);
-  }
   return true;
 }
 
-void hook_code(uc_engine *uc, uint64_t address, uint32_t size,
-               void *user_data) {
-  EmuState *state = (EmuState *)user_data;
-  static uint32_t last_pc = 0;
-  static int loop_count = 0;
-  static int logged_stall = 0;
+} // namespace
 
-  // Deterministic timer: 10 instructions per microsecond (approx 10MHz
-  // speed-up)
-  state->insn_count++;
-  if ((state->insn_count % 10) == 0) {
-    state->emu_usec++;
+void mmio_map_bus(uc_engine *uc, EmuState *state) {
+  // Flatten to pages, then map each run of contiguous pages as one window.
+  std::vector<uint64_t> pages;
+  for (const auto &r : kRegions) {
+    uint64_t first = r.base & ~0xFFFULL;
+    uint64_t end = (r.base + r.size + 0xFFF) & ~0xFFFULL;
+    for (uint64_t p = first; p < end; p += 0x1000)
+      pages.push_back(p);
+  }
+  std::sort(pages.begin(), pages.end());
+  pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+  for (size_t i = 0; i < pages.size();) {
+    size_t j = i + 1;
+    while (j < pages.size() && pages[j] == pages[j - 1] + 0x1000)
+      j++;
+    uint64_t base = pages[i], len = pages[j - 1] + 0x1000 - base;
+    uc_err err = map_window(uc, state, base, len);
+    if (err != UC_ERR_OK)
+      fprintf(stderr, "[mmio] cannot map 0x%08llX+0x%llX: %s\n",
+              (unsigned long long)base, (unsigned long long)len,
+              uc_strerror(err));
+    i = j;
   }
 
-  // Framebuffer-change-aware automation
-  static uint32_t last_fb_sum = 0;
-  static int fb_changes = 0;
-  static int auto_stage = -1; // Disabled for manual debugging
-  static uint64_t stage_start = 0;
-  static uint64_t last_change_insn = 0;
+  if (!g_tzram)
+    g_tzram = (uint8_t *)calloc(1, TZRAM_SIZE);
+  if (g_tzram)
+    uc_mem_map_ptr(uc, TZRAM_BASE, TZRAM_SIZE, UC_PROT_ALL, g_tzram);
+}
 
-  // Ignore changes for the first 2s (20M insns) to avoid boot transients
-  if (auto_stage == 0 && state->insn_count > 20000000) {
-    auto_stage = 1;
-    printf("[emu] Initial boot period over. Waiting for screen change...\n");
-  }
-
-  if (auto_stage >= 1 && (state->insn_count % 1000000) == 0) {
-    uint64_t current_fb = state->fb_addr ? state->fb_addr : 0xF5A00000;
-    uint32_t pixels[2048];
-    uint32_t sum = 0;
-
-    // Sample Top rows for maximum sensitivity
-    if (uc_mem_read(uc, current_fb, pixels, sizeof(pixels)) == UC_ERR_OK) {
-      for (int i = 0; i < 2048; i++)
-        sum += (pixels[i] & 0xFFFFFF);
-
-      if (sum != last_fb_sum && sum != 0) {
-        // Ensure there's a gap between 'changes' to let screens settle
-        if (state->insn_count > last_change_insn + 5000000) { // 0.5s gap
-          fb_changes++;
-          last_fb_sum = sum;
-          last_change_insn = state->insn_count;
-          printf("[emu] FB Change #%d detected (sum=0x%08X). PC=0x%08llX\n",
-                 fb_changes, sum, (unsigned long long)address);
-          fflush(stdout);
-
-          if (auto_stage == 1) { // Error Screen or Menu
-            auto_stage = 2;
-            stage_start = state->insn_count;
-          } else if (auto_stage == 3) { // Subsequent menu transition
-            auto_stage = 4;
-            stage_start = state->insn_count;
-          }
-        }
-      }
-    }
-  }
-
-  // State Machine for Inputs (AutoRCM Verification Path)
-  if (auto_stage == 2) { // Skip SD fail / Error screen
-    uint64_t press = stage_start + 5000000;
-    if (state->insn_count == press) {
-      printf("[emu] POWER (Skip Screen)\n");
-      state->btn_power = true;
-    }
-    if (state->insn_count == press + 1000000) {
-      state->btn_power = false;
-      auto_stage = 3;
-    }
-  } else if (auto_stage == 4) { // Main Menu reached Change #2
-    uint64_t base = stage_start + 10000000;
-
-    // 1. Move to "Tools..." (1 tap down from Launch)
-    if (state->insn_count == base) {
-      printf("[emu] VOL_DOWN (Select Tools)\n");
-      state->btn_vol_down = true;
-    }
-    if (state->insn_count == base + 1000000) {
-      state->btn_vol_down = false;
-    }
-
-    // 2. Enter Tools
-    if (state->insn_count == base + 5000000) {
-      printf("[emu] POWER (Enter Tools)\n");
-      state->btn_power = true;
-    }
-    if (state->insn_count == base + 6000000) {
-      state->btn_power = false;
-    }
-
-    // 3. Move to "AutoRCM" in Tools menu (2 taps down to skip Back and
-    // Separator)
-    if (state->insn_count == base + 10000000) {
-      printf("[emu] VOL_DOWN (Select AutoRCM 1)\n");
-      state->btn_vol_down = true;
-    }
-    if (state->insn_count == base + 11000000) {
-      state->btn_vol_down = false;
-    }
-    if (state->insn_count == base + 15000000) {
-      printf("[emu] VOL_DOWN (Select AutoRCM 2)\n");
-      state->btn_vol_down = true;
-    }
-    if (state->insn_count == base + 16000000) {
-      state->btn_vol_down = false;
-    }
-
-    // 4. Enter AutoRCM
-    if (state->insn_count == base + 20000000) {
-      printf("[emu] POWER (Enter AutoRCM)\n");
-      state->btn_power = true;
-    }
-    if (state->insn_count == base + 21000000) {
-      state->btn_power = false;
-    }
-
-    // 5. Toggle AutoRCM (Enable) / Clear potential red error
-    if (state->insn_count == base + 30000000) {
-      printf("[emu] POWER (Toggle/Skip Error 1)\n");
-      state->btn_power = true;
-    }
-    if (state->insn_count == base + 31000000) {
-      state->btn_power = false;
-    }
-    if (state->insn_count == base + 35000000) {
-      printf("[emu] POWER (Toggle/Skip Error 2)\n");
-      state->btn_power = true;
-    }
-    if (state->insn_count == base + 36000000) {
-      state->btn_power = false;
-    }
-
-    // 6. Go back to Main Menu (Using VOL_UP (Back) repeatedly)
-    if (state->insn_count == base + 50000000) {
-      printf("[emu] VOL_UP (Back to Tools)\n");
-      state->btn_vol_up = true;
-    }
-    if (state->insn_count == base + 51000000) {
-      state->btn_vol_up = false;
-    }
-
-    if (state->insn_count == base + 60000000) {
-      printf("[emu] VOL_UP (Back to Main Menu)\n");
-      state->btn_vol_up = true;
-    }
-    if (state->insn_count == base + 61000000) {
-      state->btn_vol_up = false;
-    }
-
-    // 7. Navigate to Power Off from Main Menu
-    // Power Off is near the bottom. Let's do 10 taps of VOL_DOWN.
-    uint64_t nav_base = base + 80000000;
-    for (int i = 0; i < 10; i++) {
-      uint64_t tap = nav_base + (i * 4000000);
-      if (state->insn_count == tap) {
-        printf("[emu] VOL_DOWN (Nav to Off %d)\n", i + 1);
-        state->btn_vol_down = true;
-      }
-      if (state->insn_count == tap + 1000000) {
-        state->btn_vol_down = false;
-      }
-    }
-
-    // 8. Power Off
-    uint64_t pwr_off = nav_base + 50000000;
-    if (state->insn_count == pwr_off + 1000000) {
-      state->btn_power = false;
-      auto_stage = 5;
-    }
-  }
-
-  if (address == last_pc) {
-    loop_count++;
-  } else {
-    if (loop_count > 100000 && !logged_stall) {
-      printf("[trace] STALL at PC=0x%08llX (looped %d times)\n",
-             (unsigned long long)last_pc, loop_count);
-      logged_stall = 1;
-    } else if (loop_count == 0) {
-      logged_stall = 0;
-    }
-    last_pc = (uint32_t)address;
-    loop_count = 0;
-  }
+void mmio_unmap_bus(uc_engine *uc) {
+  g_windows.erase(std::remove_if(g_windows.begin(), g_windows.end(),
+                                 [uc](const std::unique_ptr<MmioWindow> &w) {
+                                   return w->uc == uc;
+                                 }),
+                  g_windows.end());
 }
 
 void mmio_init(uc_engine *uc, EmuState *state) {
-  static uc_hook h_read, h_write, h_unmapped, h_code;
+  static uc_hook h_unmapped;
 
-  const struct {
-    uint64_t base;
-    uint64_t size;
-  } regions[] = {
-      {CLK_RST_BASE, CLK_RST_SIZE},
-      {TMR_BASE, TMR_SIZE},
-      {GPIO_BASE, GPIO_SIZE},
-      {PINMUX_BASE, PINMUX_SIZE},
-      {UART_A_BASE, UART_SIZE},
-      {I2C1_BASE, I2C_SIZE},
-      {I2C5_BASE, I2C_SIZE},
-      {RTC_BASE, RTC_SIZE},
-      {PMC_BASE, PMC_SIZE},
-      {FUSE_BASE, FUSE_SIZE},
-      {0x60007000, 0x1000}, // FLOW_CTLR
-      {EMC_BASE, EMC_SIZE},
-      {EMC0_BASE, EMC_SIZE},
-      {EMC1_BASE, EMC_SIZE},
-      {MC_BASE, MC_SIZE},
-      {DISPLAY_A_BASE, DISPLAY_SIZE},
-      {DSI_BASE, DSI_SIZE},
-      {I2C2_BASE, I2C2_SIZE},
-      {SOC_THERM_BASE, SOC_THERM_SIZE},
-      {MIPI_CAL_BASE, MIPI_CAL_SIZE},
-      {SOR_BASE, SOR_SIZE},
-      {SDMMC1_BASE, SDMMC_SIZE},
-      {SDMMC4_BASE, SDMMC_SIZE},
-      {APB_MISC_BASE, APB_MISC_SIZE},
-      {HOST1X_BASE, HOST1X_SIZE},
-      {VIC_BASE, VIC_SIZE},
-      {SYSREG_BASE, SYSREG_SIZE},
-      {I2S_BASE, I2S_SIZE},
-      {ADMAIF_BASE, ADMAIF_SIZE},
-      {ADMA_BASE, ADMA_SIZE},
-      {SE_BASE, SE_SIZE},
-      {TSEC_BASE, TSEC_SIZE},
-      {SYSCTR0_BASE, SYSCTR0_SIZE},
-      {BPMP_CACHE_BASE, BPMP_CACHE_SIZE}, // BPMP_CACHE
-      {TZRAM_BASE, TZRAM_SIZE},           // TZRAM
-      {XUSB_PADCTL_BASE, XUSB_PADCTL_SIZE},
-      {MSELECT_BASE, MSELECT_SIZE},
-      // PCIe. These are the only mapped regions below 0x50000000, so they
-      // also need their own hooks (see below) - the main MMIO hook pair
-      // covers 0x50000000..0x7FFFFFFF and would never see them.
-      {PCIE_BLOCK_BASE, PCIE_BLOCK_SIZE},
-      {PCIE_CS_BASE, PCIE_CS_MODEL_SIZE},
-      {PCIE_MEM_BASE, PCIE_MEM_MODEL_SIZE},
-  };
-
-  for (const auto &r : regions) {
-    uint64_t map_base = r.base & ~0xFFFULL;
-    uint64_t map_end = (r.base + r.size + 0xFFF) & ~0xFFFULL;
-    uint64_t map_size = map_end - map_base;
-    uc_mem_map(uc, map_base, map_size, UC_PROT_ALL);
-  }
-
-  uc_hook_add(uc, &h_read, UC_HOOK_MEM_READ, (void *)hook_mmio_read, state,
-              0x50000000, 0x7FFFFFFF);
-  uc_hook_add(uc, &h_write, UC_HOOK_MEM_WRITE, (void *)hook_mmio_write, state,
-              0x50000000, 0x7FFFFFFF);
-
-  // T210 puts the PCIe root complex at the BOTTOM of the address map, below
-  // every other peripheral, so it needs a second hook pair. The range is a
-  // filter, not a mapping - only the three small regions mapped above ever
-  // resolve inside it.
-  static uc_hook h_pcie_read, h_pcie_write;
-  uc_hook_add(uc, &h_pcie_read, UC_HOOK_MEM_READ, (void *)hook_mmio_read,
-              state, PCIE_BLOCK_BASE, PCIE_MEM_BASE + PCIE_MEM_MODEL_SIZE - 1);
-  uc_hook_add(uc, &h_pcie_write, UC_HOOK_MEM_WRITE, (void *)hook_mmio_write,
-              state, PCIE_BLOCK_BASE, PCIE_MEM_BASE + PCIE_MEM_MODEL_SIZE - 1);
-
+  mmio_map_bus(uc, state);
   pcie_reset(state);
+  ccplex_reset(state);
+  sdhci_reset_regs(sdhci_regs[0]);
+  sdhci_reset_regs(sdhci_regs[1]);
+  dc_reset(state);
 
   uc_hook_add(uc, &h_unmapped,
               UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED,
               (void *)hook_unmapped, state, 1, 0);
+}
 
-  uc_hook_add(uc, &h_code, UC_HOOK_CODE, (void *)hook_code, state, 1, 0);
+void mmio_soft_reset(EmuState *state, bool power_cycle) {
+  // A reboot is a SoC reset: every block on the SoC goes back to its power-
+  // on state. Only the always-on side survives - PMC SCRATCH0 and the reset
+  // status (TRM 12.x: "MAIN_RST resets everything but scratch 0 and reset
+  // status"), the RTC - and, unless the board was power-cycled, the PMIC and
+  // the regulators behind it, which are not on the SoC at all.
+  //
+  // This used to reset only the CCPLEX and PCIe models, so a payload run
+  // after a reboot found GPIOs, pinmux, UART modes, powered partitions,
+  // unlocked PLLs, SE keys and a half-read touch event where the previous run
+  // left them - and, after a PMIC reset, CPU rails still switched on.
+  ccplex_reset(state);
+  pcie_reset(state);
+  se_engine_reset();
+  i2c3_reset(state);
+  usb_reset(state);
+
+  mmio_regs.clear();
+  for (auto &u : uart_ports)
+    u = UartPort();
+  for (auto &fifo : state->uart_rx_fifo)
+    fifo.clear();
+  bt_chip = BtChip();
+  codec_regs.clear();
+
+  i2c_slave_addr = i2c_reg_addr = 0;
+  i2c_cmd_data1 = 0;
+  i2c_cnfg_reg[0] = i2c_cnfg_reg[1] = 0;
+  pkt_i2c1 = PacketState();
+  pkt_i2c5 = PacketState();
+  i2c2_slave = i2c2_reg = 0;
+  i2c2_cnfg = 0;
+  if (power_cycle) {
+    max77620_regs_ready = false;   // re-seeded on next access
+    max77812_ready = false;
+    memcpy(max77621_regs, kMax77621Seed, sizeof(max77621_regs));
+  }
+
+  g_kfuse_keyaddr = 0;
+  pmc_pwrgate_status = 1u << 3;
+  pmc_io_dpd_status[0] = pmc_io_dpd_status[1] = 0;
+  uint32_t scratch0 = pmc_regs[0x50 / 4], rst_status = pmc_regs[0x1B4 / 4];
+  memset(pmc_regs, 0, sizeof(pmc_regs));
+  if (!power_cycle) {
+    pmc_regs[0x50 / 4] = scratch0;
+    pmc_regs[0x1B4 / 4] = rst_status;
+  }
+  if (power_cycle) {
+    rtc_base_us = 0;
+    rtc_sec_adjust = 0;
+  } else {
+    rtc_base_us += state->emu_usec;   // the RTC keeps counting through it
+  }
+  rtc_shadow_seconds = 0;
+
+  flow_ram_repair = RAM_REPAIR_RESET;
+  memset(tmr_armed_us, 0, sizeof(tmr_armed_us));
+  car_banks = CarBanks();
+  g_fuse_ctrl_addr = 0;
+  emc = EmcState();
+  g_dsi_pending_dcs_cmd = 0;
+  memset(g_dsi_rx_fifo, 0, sizeof(g_dsi_rx_fifo));
+  g_dsi_rx_count = g_dsi_rx_pos = 0;
+  vic = VicRegs();
+  for (auto &d : actmon_dev)
+    d = ActmonDev();
+  actmon_glb_period = 0;
+  audio_pcm.clear();
+  audio_pcm_full = false;
+
+  // Storage controllers. The images stay open; the eMMC is back in its user
+  // area, as after CMD0.
+  state->sdmmc_arg = state->sdmmc_sysad = 0;
+  state->sdmmc_norintsts = state->sdmmc_errintsts = 0;
+  memset(state->sdmmc_rsp, 0, sizeof(state->sdmmc_rsp));
+  state->sdmmc_hostctl = 0;
+  state->sdmmc_blksize = state->sdmmc_blkcnt = state->sdmmc_trnmod = 0;
+  state->sdmmc_adma_addr = 0;
+  state->sdmmc4_arg = state->sdmmc4_sysad = 0;
+  state->sdmmc4_norintsts = state->sdmmc4_errintsts = 0;
+  memset(state->sdmmc4_rsp, 0, sizeof(state->sdmmc4_rsp));
+  state->sdmmc4_hostctl = 0;
+  state->sdmmc4_blksize = state->sdmmc4_blkcnt = state->sdmmc4_trnmod = 0;
+  state->sdmmc4_adma_addr = 0;
+  state->emmc_partition = 0;
+  state->last_cmd_was_55 = state->last_cmd4_was_55 = false;
+  sdhci_reset_regs(sdhci_regs[0]);
+  sdhci_reset_regs(sdhci_regs[1]);
+  if (power_cycle)
+    g_ext_csd_ready = false;
+  else
+    emmc_ext_csd_card_reset();
+  sd_card = SdCard(); // the reset drops PE4, and the card's VDD with it
+
+  // Display controller and VIC back to their defaults.
+  dc_reset(state);
+
+  state->bpmp_halted = false;
 }

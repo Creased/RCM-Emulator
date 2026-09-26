@@ -23,3 +23,7 @@ bool input_script_active();
 // Apply any events that are due at the current state.emu_usec. Call once per
 // emulator loop iteration; cheap no-op when no script is loaded.
 void input_script_tick(EmuState &state);
+
+// Soft reboot: the emulated clock starts again from 0, so every event is
+// re-armed and any button the script was holding is let go.
+void input_script_restart(EmuState &state);

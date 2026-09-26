@@ -138,6 +138,8 @@ void reset_to_defaults(EmuState *s) {
     X(usb_pd_inserted,     "usb_pd",  "inserted",        0)                  \
     X(usb_pd_voltage_mv,   "usb_pd",  "voltage_mv",      0)                  \
     X(usb_pd_amperage_ma,  "usb_pd",  "amperage_ma",     0)                  \
+    X(usb_host,            "usb",     "host",            0)                  \
+    X(usb_nbd_port,        "usb",     "nbd_port",        0)                  \
     /* SoC / PMIC */                                                         \
     X(pmic_otp,            "soc",     "pmic_otp",        0)                  \
     X(is_mariko,           "soc",     "is_mariko",       0)                  \
@@ -217,11 +219,13 @@ bool config_window_save_ini_impl(const EmuState *s, const char *path) {
     fprintf(f, "radio=%s\n", wifi_radio_name(s->wifi_radio.load()));
 
     // Fuses are dumped wholesale — small enough (256 × 4 bytes) and keeps the
-    // load path branch-free.
+    // load path branch-free. Zero words too: loading layers the file over
+    // init_fuse_defaults(), so a fuse cleared in the UI and left out here
+    // came back at its default on the next start.
     fprintf(f, "\n[fuses]\n");
     for (size_t i = 0; i < EmuState::FUSE_WORDS; i++) {
         uint32_t v = s->fuse_word[i].load();
-        if (v) fprintf(f, "0x%03X=0x%08X\n", (unsigned)(i * 4), v);
+        fprintf(f, "0x%03X=0x%08X\n", (unsigned)(i * 4), v);
     }
 
     fclose(f);
@@ -643,6 +647,26 @@ void build_ui(EmuState *state) {
         atomic_slider_int<uint16_t>("PDO amperage (mA)", state->usb_pd_amperage_ma,  500,  3000, "%d mA");
     }
 
+    if (ImGui::CollapsingHeader("USB device mode")) {
+        // The PC in t210/usb.cpp: it enumerates a gadget the payload brings up.
+        bool host = state->usb_host.load();
+        if (ImGui::Checkbox("PC on the USB-C port (--usb-host)", &host)) {
+            state->usb_host.store(host);
+        }
+        // Mass storage served over NBD instead (--usb-host nbd[:port]);
+        // takes effect when the next disk is attached.
+        bool nbd = state->usb_nbd_port.load() != 0;
+        if (ImGui::Checkbox("Serve mass storage over NBD", &nbd)) {
+            state->usb_nbd_port.store(nbd ? 10809 : 0);
+        }
+        if (nbd) {
+            atomic_slider_int<uint16_t>("NBD port", state->usb_nbd_port, 1024, 65535, "%d");
+            ImGui::TextDisabled("127.0.0.1 only; the disk is ejected when the client disconnects.");
+        } else {
+            ImGui::TextDisabled("Mass storage is read back, written back unchanged and ejected;\nHID is polled.");
+        }
+    }
+
     if (ImGui::CollapsingHeader("Display")) {
         int bl = (int)state->backlight;
         if (ImGui::SliderInt("Backlight", &bl, 0, 255)) {
@@ -757,7 +781,7 @@ void build_ui(EmuState *state) {
         // Each row corresponds to a FUSE_BASE offset in Hekate's
         // bdk/soc/fuse.h. Defaults match a typical Erista golden sample.
         atomic_hex_input("0x100 PRODUCTION_MODE",  state->fuse_at(0x100));
-        atomic_hex_input("0x110 SKU_INFO",         state->fuse_at(0x110));
+        atomic_hex_input("0x110 SKU_INFO (0x83 ODIN; Minerva needs it)", state->fuse_at(0x110));
         atomic_hex_input("0x114 CPU_SPEEDO_0",     state->fuse_at(0x114));
         atomic_hex_input("0x118 CPU_IDDQ",         state->fuse_at(0x118));
         atomic_hex_input("0x128 OPT_FT_REV",       state->fuse_at(0x128));
@@ -889,6 +913,7 @@ void build_ui(EmuState *state) {
         }
         ImGui::SameLine();
         if (ImGui::Button("Reboot")) {
+            state->reboot_cold = true;  // the user's reset is a power cycle
             state->reboot_requested.store(true);
         }
         ImGui::Text("emu_usec:    %llu", (unsigned long long)state->emu_usec);
@@ -944,7 +969,13 @@ bool config_window_init() {
         fprintf(stderr, "[config_window] SDL_CreateWindow failed: %s\n", SDL_GetError());
         return false;
     }
-    g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    // No PRESENTVSYNC: this window renders on the emulation thread, and
+    // vsync would stall the emulated CPU for up to a frame per present.
+    g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED);
+    // Same fallback as the main window: no GPU renderer (a headless run, a
+    // VM without GL) should not cost the window altogether.
+    if (!g_renderer)
+        g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE);
     if (!g_renderer) {
         fprintf(stderr, "[config_window] SDL_CreateRenderer failed: %s\n", SDL_GetError());
         SDL_DestroyWindow(g_window);
