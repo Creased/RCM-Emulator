@@ -320,6 +320,10 @@ struct EmuState {
     // SD card insertion (GPIO Port Z bit 1 = 0 means inserted).
     std::atomic<bool>     sd_inserted{true};
 
+    // A PC on the USB-C port (--usb-host): it enumerates whatever gadget the
+    // payload brings up (t210/usb.cpp). Off, nothing is on the cable.
+    std::atomic<bool>     usb_host{false};
+
     // SD card identity (returned for SDMMC1 CMD2 ALL_SEND_CID).
     // Hekate parses these out of the R2 response per bdk/storage/sdmmc.c
     // _sd_storage_parse_cid; the I2C handler builds the 16-byte CID payload

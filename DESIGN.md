@@ -28,6 +28,7 @@ flowchart TB
     mmio --> dc["<b>DC + VIC</b> (inline)<br/>window registers A-D<br/>VIC compose, flip/transpose"]
     mmio --> stubs["<b>inline stubs</b><br/>GPIO, PMC, TSEC, KFUSE,<br/>PWM, CLK, TMR, FUSE, UART"]
     mmio --> pcie["<b>pcie</b><br/>AFI, root ports, CYW4356<br/>(CPU-complex master only)"]
+    mmio --> usb["<b>usb</b><br/>USB2 + XUSB device controllers<br/>and the --usb-host PC"]
 
     cfg -.->|writes atomics| state["<b>EmuState</b><br/>(emu_state.h)"]
     con -.->|RX inject / TX log| state
@@ -529,6 +530,62 @@ All TX append / RX pop is single-threaded -- both the CPU emulation and ImGui
 rendering run on the main thread between SDL polls -- so no locking is
 needed. The 64 KB TX log trim happens in-place during the write hook.
 
+### USB device mode (`t210/usb.cpp`)
+
+bdk runs its gadgets - Nyx's USB mass storage for the SD card, eMMC and
+emuMMC, and its Joy-Con gamepad - on one of two device controllers, and both
+are modelled:
+
+- **Erista: the USB2 controller USB1** (0x7D000000, bdk `usbd.c`), an
+  EHCI-derived device controller. Each endpoint half has a 64-byte queue
+  head at `ENDPOINTLISTADDR` (bdk keeps them in the controller's own memory
+  at +0x1000) and a chain of transfer descriptors in DRAM. `ENDPTPRIME`
+  loads the first descriptor and sets its bit in `ENDPTSTATUS` until the
+  transfer retires; each descriptor it reaches is written back with the
+  bytes it did not move, and the endpoint's bit set in `ENDPTCOMPLETE`. A
+  SETUP lands in queue head 0 with `ENDPTSETUPSTAT` bit 0. `USBCMD.RESET`
+  resets the controller and clears itself; `PHY_CLK_VALID` follows the
+  UTMI PHY's enable and reset. bdk copies SETUP packets out with `memcpy()`,
+  so byte and halfword accesses are handled.
+- **Mariko: the XUSB device controller** (0x700D0000, bdk `xusbd.c`), the
+  device side of xHCI. Endpoints are device context indexes (0 control, 2
+  bulk OUT, 3 bulk IN), each with a context (the dequeue pointer and DCS in
+  word 2) and a ring of TRBs the driver fills and closes with a Link TRB,
+  ringing the doorbell. The controller posts events on a two-segment event
+  ring, flipping its cycle bit per pass and raising `ST.IP`: a Port Status
+  Change on a bus reset, a Setup event with a sequence number per SETUP, a
+  Transfer event with the residue and SUCCESS or SHORT_PKT per TRB.
+  `EP_HALT` halts an endpoint (`EP_STCHG` reports it), `EP_RELOAD` reloads a
+  context, and a `PORTSC` write with LWS and RxDetect arms the port.
+
+**The host.** `--usb-host` (or `[usb] host`, or the config window's USB
+device mode box) plugs in a PC; without it nothing is on the cable and a
+gadget waits for a connection until it gives up, as with no cable. The host
+sees whichever controller attaches, waits out the attach debounce, resets
+the bus at high speed and enumerates: device descriptor, `SET_ADDRESS` (with
+its 2 ms recovery), configuration, strings, `SET_CONFIGURATION`. It then gives
+the class driver 100 ms to bind, as a PC does - bdk's XUSB driver stalls a
+`GET_MAX_LUN` that arrives before the gadget asks for it - and runs the
+class:
+
+- *Mass storage (Bulk-Only Transport):* `GET_MAX_LUN`, INQUIRY, TEST UNIT
+  READY (answering the first unit attention with REQUEST SENSE), READ
+  CAPACITY, READ(10) of the first 64 and the last 8 blocks, each logged with
+  its CRC32 and checked against the SD image when the disk is its size; then
+  PREVENT ALLOW MEDIUM REMOVAL, an eject (START STOP UNIT, LoEj) and TEST
+  UNIT READY every 500 ms until the gadget detaches, as Linux does. It only
+  reads.
+- *HID:* the report descriptor, `SET_IDLE` with an idle rate of 0 (report on
+  change), then the interrupt IN endpoint is polled. Nyx's gamepad has
+  nothing to report without Joy-Cons.
+
+The host advances on every access to either controller - it runs as far as
+the device and the emulated clock allow - so it needs no thread or main-loop
+hook and runs repeat exactly. It logs `[usb-host]` lines; `RCM_USB_TRACE=1`
+also logs each transfer descriptor, TRB and doorbell. Nyx's SD card mass
+storage reads back identical to the image and reports "Disk ejected" on
+both SoCs.
+
 ### Other peripherals (mostly stubs)
 
 - **CAR and MC.** Registers without behaviour of their own read back what
@@ -722,8 +779,11 @@ emulated second.
 refusal, the EL3 entry, a core released with its clock stopped, the
 mailbox, WFE parking and the reset;
 `tests/se/`, which runs the SE's RSA, SHA-256, AES and RNG against vectors
-computed in Python (`gen_vectors.py` writes `vectors.h`); and
-`tests/display/`, one payload built per scenario that drives the display
+computed in Python (`gen_vectors.py` writes `vectors.h`); `tests/usb/`, a
+mass storage gadget over a RAM disk on each device controller and a HID
+gadget, which the `--usb-host` PC must enumerate, read back (the CRC32s it
+logs match the payload's) and see detach, plus a run with nothing on the
+cable; and `tests/display/`, one payload built per scenario that drives the display
 controller and VIC the way bdk does (a pitch window; Nyx's VIC turn into
 pitch and into block-linear surfaces; a block-linear VIC source; the DC's
 own column scan with an address offset; a mirrored window with window D
@@ -747,6 +807,10 @@ don't repeat the diagnosis:
   real console's value taken after a payload had brought the display up, so
   `display_init()` found DISP1 already clocked at RCM entry. Fix: the bank
   starts at the TRM reset value and follows the payload's writes.
+- **Every USB gadget failed to start.** The USB controllers were plain
+  register caches, so `USBCMD.RESET` never cleared and bdk's
+  `usb_device_init()` timed out; Nyx's USB tools could not even wait for a
+  cable. Fix: both device controllers are modelled, with a PC to plug in.
 - **Minerva hung Nyx** (hekate 6.5.3 with the stock `bootloader/` folder
   never reached its GUI). The emulator planted hekate's "watchdog fired"
   cookie in IRAM so the IPL would skip Minerva; Nyx then trained the DRAM

@@ -36,6 +36,26 @@ static inline int64_t file_size64(int fd) {
 #endif
 }
 
+// pread/pwrite are POSIX and MinGW does not have them. Seek-then-read is
+// equivalent here: the emulated storage is touched only from the CPU thread,
+// so the atomicity real pread() buys against a shared file offset is not in
+// play.
+#ifdef _WIN32
+#include <io.h>
+static inline ssize_t pread(int fd, void *buf, size_t n, long long off) {
+  if (_lseeki64(fd, off, SEEK_SET) < 0)
+    return -1;
+  return _read(fd, buf, (unsigned int)n);
+}
+static inline ssize_t pwrite(int fd, const void *buf, size_t n, long long off) {
+  if (_lseeki64(fd, off, SEEK_SET) < 0)
+    return -1;
+  return _write(fd, buf, (unsigned int)n);
+}
+#else
+#include <unistd.h>
+#endif
+
 // Large zero-filled memory that only becomes resident where it is touched
 // (platform.cpp). zeroed_reset() makes all of it zero again, at the same
 // address, without touching it.

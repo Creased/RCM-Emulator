@@ -138,6 +138,7 @@ void reset_to_defaults(EmuState *s) {
     X(usb_pd_inserted,     "usb_pd",  "inserted",        0)                  \
     X(usb_pd_voltage_mv,   "usb_pd",  "voltage_mv",      0)                  \
     X(usb_pd_amperage_ma,  "usb_pd",  "amperage_ma",     0)                  \
+    X(usb_host,            "usb",     "host",            0)                  \
     /* SoC / PMIC */                                                         \
     X(pmic_otp,            "soc",     "pmic_otp",        0)                  \
     X(is_mariko,           "soc",     "is_mariko",       0)                  \
@@ -643,6 +644,15 @@ void build_ui(EmuState *state) {
         }
         atomic_slider_int<uint16_t>("PDO voltage (mV)",  state->usb_pd_voltage_mv,  5000, 20000, "%d mV");
         atomic_slider_int<uint16_t>("PDO amperage (mA)", state->usb_pd_amperage_ma,  500,  3000, "%d mA");
+    }
+
+    if (ImGui::CollapsingHeader("USB device mode")) {
+        // The PC in t210/usb.cpp: it enumerates a gadget the payload brings up.
+        bool host = state->usb_host.load();
+        if (ImGui::Checkbox("PC on the USB-C port (--usb-host)", &host)) {
+            state->usb_host.store(host);
+        }
+        ImGui::TextDisabled("Mass storage is read back and ejected; HID is polled.");
     }
 
     if (ImGui::CollapsingHeader("Display")) {

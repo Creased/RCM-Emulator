@@ -193,6 +193,16 @@ constexpr uint64_t SE_SIZE = 0x2000;
 constexpr uint64_t MSELECT_BASE = 0x50060000;
 constexpr uint64_t MSELECT_SIZE = 0x1000;
 
+// USB2 controller USB1 ("OTG"): the device controller bdk's usbd.c drives on
+// Erista. Registers, the UTMI PHY at +0x400/+0x800, queue heads at +0x1000.
+constexpr uint64_t USB_OTG_BASE = 0x7D000000;
+constexpr uint64_t USB_OTG_SIZE = 0x4000;
+
+// XUSB device controller: bdk's xusbd.c on Mariko. XHCI registers, then its
+// PCI configuration space at +0x8000 and device registers at +0x9000.
+constexpr uint64_t XUSB_DEV_BASE = 0x700D0000;
+constexpr uint64_t XUSB_DEV_SIZE = 0xA000;
+
 // XUSB pad controller. Owns the UPHY SERDES lanes shared by PCIe (pcie-0..4)
 // and USB 3.0 SuperSpeed (pcie-5/6 on this board), plus UPHY PLL P0.
 constexpr uint64_t XUSB_PADCTL_BASE = 0x7009F000;

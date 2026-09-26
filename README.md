@@ -30,8 +30,12 @@ slow or destructive.
   `--auto-te-script`, so a payload flow can be exercised from a CI run or a
   one-shot script. `--input-script` scripts buttons and touchscreen taps for
   any payload.
+- Plug an emulated PC into the USB-C port (`--usb-host`): Nyx's USB mass
+  storage and gamepad gadgets enumerate on both the Erista (USB2) and Mariko
+  (XUSB) device controllers, and the PC reads a mass storage disk back,
+  checks it against the SD image and ejects it.
 - Tweak emulated hardware live (battery, charger, thermal, USB-PD, PMIC,
-  fuses, SD insertion) from a side window. See [Live hardware tweaks](#live-hardware-tweaks).
+  fuses, SD insertion, the USB host) from a side window. See [Live hardware tweaks](#live-hardware-tweaks).
 - Inspect each Tegra UART port (TX history) and inject keystrokes into the
   payload's RX FIFO from a separate console window. See [UART console](#uart-console).
 - Read real eMMC (embedded MMC) dumps (`BOOT0`, multi-part `rawnand.bin.NN`)
@@ -177,15 +181,20 @@ real consoles. Details in [DESIGN.md](DESIGN.md#ccplex-cpu0).
 ## Tests
 
 ```bash
-make test                                   # CCPLEX, SE + display regression payloads (arm-none-eabi-gcc, python3)
+make test                                   # CCPLEX, SE, USB + display regression payloads (arm-none-eabi-gcc, python3)
 tests/hwtest/build.sh build-hwtest          # build hwtest-rcm (+ gcc-aarch64-linux-gnu)
 tests/hwtest/run.sh ./rcm_emu build-hwtest/hwtest-rcm/build/hwtest.bin
 ```
 
-The first boots CPU0 from a small self-contained payload and checks the
-refusal of an unpowered release, the EL3 entry, the mailbox, WFE parking and
-the reset. The second runs hwtest-rcm's whole hardware sweep headless and
-checks that the CPU0-driven Wi-Fi probe enumerates the endpoint. CI runs both.
+`make test` runs small self-contained payloads: one boots CPU0 and checks the
+refusal of an unpowered release, the EL3 entry, the mailbox, a stopped clock,
+WFE parking and the reset; one checks the Security Engine's RSA, SHA-256, AES
+and RNG against vectors computed in Python; one brings up a USB mass storage
+gadget on each device controller (and a HID gadget) for the `--usb-host` PC to
+enumerate and read back; one drives the display controller and VIC and
+compares the frame pixel for pixel. The hwtest scripts run hwtest-rcm's whole
+hardware sweep headless and check that the CPU0-driven Wi-Fi probe enumerates
+the endpoint. CI runs both.
 
 ## Live hardware tweaks
 
@@ -279,6 +288,7 @@ needed.
 | `--oem`               | `erista` \| `mariko` | Switch SoC generation. Drives `APB_MISC_GP_HIDREV` so Hekate's `h_cfg.t210b01` matches and pkg1 identification skips the right OEM header. Default `erista`. |
 | `--bt-radio`          | `healthy` \| `faulty` \| `absent` | Broadcom CYW4356 behaviour on UART-D. `healthy` powers up on the `BT_REG_ON` edge, holds `BT_HOST_WAKE` high, asserts `RTS_N` and answers HCI; `faulty` reproduces the 2110-1118 console (module fitted, never leaves POR); `absent` additionally leaves `BT_UART_RXD` in a break condition. Overrides `[bluetooth] radio` in the ini. Default `healthy`. |
 | `--wifi-radio`        | `healthy` \| `faulty` \| `absent` | The WLAN half of the same CYW4356: a PCI Express endpoint on root port 1, reachable only from CPU0 (the BPMP reads all ones, as on silicon). `healthy` trains the link, enumerates as `14E4:43EC` and answers a ChipCommon ChipID read with `0x4356`; `faulty` still trains and enumerates but reads all ones on the backplane (live PCIe front-end, dead radio die); `absent` never leaves detect. The model also enforces the datasheet's power-up ordering, so a payload that releases PERST# too early gets a link that stays down and a `[pcie]` line naming the reason. Overrides `[wifi] radio` in the ini. Default `healthy`. |
+| `--usb-host`          | (none)        | A PC on the USB-C port. It enumerates whatever USB gadget the payload brings up; a mass storage disk is read back (checked against the SD image), then ejected, and HID reports are polled. Logged as `[usb-host]`; `RCM_USB_TRACE=1` traces every transfer. Overrides `[usb] host` in the ini. |
 | `--input-script`      | file or spec  | Scripted input keyed to emulated time: `<ms> P\|U\|D [hold_ms]` presses POWER / VOL+ / VOL-, `<ms> TAP <x> <y> [hold_ms]` taps the touchscreen at (x, y) in the 1280x720 picture, `+N` times an event N ms after the previous one. Events are separated by `,`, `;` or newlines. |
 | `--auto-pin-recovery` | (none)        | Drive the Lockpick PIN-recovery menu without user input.  |
 | `--auto-te-script`    | (none)        | Drive `recover_pin.te` in TegraExplorer without input.    |
@@ -291,13 +301,14 @@ flowchart LR
     root --> top["main.cpp<br/>emu_state.h<br/>Makefile<br/>Dockerfile<br/>README.md / DESIGN.md"]
     root --> t210["t210/<br/>(SoC peripheral models)"]
     root --> display["display/"]
-    root --> tests["tests/<br/>ccplex/, se/, display/, hwtest/"]
+    root --> tests["tests/<br/>ccplex/, se/, usb/, display/, hwtest/"]
 
     t210 --> mmio["mmio.{h,cpp}<br/>memory_map.h<br/>regcache.h, tegra_bl.h"]
     t210 --> cpus["bpmp.{h,cpp} BPMP clock<br/>ccplex.{h,cpp} CPU0 (A57)"]
     t210 --> pcie["pcie.{h,cpp}<br/>root complex + CYW4356"]
     t210 --> se["se_engine.{h,cpp}<br/>AES-128, SHA-256, RSA, RNG"]
     t210 --> i2c["i2c3.{h,cpp}<br/>STMFTS / FTS4 touch"]
+    t210 --> usb["usb.{h,cpp}<br/>USB device controllers + host PC"]
 
     display --> sdl["sdl_display.{h,cpp}<br/>DC window scan-out<br/>+ SDL2"]
 ```
@@ -321,6 +332,9 @@ For implementation details, see [DESIGN.md](DESIGN.md).
   seed, so runs repeat.
 - **Single-threaded.** Both cores run in batches on the main thread between
   SDL event polls. That is also what keeps them deterministic.
+- **The USB host is scripted.** `--usb-host` runs a fixed session - enumerate,
+  read back, eject - rather than bridging the gadget to the machine running
+  the emulator, so the disk cannot be mounted on it.
 
 ## Acknowledgements
 

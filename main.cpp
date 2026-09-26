@@ -356,6 +356,11 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "[emu] Unknown --bt-radio value '%s'; expected"
                                 " 'healthy', 'faulty' or 'absent'\n", mode);
             }
+        } else if (strcmp(argv[i], "--usb-host") == 0) {
+            // A PC on the USB-C port: it enumerates whatever gadget the
+            // payload brings up and, for mass storage, reads it back.
+            state.usb_host = true;
+            printf("[emu] USB host connected [overrides ini]\n");
         } else if (strcmp(argv[i], "--wifi-radio") == 0 && i + 1 < argc) {
             // WLAN half of the same package, on PCIe. 'faulty' means
             // something different here from the Bluetooth side: the link

@@ -10,6 +10,7 @@ last_fb.rgba
 last_fb.meta
 last_fb*.png
 out.log
+out_*.log
 out*.txt
 emu_run*.log
 emu_capture*.txt

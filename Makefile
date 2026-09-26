@@ -102,6 +102,12 @@ tests/se/payload.bin: tests/se/payload.c tests/se/vectors.h tests/se/link.ld
 	$(TEST_CC) $(TEST_CFLAGS) -T tests/se/link.ld -o tests/se/payload.elf $<
 	$(TEST_OBJCOPY) -O binary tests/se/payload.elf $@
 
+USB_PAYLOADS = tests/usb/payload_1.bin tests/usb/payload_2.bin tests/usb/payload_3.bin
+
+tests/usb/payload_%.bin: tests/usb/payload.c tests/usb/link.ld
+	$(TEST_CC) $(TEST_CFLAGS) -DSCENARIO=$* -T tests/usb/link.ld -o tests/usb/payload_$*.elf $<
+	$(TEST_OBJCOPY) -O binary tests/usb/payload_$*.elf $@
+
 DISPLAY_SCENARIOS = 1 2 3 4 5 6
 DISPLAY_PAYLOADS  = $(DISPLAY_SCENARIOS:%=tests/display/payload_%.bin)
 
@@ -109,14 +115,16 @@ tests/display/payload_%.bin: tests/display/payload.c tests/display/link.ld
 	$(TEST_CC) $(TEST_CFLAGS) -DSCENARIO=$* -T tests/display/link.ld -o tests/display/payload_$*.elf $<
 	$(TEST_OBJCOPY) -O binary tests/display/payload_$*.elf $@
 
-test: $(OUTPUT) tests/ccplex/payload.bin tests/se/payload.bin $(DISPLAY_PAYLOADS)
+test: $(OUTPUT) tests/ccplex/payload.bin tests/se/payload.bin $(USB_PAYLOADS) $(DISPLAY_PAYLOADS)
 	sh tests/ccplex/run.sh ./$(OUTPUT) tests/ccplex/payload.bin
 	sh tests/se/run.sh ./$(OUTPUT) tests/se/payload.bin
+	sh tests/usb/run.sh ./$(OUTPUT) tests/usb
 	sh tests/display/run.sh ./$(OUTPUT) tests/display
 
 clean:
 	rm -f $(OUTPUT) $(OBJS) $(OBJS:.o=.d) \
 	      tests/ccplex/payload.elf tests/ccplex/payload.bin tests/ccplex/out.log \
 	      tests/se/payload.elf tests/se/payload.bin tests/se/out.log \
+	      tests/usb/payload_*.elf tests/usb/payload_*.bin tests/usb/out_*.log \
 	      tests/display/payload_*.elf tests/display/payload_*.bin \
 	      $(WIN_OUT) $(WIN_OBJS) $(WIN_OBJS:.o=.d)

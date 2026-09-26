@@ -8,6 +8,7 @@
 #include "bpmp.h"
 #include "ccplex.h"
 #include "pcie.h"
+#include "usb.h"
 #include "regcache.h"
 #include "se_engine.h"
 #include "tegra_bl.h"
@@ -23,26 +24,6 @@
 #include <unistd.h>
 #include <vector>
 #include <SDL2/SDL.h>
-
-// pread/pwrite are POSIX and MinGW does not have them, so the SD/eMMC image
-// access below would not compile for Windows. Seek-then-read is equivalent
-// here: the emulated storage is touched only from the CPU thread, so the
-// atomicity real pread() buys against a shared file offset is not in play.
-// Kept next to the includes rather than in a header because these four call
-// sites are the only users in the tree.
-#ifdef _WIN32
-#include <io.h>
-static inline ssize_t pread(int fd, void *buf, size_t n, long long off) {
-  if (_lseeki64(fd, off, SEEK_SET) < 0)
-    return -1;
-  return _read(fd, buf, (unsigned int)n);
-}
-static inline ssize_t pwrite(int fd, const void *buf, size_t n, long long off) {
-  if (_lseeki64(fd, off, SEEK_SET) < 0)
-    return -1;
-  return _write(fd, buf, (unsigned int)n);
-}
-#endif
 
 #define BIT(n) (1U << (n))
 
@@ -4618,6 +4599,10 @@ uint32_t mmio_bus_read(EmuState *state, uint64_t address, unsigned size) {
   if (address >= XUSB_PADCTL_BASE &&
       address < XUSB_PADCTL_BASE + XUSB_PADCTL_SIZE)
     return padctl_read(state, address);
+  if (address >= USB_OTG_BASE && address < USB_OTG_BASE + USB_OTG_SIZE)
+    return usb2d_read(state, address, size);
+  if (address >= XUSB_DEV_BASE && address < XUSB_DEV_BASE + XUSB_DEV_SIZE)
+    return xusbd_read(state, address, size);
   if (address >= MSELECT_BASE && address < MSELECT_BASE + MSELECT_SIZE)
     return mselect_read(state, address);
   if (address >= VIC_BASE && address < VIC_BASE + VIC_SIZE)
@@ -4777,6 +4762,10 @@ void mmio_bus_write(EmuState *state, uint64_t address, unsigned size,
   } else if (address >= XUSB_PADCTL_BASE &&
              address < XUSB_PADCTL_BASE + XUSB_PADCTL_SIZE) {
     padctl_write(state, address, val);
+  } else if (address >= USB_OTG_BASE && address < USB_OTG_BASE + USB_OTG_SIZE) {
+    usb2d_write(state, address, size, val);
+  } else if (address >= XUSB_DEV_BASE && address < XUSB_DEV_BASE + XUSB_DEV_SIZE) {
+    xusbd_write(state, address, size, val);
   } else if (address >= MSELECT_BASE && address < MSELECT_BASE + MSELECT_SIZE) {
     mselect_write(state, address, val);
   } else if ((address >= SDMMC1_BASE && address < SDMMC1_BASE + 0x200) ||
@@ -4947,6 +4936,8 @@ const struct {
     {SYSCTR0_BASE, SYSCTR0_SIZE},
     {BPMP_CACHE_BASE, BPMP_CACHE_SIZE},
     {XUSB_PADCTL_BASE, XUSB_PADCTL_SIZE},
+    {USB_OTG_BASE, USB_OTG_SIZE},
+    {XUSB_DEV_BASE, XUSB_DEV_SIZE},
     {MSELECT_BASE, MSELECT_SIZE},
     // PCIe. T210 puts the root complex at the BOTTOM of the address map,
     // below every other peripheral.
@@ -5056,6 +5047,7 @@ void mmio_soft_reset(EmuState *state, bool power_cycle) {
   pcie_reset(state);
   se_engine_reset();
   i2c3_reset(state);
+  usb_reset(state);
 
   mmio_regs.clear();
   for (auto &u : uart_ports)
