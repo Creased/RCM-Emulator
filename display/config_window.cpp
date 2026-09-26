@@ -139,6 +139,7 @@ void reset_to_defaults(EmuState *s) {
     X(usb_pd_voltage_mv,   "usb_pd",  "voltage_mv",      0)                  \
     X(usb_pd_amperage_ma,  "usb_pd",  "amperage_ma",     0)                  \
     X(usb_host,            "usb",     "host",            0)                  \
+    X(usb_nbd_port,        "usb",     "nbd_port",        0)                  \
     /* SoC / PMIC */                                                         \
     X(pmic_otp,            "soc",     "pmic_otp",        0)                  \
     X(is_mariko,           "soc",     "is_mariko",       0)                  \
@@ -652,7 +653,18 @@ void build_ui(EmuState *state) {
         if (ImGui::Checkbox("PC on the USB-C port (--usb-host)", &host)) {
             state->usb_host.store(host);
         }
-        ImGui::TextDisabled("Mass storage is read back and ejected; HID is polled.");
+        // Mass storage served over NBD instead (--usb-host nbd[:port]);
+        // takes effect when the next disk is attached.
+        bool nbd = state->usb_nbd_port.load() != 0;
+        if (ImGui::Checkbox("Serve mass storage over NBD", &nbd)) {
+            state->usb_nbd_port.store(nbd ? 10809 : 0);
+        }
+        if (nbd) {
+            atomic_slider_int<uint16_t>("NBD port", state->usb_nbd_port, 1024, 65535, "%d");
+            ImGui::TextDisabled("127.0.0.1 only; the disk is ejected when the client disconnects.");
+        } else {
+            ImGui::TextDisabled("Mass storage is read back, written back unchanged and ejected;\nHID is polled.");
+        }
     }
 
     if (ImGui::CollapsingHeader("Display")) {

@@ -358,9 +358,28 @@ int main(int argc, char *argv[]) {
             }
         } else if (strcmp(argv[i], "--usb-host") == 0) {
             // A PC on the USB-C port: it enumerates whatever gadget the
-            // payload brings up and, for mass storage, reads it back.
+            // payload brings up and, for mass storage, reads it back - or,
+            // given "nbd[:port]", serves the disk over NBD.
             state.usb_host = true;
-            printf("[emu] USB host connected [overrides ini]\n");
+            if (i + 1 < argc && strncmp(argv[i + 1], "nbd", 3) == 0 &&
+                (argv[i + 1][3] == 0 || argv[i + 1][3] == ':')) {
+                const char *arg = argv[++i];
+                unsigned long port = 10809;       // the NBD port
+                char *end = nullptr;
+                if (arg[3] == ':')
+                    port = strtoul(arg + 4, &end, 10);
+                if (port == 0 || port > 65535 || (end && *end)) {
+                    fprintf(stderr, "[emu] Bad --usb-host value '%s'; expected"
+                                    " nbd or nbd:<port>\n", arg);
+                    port = 10809;
+                }
+                state.usb_nbd_port = (uint16_t)port;
+                printf("[emu] USB host connected, serving mass storage over"
+                       " NBD on port %lu [overrides ini]\n", port);
+            } else {
+                state.usb_nbd_port = 0;
+                printf("[emu] USB host connected [overrides ini]\n");
+            }
         } else if (strcmp(argv[i], "--wifi-radio") == 0 && i + 1 < argc) {
             // WLAN half of the same package, on PCIe. 'faulty' means
             // something different here from the Bluetooth side: the link

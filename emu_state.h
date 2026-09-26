@@ -323,6 +323,10 @@ struct EmuState {
     // A PC on the USB-C port (--usb-host): it enumerates whatever gadget the
     // payload brings up (t210/usb.cpp). Off, nothing is on the cable.
     std::atomic<bool>     usb_host{false};
+    // --usb-host nbd[:port]: instead of reading a mass storage disk back and
+    // ejecting it, the host serves it over NBD on 127.0.0.1:port until the
+    // client disconnects. 0: off.
+    std::atomic<uint16_t> usb_nbd_port{0};
 
     // SD card identity (returned for SDMMC1 CMD2 ALL_SEND_CID).
     // Hekate parses these out of the R2 response per bdk/storage/sdmmc.c

@@ -570,21 +570,48 @@ class:
 
 - *Mass storage (Bulk-Only Transport):* `GET_MAX_LUN`, INQUIRY, TEST UNIT
   READY (answering the first unit attention with REQUEST SENSE), READ
-  CAPACITY, READ(10) of the first 64 and the last 8 blocks, each logged with
-  its CRC32 and checked against the SD image when the disk is its size; then
-  PREVENT ALLOW MEDIUM REMOVAL, an eject (START STOP UNIT, LoEj) and TEST
-  UNIT READY every 500 ms until the gadget detaches, as Linux does. It only
-  reads.
+  CAPACITY, MODE SENSE(6) for the write-protect bit (asking for just the
+  4-byte header: bdk stalls bulk IN on a reply shorter than asked), READ(10)
+  of the first 64 and the last 8 blocks, each logged with its CRC32 and
+  checked against the SD image when the disk is its size. Unless the disk is
+  write-protected or the read was wrong, the last 8 blocks are written back
+  as read (WRITE(10), SYNCHRONIZE CACHE) and read again. Then PREVENT ALLOW
+  MEDIUM REMOVAL, an eject (START STOP UNIT, LoEj) and TEST UNIT READY every
+  500 ms until the gadget detaches, as Linux does.
+- *Mass storage over NBD* (`--usb-host nbd[:port]`, `[usb] nbd_port`): after
+  MODE SENSE the host sends PREVENT MEDIUM REMOVAL and serves the disk on
+  127.0.0.1 with `t210/nbd.cpp`, a one-client NBD server (fixed newstyle
+  handshake: `EXPORT_NAME`, `LIST`, `INFO` and `GO`, with the export's size,
+  flags and 512-byte minimum block size; simple replies; READ, WRITE, FLUSH,
+  DISC). It is non-blocking and polled from the host every 100 us of
+  emulated time. A READ or WRITE is split into READ(10)s or WRITE(10)s of up
+  to 64 KiB, a FLUSH is a SYNCHRONIZE CACHE, and misaligned or out-of-range
+  requests are refused with `EINVAL` (writes to a write-protected disk with
+  `EPERM`, and the export is read-only). A quiet client gets a TEST UNIT
+  READY every emulated second, as Windows sends. When the client
+  disconnects the host allows removal and ejects as above.
 - *HID:* the report descriptor, `SET_IDLE` with an idle rate of 0 (report on
   change), then the interrupt IN endpoint is polled. Nyx's gamepad has
   nothing to report without Joy-Cons.
 
 The host advances on every access to either controller - it runs as far as
 the device and the emulated clock allow - so it needs no thread or main-loop
-hook and runs repeat exactly. It logs `[usb-host]` lines; `RCM_USB_TRACE=1`
-also logs each transfer descriptor, TRB and doorbell. Nyx's SD card mass
-storage reads back identical to the image and reports "Disk ejected" on
-both SoCs.
+hook and runs repeat exactly (an NBD session aside: its requests come when
+the client sends them). It logs `[usb-host]` lines; `RCM_USB_TRACE=1` also
+logs each transfer descriptor, TRB and doorbell.
+
+A device transfer that retires before the host has all it asked for ends the
+host's transfer only on a short packet: fewer bytes than a whole number of
+max-size packets (the queue head or endpoint context gives the size), or a
+zero-length packet, which the USB2 controller appends unless the queue head
+disables it (ZLT; bdk disables it on every endpoint) and the XUSB controller
+never adds. Otherwise the host carries on with the device's next transfer:
+bdk sends a READ(10) under 512 KiB as 32 KiB transfers.
+
+Nyx's SD card mass storage reads back identical to the image, takes the
+write check and reports "Disk ejected" on both SoCs. Over NBD, `nbdinfo`
+negotiates, `qemu-img convert` copies the whole 256 MiB disk byte for byte,
+and a `qemu-io` write lands in the SD image.
 
 ### Other peripherals (mostly stubs)
 
@@ -780,10 +807,14 @@ refusal, the EL3 entry, a core released with its clock stopped, the
 mailbox, WFE parking and the reset;
 `tests/se/`, which runs the SE's RSA, SHA-256, AES and RNG against vectors
 computed in Python (`gen_vectors.py` writes `vectors.h`); `tests/usb/`, a
-mass storage gadget over a RAM disk on each device controller and a HID
-gadget, which the `--usb-host` PC must enumerate, read back (the CRC32s it
-logs match the payload's) and see detach, plus a run with nothing on the
-cable; and `tests/display/`, one payload built per scenario that drives the display
+mass storage gadget over a RAM disk on each device controller (writable, and
+write-protected in scenario 4) and a HID gadget, which the `--usb-host` PC
+must enumerate, read back (the CRC32s it logs match the payload's), write
+back unchanged unless write-protected and see detach, plus a run with
+nothing on the cable and three NBD runs where `nbd_check.py` negotiates,
+reads the disk, is refused a misaligned and an out-of-range read, writes
+(or is refused on the write-protected disk), pipelines two reads, flushes
+and disconnects, and the disk's CRC32 after the eject must be the client's; and `tests/display/`, one payload built per scenario that drives the display
 controller and VIC the way bdk does (a pitch window; Nyx's VIC turn into
 pitch and into block-linear surfaces; a block-linear VIC source; the DC's
 own column scan with an address offset; a mirrored window with window D
@@ -811,6 +842,13 @@ don't repeat the diagnosis:
   register caches, so `USBCMD.RESET` never cleared and bdk's
   `usb_device_init()` timed out; Nyx's USB tools could not even wait for a
   cable. Fix: both device controllers are modelled, with a PC to plug in.
+- **NBD reads of 64 KiB failed on Nyx.** The host took a device transfer
+  that moved less than it asked for as a short packet, so when bdk sent a
+  64 KiB READ(10) as two 32 KiB transfers the data phase ended after the
+  first and the CSW read found data. Fix: only a transfer whose last packet
+  is short (or zero-length, including the USB2 controller's own ZLP when the
+  queue head allows it) ends the host's transfer; the test payload now sends
+  reads in 32 KiB transfers too.
 - **Minerva hung Nyx** (hekate 6.5.3 with the stock `bootloader/` folder
   never reached its GUI). The emulator planted hekate's "watchdog fired"
   cookie in IRAM so the IPL would skip Minerva; Nyx then trained the DRAM

@@ -51,8 +51,9 @@ jobs:
         # refused, a powered one must run an AArch64 blob at EL3, and WFE must
         # park the core. One runs the Security Engine's RSA, SHA-256, AES and
         # RNG against vectors computed in Python. One brings up USB gadgets on
-        # both device controllers for the --usb-host PC to enumerate and read
-        # back. The others drive the display controller and VIC in six
+        # both device controllers for the --usb-host PC to enumerate, read
+        # back and write, and serves the disk over NBD (on a localhost port)
+        # to a Python client. The others drive the display controller and VIC in six
         # scenarios, and the frame the emulator shows must match the picture
         # drawn, pixel for pixel.
         run: make test

@@ -2,7 +2,7 @@
  * USB device mode regression payload.
  *
  * A freestanding BPMP payload that brings up a small USB mass storage gadget
- * - one LUN, a 128-block RAM disk - on one of the two device controllers,
+ * - one LUN, a 384-block RAM disk - on one of the two device controllers,
  * with the register sequences bdk's drivers use, and serves whatever the
  * emulator's --usb-host PC asks. Built once per scenario with -DSCENARIO=n:
  *
@@ -12,14 +12,16 @@
  *      transfer rings and endpoint contexts in IRAM
  *   3  the USB2 controller again, as a HID gadget: after the report
  *      descriptor and SET_IDLE it sends three interrupt IN reports
+ *   4  scenario 1 with the disk write-protected
  *
  * Either way the gadget answers the standard requests and GET_MAX_LUN, then
  * the Bulk-Only Transport: INQUIRY, TEST UNIT READY, REQUEST SENSE, READ
- * CAPACITY, READ(10), PREVENT ALLOW MEDIUM REMOVAL and START STOP UNIT. When
- * the host ejects, it stops the controller and powers off. It prints the
- * CRC32 of the disk ranges the host reads, which tests/usb/run.sh compares
- * with what the host logs. Run without --usb-host, scenario 1 sees no bus
- * reset and says so.
+ * CAPACITY, MODE SENSE(6), READ(10), WRITE(10), SYNCHRONIZE CACHE, PREVENT
+ * ALLOW MEDIUM REMOVAL and START STOP UNIT. When the host ejects, it stops
+ * the controller and powers off. It prints the CRC32 of the disk ranges the
+ * host reads, and of the whole disk after the eject, which tests/usb/run.sh
+ * compares with what the host logs and what its NBD client wrote. Run without
+ * --usb-host, scenario 1 sees no bus reset and says so.
  */
 
 #ifndef SCENARIO
@@ -37,10 +39,12 @@ typedef unsigned char u8;
 #define UARTB_THR 0x70006040u
 #define I2C5      0x7000D000u
 
-#define DISK       0xC0000000u /* 128 blocks of 512 bytes */
-#define DISK_LBAS  128u
+#define DISK       0xC0000000u /* 384 blocks of 512 bytes */
+#define DISK_LBAS  384u
 #define EP0BUF     0xC0110000u
 #define CMDBUF     0xC0111000u /* CBW / CSW / small replies */
+#define SCRATCH    0xC0120000u /* a rejected WRITE's data */
+#define READ_ONLY  (SCENARIO == 4)
 
 static void putc_(char c) { REG(UARTB_THR) = (u32)(unsigned char)c; }
 
@@ -53,6 +57,19 @@ static void puthex(u32 v) {
     for (int i = 28; i >= 0; i -= 4)
         putc_("0123456789ABCDEF"[(v >> i) & 0xF]);
 }
+
+#if SCENARIO != 3
+static void putdec(u32 v) {
+    char b[10];
+    int n = 0;
+    do {
+        b[n++] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v);
+    while (n)
+        putc_(b[--n]);
+}
+#endif
 
 static void i2c5_write(u32 dev, u32 reg, u32 val) {
     REG(I2C5 + 0x04) = dev << 1;
@@ -250,7 +267,7 @@ static void configure(void) {
     for (u32 i = 2; i < 4; i++) {
         for (u32 w = 0; w < 16; w++)
             REG(QH(i) + 4 * w) = 0;
-        REG(QH(i)) = 512u << 16;
+        REG(QH(i)) = 512u << 16 | 1u << 29;     /* 512, no ZLP, as bdk */
         REG(QH(i) + 8) = 1;
     }
     U(EPCTRL(1)) = 2u << 2 | 1u << 7 | 2u << 18 | 1u << 23; /* bulk RX/TX on */
@@ -311,6 +328,7 @@ static void ring_init(u32 dci, u32 base) {
     u32 ctx = CTX + 64 * dci;
     zero(ctx, 64);
     REG(ctx) = 1;                               /* EP_RUNNING */
+    REG(ctx + 4) = (dci ? 512u : 64u) << 16;    /* max packet size */
     REG(ctx + 8) = base | 1;                    /* dequeue pointer, DCS */
 }
 
@@ -543,16 +561,49 @@ static void bot(void) {
             put_be32(CMDBUF + 0x104, 512);
             sent = bulk(1, CMDBUF + 0x100, 8);
             break;
-        case 0x28: {                            /* READ(10) */
+        case 0x1A:                              /* MODE SENSE(6) */
+            zero(CMDBUF + 0x100, 4);            /* the header, no pages */
+            B(CMDBUF + 0x100) = 3;
+            B(CMDBUF + 0x102) = READ_ONLY ? 0x80 : 0; /* WP */
+            sent = bulk(1, CMDBUF + 0x100, want < 4 ? want : 4);
+            break;
+        case 0x28:                              /* READ(10) */
+        case 0x2A: {                            /* WRITE(10) */
             u32 lba = (u32)B(cdb + 2) << 24 | B(cdb + 3) << 16 | B(cdb + 4) << 8 |
                       B(cdb + 5);
             u32 cnt = B(cdb + 7) << 8 | B(cdb + 8);
-            if (lba + cnt > DISK_LBAS)
+            int bad = lba + cnt > DISK_LBAS || cnt * 512 != want;
+            if (op == 0x28) {
+                /* In 32 KiB transfers, as bdk sends a read: the host has to
+                 * go on to the next one after a full-sized packet. */
+                if (bad)
+                    status = 1;
+                for (u32 off = 0; !bad && off < want; off += 32768) {
+                    u32 n = want - off > 32768 ? 32768 : want - off;
+                    if (bulk(1, DISK + lba * 512 + off, n) != (int)n)
+                        break;
+                    sent += n;
+                }
+                break;
+            }
+            /* The host sends the data whatever happens to it. */
+            if (bad || READ_ONLY) {
+                sent = bulk(0, SCRATCH, want);
                 status = 1;
-            else
-                sent = bulk(1, DISK + lba * 512, cnt * 512);
+                break;
+            }
+            sent = bulk(0, DISK + lba * 512, want);
+            status = sent != want;
+            puts_("usb test: WRITE(10) blocks ");
+            putdec(lba);
+            putc_('-');
+            putdec(lba + cnt - 1);
+            putc_('\n');
             break;
         }
+        case 0x35:                              /* SYNCHRONIZE CACHE(10) */
+            puts_("usb test: SYNCHRONIZE CACHE\n");
+            break;
         case 0x1E:                              /* PREVENT ALLOW MEDIUM REMOVAL */
             break;
         case 0x1B:                              /* START STOP UNIT */
@@ -581,6 +632,8 @@ void _start(void) {
     puthex(crc32(DISK, 64 * 512));
     puts_(" last ");
     puthex(crc32(DISK + (DISK_LBAS - 8) * 512, 8 * 512));
+    puts_(" all ");
+    puthex(crc32(DISK, DISK_LBAS * 512));
     putc_('\n');
 
     init();
@@ -606,7 +659,9 @@ void _start(void) {
     puts_("usb test: hid reports sent\n");
 #else
     bot();
-    puts_("usb test: ejected\n");
+    puts_("usb test: ejected; disk crc32 ");
+    puthex(crc32(DISK, DISK_LBAS * 512));
+    putc_('\n');
 #endif
     stop();
     finish("usb test: done\n");

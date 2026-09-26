@@ -33,7 +33,9 @@ slow or destructive.
 - Plug an emulated PC into the USB-C port (`--usb-host`): Nyx's USB mass
   storage and gamepad gadgets enumerate on both the Erista (USB2) and Mariko
   (XUSB) device controllers, and the PC reads a mass storage disk back,
-  checks it against the SD image and ejects it.
+  checks it against the SD image, writes a few sectors back unchanged and
+  ejects it. With `--usb-host nbd` the PC serves the disk over NBD instead,
+  so it can be mounted on the machine running the emulator.
 - Tweak emulated hardware live (battery, charger, thermal, USB-PD, PMIC,
   fuses, SD insertion, the USB host) from a side window. See [Live hardware tweaks](#live-hardware-tweaks).
 - Inspect each Tegra UART port (TX history) and inject keystrokes into the
@@ -191,10 +193,38 @@ refusal of an unpowered release, the EL3 entry, the mailbox, a stopped clock,
 WFE parking and the reset; one checks the Security Engine's RSA, SHA-256, AES
 and RNG against vectors computed in Python; one brings up a USB mass storage
 gadget on each device controller (and a HID gadget) for the `--usb-host` PC to
-enumerate and read back; one drives the display controller and VIC and
+enumerate, read back and write, and serves it over NBD to a Python client;
+one drives the display controller and VIC and
 compares the frame pixel for pixel. The hwtest scripts run hwtest-rcm's whole
 hardware sweep headless and check that the CPU0-driven Wi-Fi probe enumerates
 the endpoint. CI runs both.
+
+## Mounting a gadget's disk
+
+`--usb-host nbd` turns the emulated PC into a bridge: when a mass storage
+gadget attaches - Nyx's SD card, eMMC or emuMMC under USB tools - the PC
+locks the medium (PREVENT MEDIUM REMOVAL, so Nyx will not unload it from its
+side) and serves it with the NBD protocol on 127.0.0.1, port 10809 or the one
+given as `nbd:<port>`. Every NBD read, write and flush becomes SCSI
+commands to the gadget, so what reaches the SD image goes through bdk's UMS
+code as it would from a real PC. A write-protected disk (Nyx's eMMC in its
+default read-only mode) is exported read-only.
+
+```sh
+./rcm_emu hekate.bin --sd sd.img --usb-host nbd
+# in Nyx: Tools > USB Tools > SD Card, then on the host:
+sudo modprobe nbd max_part=8
+sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -b 512
+sudo mount /dev/nbd0p1 /mnt        # ... use it ...
+sudo umount /mnt && sudo nbd-client -d /dev/nbd0   # the disk is ejected
+```
+
+Without root, `qemu-img convert nbd://127.0.0.1:10809 copy.img` takes a
+copy, `qemu-io nbd://127.0.0.1:10809` reads and writes sectors, and
+`nbdfuse` exposes the disk as a file. The session ends when the client
+disconnects: the PC allows removal and ejects, and Nyx reports "Disk
+ejected". The port only listens while a disk is being served. In the config
+window, the USB device mode section has the same switch and port.
 
 ## Live hardware tweaks
 
@@ -288,7 +318,7 @@ needed.
 | `--oem`               | `erista` \| `mariko` | Switch SoC generation. Drives `APB_MISC_GP_HIDREV` so Hekate's `h_cfg.t210b01` matches and pkg1 identification skips the right OEM header. Default `erista`. |
 | `--bt-radio`          | `healthy` \| `faulty` \| `absent` | Broadcom CYW4356 behaviour on UART-D. `healthy` powers up on the `BT_REG_ON` edge, holds `BT_HOST_WAKE` high, asserts `RTS_N` and answers HCI; `faulty` reproduces the 2110-1118 console (module fitted, never leaves POR); `absent` additionally leaves `BT_UART_RXD` in a break condition. Overrides `[bluetooth] radio` in the ini. Default `healthy`. |
 | `--wifi-radio`        | `healthy` \| `faulty` \| `absent` | The WLAN half of the same CYW4356: a PCI Express endpoint on root port 1, reachable only from CPU0 (the BPMP reads all ones, as on silicon). `healthy` trains the link, enumerates as `14E4:43EC` and answers a ChipCommon ChipID read with `0x4356`; `faulty` still trains and enumerates but reads all ones on the backplane (live PCIe front-end, dead radio die); `absent` never leaves detect. The model also enforces the datasheet's power-up ordering, so a payload that releases PERST# too early gets a link that stays down and a `[pcie]` line naming the reason. Overrides `[wifi] radio` in the ini. Default `healthy`. |
-| `--usb-host`          | (none)        | A PC on the USB-C port. It enumerates whatever USB gadget the payload brings up; a mass storage disk is read back (checked against the SD image), then ejected, and HID reports are polled. Logged as `[usb-host]`; `RCM_USB_TRACE=1` traces every transfer. Overrides `[usb] host` in the ini. |
+| `--usb-host`          | `nbd[:port]` (optional) | A PC on the USB-C port. It enumerates whatever USB gadget the payload brings up; a mass storage disk is read back (checked against the SD image), its last 8 sectors are written back unchanged and read again unless it is write-protected, and it is ejected; HID reports are polled. With `nbd` the disk is served over NBD on 127.0.0.1 (port 10809 by default) until the client disconnects, then ejected - see [Mounting a gadget's disk](#mounting-a-gadgets-disk). Logged as `[usb-host]`; `RCM_USB_TRACE=1` traces every transfer. Overrides `[usb] host` and `[usb] nbd_port` in the ini. |
 | `--input-script`      | file or spec  | Scripted input keyed to emulated time: `<ms> P\|U\|D [hold_ms]` presses POWER / VOL+ / VOL-, `<ms> TAP <x> <y> [hold_ms]` taps the touchscreen at (x, y) in the 1280x720 picture, `+N` times an event N ms after the previous one. Events are separated by `,`, `;` or newlines. |
 | `--auto-pin-recovery` | (none)        | Drive the Lockpick PIN-recovery menu without user input.  |
 | `--auto-te-script`    | (none)        | Drive `recover_pin.te` in TegraExplorer without input.    |
@@ -332,9 +362,11 @@ For implementation details, see [DESIGN.md](DESIGN.md).
   seed, so runs repeat.
 - **Single-threaded.** Both cores run in batches on the main thread between
   SDL event polls. That is also what keeps them deterministic.
-- **The USB host is scripted.** `--usb-host` runs a fixed session - enumerate,
-  read back, eject - rather than bridging the gadget to the machine running
-  the emulator, so the disk cannot be mounted on it.
+- **The USB host drives mass storage and HID only.** A gadget of another
+  class is enumerated and left configured. Over NBD, one client has the disk
+  per session: when it disconnects - `nbdinfo` and `qemu-img info` do so as
+  soon as they have their answer - the disk is ejected, as a PC ejects a
+  disk it has unmounted.
 
 ## Acknowledgements
 

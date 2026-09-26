@@ -102,7 +102,8 @@ tests/se/payload.bin: tests/se/payload.c tests/se/vectors.h tests/se/link.ld
 	$(TEST_CC) $(TEST_CFLAGS) -T tests/se/link.ld -o tests/se/payload.elf $<
 	$(TEST_OBJCOPY) -O binary tests/se/payload.elf $@
 
-USB_PAYLOADS = tests/usb/payload_1.bin tests/usb/payload_2.bin tests/usb/payload_3.bin
+USB_PAYLOADS = tests/usb/payload_1.bin tests/usb/payload_2.bin tests/usb/payload_3.bin \
+               tests/usb/payload_4.bin
 
 tests/usb/payload_%.bin: tests/usb/payload.c tests/usb/link.ld
 	$(TEST_CC) $(TEST_CFLAGS) -DSCENARIO=$* -T tests/usb/link.ld -o tests/usb/payload_$*.elf $<

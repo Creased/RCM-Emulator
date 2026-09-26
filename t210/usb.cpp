@@ -13,15 +13,25 @@
 // runs the class:
 //
 //   mass storage  GET_MAX_LUN, then over Bulk-Only Transport INQUIRY, TEST
-//                 UNIT READY, READ CAPACITY and two READ(10)s (the first 64
-//                 sectors and the last 8), checked against the SD image when
-//                 the capacity matches it; then it allows medium removal,
-//                 ejects (START STOP UNIT, LoEj) and polls TEST UNIT READY
-//                 until the gadget lets go, as Linux does
+//                 UNIT READY, READ CAPACITY, MODE SENSE (write protection)
+//                 and two READ(10)s (the first 64 sectors and the last 8),
+//                 checked against the SD image when the capacity matches it.
+//                 Unless the disk is write-protected, the last 8 sectors are
+//                 then written back unchanged (WRITE(10), SYNCHRONIZE CACHE)
+//                 and read again. Then it allows medium removal, ejects
+//                 (START STOP UNIT, LoEj) and polls TEST UNIT READY until
+//                 the gadget lets go, as Linux does
 //   HID           the report descriptor, SET_IDLE, then interrupt IN reports
 //
-// Everything is logged as [usb-host]. The host only reads: nothing is ever
-// written to the storage a gadget exports.
+// With --usb-host nbd[:port] (or [usb] nbd_port) the mass storage session
+// instead locks the medium (PREVENT MEDIUM REMOVAL) and serves the disk over
+// NBD on 127.0.0.1 (nbd.cpp), so it can be mounted on this machine: each
+// request becomes READ(10)s, WRITE(10)s or a SYNCHRONIZE CACHE, and a TEST
+// UNIT READY goes out every second the client is quiet, as Windows does.
+// When the client disconnects, the host ejects the disk as above.
+//
+// Everything is logged as [usb-host]. The only data the host writes on its
+// own is what it has just read from the same sectors.
 //
 // The host advances whenever the payload touches the controller - every
 // register access runs it as far as the device and the emulated clock allow
@@ -41,6 +51,7 @@
 #include "../emu_state.h"
 #include "../platform.h"
 #include "memory_map.h"
+#include "nbd.h"
 
 namespace {
 
@@ -106,6 +117,12 @@ constexpr uint64_t kSetAddrUs  = 2000;   // USB 2.0 9.2.6.3: SET_ADDRESS recover
 constexpr uint64_t kBindUs     = 100000;
 constexpr uint64_t kTimeoutUs  = 5000000;
 constexpr uint64_t kEjectPollUs = 500000;
+// Serving NBD: the socket is polled every 100 us of emulated time rather
+// than on every register access, a quiet client gets a TEST UNIT READY every
+// second, and requests go to the device 64 KiB at a time.
+constexpr uint64_t kNbdPollUs  = 100;
+constexpr uint64_t kNbdIdleUs  = 1000000;
+constexpr uint32_t kNbdChunkBlocks = 128;
 
 struct Endpoint {
   uint8_t addr = 0, attr = 0, interval = 0;
@@ -139,8 +156,10 @@ enum class Step {
   Unplugged, WaitAttach, Debounce, WaitReset, Recover,
   GetDevice8, SetAddress, AddrRecovery, GetDevice, GetConfig9, GetConfig,
   GetLangs, GetVendor, GetProduct, GetSerial, SetConfig, Bind,
-  MscMaxLun, MscInquiry, MscTur, MscSense, MscCapacity, MscReadFirst, MscReadLast,
-  MscAllow, MscEject, MscAfterEject, MscEjectWait,
+  MscMaxLun, MscInquiry, MscTur, MscSense, MscCapacity, MscModeSense,
+  MscReadFirst, MscReadLast, MscWrite, MscSync, MscReadBack,
+  NbdPrevent, NbdRead, NbdWrite, NbdFlush, NbdTur,
+  MscAllow, MscEject, MscAfterEject, MscEjectWait, NbdServe,
   HidReport, HidIdle, HidPoll,
   Idle, Failed,
 };
@@ -161,6 +180,7 @@ public:
       if (step_ != Step::Unplugged) {
         if (dc_)
           dc_->detach();
+        nbd_.close();
         step_ = Step::Unplugged;
         printf("[usb-host] unplugged\n");
       }
@@ -181,6 +201,7 @@ public:
     if (step_ != Step::WaitAttach && !dc_->attached()) {
       printf("[usb-host] device detached\n");
       dc_->detach();
+      nbd_.close();
       step_ = Step::WaitAttach;
       ctl_.stage = Control::DONE;
       bot_.phase = Bot::DONE;
@@ -199,6 +220,7 @@ public:
     step_ = Step::Unplugged;
     ctl_ = Control();
     bot_ = Bot();
+    nbd_.close();
   }
 
 private:
@@ -222,7 +244,21 @@ private:
   uint32_t tag_ = 0, blocks_ = 0, block_len_ = 0;
   int tur_tries_ = 0;
   uint64_t eject_deadline_ = 0;
+  bool wp_ = false;                // MODE SENSE said write-protected
+  std::vector<uint8_t> last_;      // the last 8 sectors, as read
   int reports_ = 0;
+
+  // Serving NBD: the request in hand, how many of its blocks have been
+  // moved, and what a READ has gathered.
+  NbdServer nbd_;
+  NbdRequest req_;
+  uint32_t req_done_ = 0;
+  std::vector<uint8_t> req_data_;
+  uint64_t last_cmd_us_ = 0, last_poll_us_ = 0;
+  uint64_t nbd_reads_ = 0, nbd_writes_ = 0, nbd_read_bytes_ = 0,
+           nbd_write_bytes_ = 0;
+
+  static uint16_t nbd_port() { return g_state ? g_state->usb_nbd_port.load() : 0; }
 
   void go(Step s) {
     step_ = s;
@@ -231,6 +267,7 @@ private:
 
   void fail(const char *what) {
     printf("[usb-host] %s - giving up on this device\n", what);
+    nbd_.close();
     go(Step::Failed);
   }
 
@@ -465,6 +502,8 @@ private:
 
   // ---- Mass storage checks ----
 
+  static constexpr const char *kDiffers = "DIFFERS from the SD image";
+
   // Compare what was read with the SD image, when the disk is the size of it.
   const char *compare_sd(uint32_t lba, const std::vector<uint8_t> &got) {
     if (!g_state || g_state->sd_fd < 0)
@@ -478,7 +517,7 @@ private:
       return "SD image unreadable";
     return memcmp(want.data(), got.data(), got.size()) == 0
                ? "matches the SD image"
-               : "DIFFERS from the SD image";
+               : kDiffers;
   }
 
   static uint32_t crc32(const std::vector<uint8_t> &d) {
@@ -500,6 +539,28 @@ private:
                        (uint8_t)(lba >> 8), (uint8_t)lba, 0,
                        (uint8_t)(count >> 8), (uint8_t)count, 0};
     bot(cdb, 10, true, (uint32_t)count * block_len_);
+  }
+
+  void write10(uint32_t lba, uint16_t count, const uint8_t *src) {
+    uint8_t cdb[10] = {0x2A, 0, (uint8_t)(lba >> 24), (uint8_t)(lba >> 16),
+                       (uint8_t)(lba >> 8), (uint8_t)lba, 0,
+                       (uint8_t)(count >> 8), (uint8_t)count, 0};
+    bot(cdb, 10, false, (uint32_t)count * block_len_);
+    memcpy(bot_.data.data(), src, bot_.data.size());
+  }
+
+  void synchronize_cache() {
+    uint8_t cdb[10] = {0x35};
+    bot(cdb, 10, false, 0);
+  }
+
+  bool bot_good() const { return !bot_.stalled && bot_status() == 0; }
+
+  // Done with the disk: allow medium removal, then eject.
+  void release_disk() {
+    uint8_t cdb[6] = {0x1E, 0, 0, 0, 0, 0};     // PREVENT ALLOW: allow
+    bot(cdb, 6, false, 0);
+    go(Step::MscAllow);
   }
 
   // A BOT command finished: false (and the session failed) if it did not end
@@ -585,6 +646,10 @@ private:
       finish();                                 // polls the endpoint itself
       return;
 
+    case Step::NbdServe:
+      serve();
+      return;
+
     default:
       break;
     }
@@ -598,6 +663,72 @@ private:
       return;
     }
     finish();
+  }
+
+  // ---- Serving NBD ----
+
+  void serve_next() {
+    last_cmd_us_ = now_us();
+    last_poll_us_ = 0;                          // a pipelined request is next
+    go(Step::NbdServe);
+  }
+
+  // The next piece of an NBD READ or WRITE.
+  void next_chunk() {
+    uint32_t lba = (uint32_t)(req_.offset / block_len_) + req_done_;
+    uint16_t count = (uint16_t)std::min<uint32_t>(
+        req_.len / block_len_ - req_done_, kNbdChunkBlocks);
+    if (req_.type == NBD_CMD_READ) {
+      read10(lba, count);
+      return go(Step::NbdRead);
+    }
+    write10(lba, count, req_.data.data() + (size_t)req_done_ * block_len_);
+    go(Step::NbdWrite);
+  }
+
+  void serve() {
+    if (now_us() - last_poll_us_ < kNbdPollUs)
+      return;
+    last_poll_us_ = now_us();
+    switch (nbd_.poll(&req_)) {
+    case NbdEvent::None:
+      if (now_us() - last_cmd_us_ >= kNbdIdleUs) {
+        uint8_t cdb[6] = {0x00, 0, 0, 0, 0, 0}; // TEST UNIT READY
+        bot(cdb, 6, false, 0);
+        go(Step::NbdTur);
+      }
+      return;
+    case NbdEvent::Closed:
+      nbd_.close();
+      printf("[usb-host] NBD: %llu reads (%llu KiB), %llu writes (%llu KiB); "
+             "ejecting the disk\n",
+             (unsigned long long)nbd_reads_,
+             (unsigned long long)(nbd_read_bytes_ >> 10),
+             (unsigned long long)nbd_writes_,
+             (unsigned long long)(nbd_write_bytes_ >> 10));
+      return release_disk();
+    case NbdEvent::Request:
+      break;
+    }
+    uint64_t size = ((uint64_t)blocks_ + 1) * block_len_;
+    bool rw = req_.type == NBD_CMD_READ || req_.type == NBD_CMD_WRITE;
+    uint32_t err = 0;
+    if (req_.type == NBD_CMD_FLUSH) {
+      synchronize_cache();
+      return go(Step::NbdFlush);
+    }
+    if (!rw || req_.offset % block_len_ || req_.len % block_len_ ||
+        req_.offset > size || req_.len > size - req_.offset)
+      err = NBD_EINVAL;                         // whole sectors, on the disk
+    else if (req_.type == NBD_CMD_WRITE && wp_)
+      err = NBD_EPERM;
+    if (err || !req_.len) {
+      nbd_.reply(req_.handle, err);
+      return serve_next();
+    }
+    req_done_ = 0;
+    req_data_.clear();
+    next_chunk();
   }
 
   // The class driver binds: its first request.
@@ -760,10 +891,32 @@ private:
       blocks_ = be32(&bot_.data[0]);
       block_len_ = be32(&bot_.data[4]);
       uint64_t bytes = ((uint64_t)blocks_ + 1) * block_len_;
-      printf("[usb-host] %u blocks of %u bytes (%llu MiB)\n", blocks_ + 1,
-             block_len_, (unsigned long long)(bytes >> 20));
+      bool mib = bytes >= (1u << 20);
+      printf("[usb-host] %u blocks of %u bytes (%llu %s)\n", blocks_ + 1,
+             block_len_, (unsigned long long)(bytes >> (mib ? 20 : 10)),
+             mib ? "MiB" : "KiB");
       if (block_len_ != 512 || blocks_ < 72)
         return fail("unexpected capacity");
+      // Just the 4-byte header: bdk stalls bulk IN on a reply shorter than
+      // the host asked for.
+      uint8_t cdb[6] = {0x1A, 0, 0x3F, 0, 4, 0};  // MODE SENSE(6), all pages
+      bot(cdb, 6, true, 4);
+      return go(Step::MscModeSense);
+    }
+
+    case Step::MscModeSense: {
+      // Bit 7 of byte 2 of the header: write-protected. A device that
+      // cannot say is taken to be.
+      bool ok = bot_good() && bot_.data.size() >= 4;
+      wp_ = !ok || (bot_.data[2] & 0x80);
+      printf("[usb-host] %s\n", !ok ? "MODE SENSE failed; taking the disk as "
+                                      "write-protected"
+                               : wp_ ? "write-protected" : "writable");
+      if (nbd_port()) {
+        uint8_t cdb[6] = {0x1E, 0, 0, 0, 1, 0};  // PREVENT ALLOW: prevent
+        bot(cdb, 6, false, 0);
+        return go(Step::NbdPrevent);
+      }
       read10(0, 64);
       return go(Step::MscReadFirst);
     }
@@ -779,12 +932,96 @@ private:
     case Step::MscReadLast: {
       if (!bot_ok("READ(10)"))
         return;
+      const char *cmp = compare_sd(blocks_ - 7, bot_.data);
       printf("[usb-host] read blocks %u-%u (crc32 %08X): %s\n", blocks_ - 7,
-             blocks_, crc32(bot_.data), compare_sd(blocks_ - 7, bot_.data));
-      uint8_t cdb[6] = {0x1E, 0, 0, 0, 0, 0};   // PREVENT ALLOW: allow
-      bot(cdb, 6, false, 0);
-      return go(Step::MscAllow);
+             blocks_, crc32(bot_.data), cmp);
+      // The write check puts back exactly what was read, so only data that
+      // is known good - or cannot be checked - is written.
+      if (wp_ || cmp == kDiffers) {
+        printf("[usb-host] write check skipped: %s\n",
+               wp_ ? "the disk is write-protected" : "the read was wrong");
+        return release_disk();
+      }
+      last_ = bot_.data;
+      write10(blocks_ - 7, 8, last_.data());
+      return go(Step::MscWrite);
     }
+
+    case Step::MscWrite:
+      if (!bot_ok("WRITE(10)"))
+        return;
+      synchronize_cache();
+      return go(Step::MscSync);
+
+    case Step::MscSync:
+      if (!bot_ok("SYNCHRONIZE CACHE"))
+        return;
+      read10(blocks_ - 7, 8);
+      return go(Step::MscReadBack);
+
+    case Step::MscReadBack:
+      if (!bot_ok("READ(10)"))
+        return;
+      printf("[usb-host] wrote blocks %u-%u back unchanged; read back: %s, "
+             "%s\n", blocks_ - 7, blocks_,
+             bot_.data == last_ ? "the same data" : "DIFFERENT data",
+             compare_sd(blocks_ - 7, bot_.data));
+      return release_disk();
+
+    // ---- Serving NBD ----
+
+    case Step::NbdPrevent: {
+      if (!bot_ok("PREVENT ALLOW MEDIUM REMOVAL"))
+        return;
+      uint16_t port = nbd_port();
+      if (!nbd_.listen(port, ((uint64_t)blocks_ + 1) * block_len_, wp_)) {
+        printf("[usb-host] not serving the disk\n");
+        return release_disk();
+      }
+      printf("[usb-host] serving the disk over NBD at 127.0.0.1:%u%s (e.g. "
+             "nbd-client 127.0.0.1 %u /dev/nbd0); it is ejected when the "
+             "client disconnects\n",
+             port, wp_ ? ", read-only" : "", port);
+      fflush(stdout);                           // a script may be waiting on it
+      nbd_reads_ = nbd_writes_ = nbd_read_bytes_ = nbd_write_bytes_ = 0;
+      return serve_next();
+    }
+
+    case Step::NbdRead:
+    case Step::NbdWrite: {
+      bool read = step_ == Step::NbdRead;
+      uint32_t count = bot_.len / block_len_;
+      if (!bot_good() || (read && bot_.data.size() != bot_.len)) {
+        printf("[usb-host] NBD %s of blocks %llu-%llu failed\n",
+               read ? "read" : "write",
+               (unsigned long long)(req_.offset / block_len_ + req_done_),
+               (unsigned long long)(req_.offset / block_len_ + req_done_ +
+                                    count - 1));
+        nbd_.reply(req_.handle, NBD_EIO);
+        return serve_next();
+      }
+      if (read)
+        req_data_.insert(req_data_.end(), bot_.data.begin(), bot_.data.end());
+      req_done_ += count;
+      if (req_done_ < req_.len / block_len_)
+        return next_chunk();
+      if (read) {
+        nbd_reads_++;
+        nbd_read_bytes_ += req_.len;
+      } else {
+        nbd_writes_++;
+        nbd_write_bytes_ += req_.len;
+      }
+      nbd_.reply(req_.handle, 0, req_data_.data(), read ? req_data_.size() : 0);
+      return serve_next();
+    }
+
+    case Step::NbdFlush:
+      nbd_.reply(req_.handle, bot_good() ? 0 : NBD_EIO);
+      return serve_next();
+
+    case Step::NbdTur:
+      return serve_next();                      // only keeps the gadget company
 
     case Step::MscAllow: {
       if (!bot_ok("PREVENT ALLOW MEDIUM REMOVAL"))
@@ -904,6 +1141,7 @@ constexpr uint32_t EPCTRL_RX_STALL = 1u << 0, EPCTRL_RX_RESET = 1u << 6,
 constexpr uint32_t SUSP_PHY_CLK_VALID = 1u << 7, SUSP_UTMIP_RESET = 1u << 11,
                    SUSP_UTMIP_PHY_ENB = 1u << 12;
 constexpr uint32_t DTD_ACTIVE = 1u << 7, DTD_IOC = 1u << 15;
+constexpr uint32_t QH_MAX_PKT_SHIFT = 16, QH_ZLT_DISABLE = 1u << 29;
 
 class Usb2d : public UsbDc {
 public:
@@ -1013,7 +1251,7 @@ public:
     if (!(reg(R_STATUS) & bit))
       return XFER_NAK;
     int moved = transfer(2 * ep + 1, buf, max, true);
-    *short_pkt = moved < max;
+    *short_pkt = moved < max && ends_transfer(2 * ep + 1, moved);
     return moved;
   }
 
@@ -1040,6 +1278,18 @@ private:
   bool phy_valid() {
     uint32_t s = reg(R_SUSP_CTRL);
     return (s & SUSP_UTMIP_PHY_ENB) && !(s & SUSP_UTMIP_RESET);
+  }
+
+  // A device transfer of n bytes that retired before the host had all it
+  // asked for ends the host's transfer too only if its last packet was
+  // short, or zero-length - which the controller appends to a whole number
+  // of packets unless the queue head disables it (ZLT, as bdk does on every
+  // endpoint). Otherwise the host goes on to the device's next transfer:
+  // bdk sends a 64 KiB READ(10) as two 32 KiB ones.
+  bool ends_transfer(int index, int n) {
+    uint32_t caps = qh_read32(qh_addr(index));
+    uint32_t mps = (caps >> QH_MAX_PKT_SHIFT) & 0x7FF;
+    return n == 0 || !mps || n % mps || !(caps & QH_ZLT_DISABLE);
   }
 
   // Queue heads live wherever ENDPOINTLISTADDR points: bdk uses the
@@ -1296,9 +1546,18 @@ public:
   bool setup_taken() override { return true; }
 
   int in(int ep, uint8_t *buf, int max, bool *short_pkt) override {
-    int n = transfer(ep ? 3 : 0, true, buf, max);
-    if (n >= 0)
-      *short_pkt = n < max;
+    int dci = ep ? 3 : 0;
+    int n = transfer(dci, true, buf, max);
+    if (n >= 0) {
+      // As on the USB2 controller, a TRB that moved less than the host asked
+      // for ends its transfer only on a short or zero-length packet; this
+      // side appends no ZLP of its own. The max packet size is in word 1 of
+      // the endpoint context.
+      uint32_t w1 = 0;
+      mem_read(ctx_addr(dci) + 4, &w1, 4);
+      uint32_t mps = w1 >> 16;
+      *short_pkt = n < max && (n == 0 || !mps || n % mps);
+    }
     return n;
   }
 
