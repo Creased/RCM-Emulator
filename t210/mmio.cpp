@@ -3598,8 +3598,10 @@ void fuse_write(EmuState *state, uint64_t addr, uint32_t val) {
 //   oscillator count, and any other mode register what was last written.
 //
 //   Digital DLL. It locks as soon as it is (re)started: EMC_DIG_DLL_STATUS
-//   reports DLL_LOCK and DLL_PRIV_UPDATED. The DLL code itself (DLL_OUT) is
-//   not modelled and reads 0.
+//   reports DLL_LOCK and DLL_PRIV_UPDATED. Its code, DLL_OUT (10:0), is
+//   where calibration starts, the channel's EMC_DLL_CFG_1
+//   DDLLCAL_CTRL_START_TRIM (10:0, reset 0x20, TRM 18.11.2.219): with no
+//   delay line to drift, calibration has nothing to move it by.
 //
 //   Clock change. A new source or divisor in CAR CLK_SOURCE_EMC starts the
 //   CAR/EMC clock-change handshake: the EMC replays the writes queued in its
@@ -3624,6 +3626,7 @@ static constexpr uint32_t EMC_CCFIFO_ADDR    = 0x3E8;
 static constexpr uint32_t EMC_CCFIFO_DATA    = 0x3EC;
 static constexpr uint32_t EMC_CCFIFO_STATUS  = 0x3F0;
 static constexpr uint32_t EMC_FBIO_CFG7      = 0x584;
+static constexpr uint32_t EMC_DLL_CFG_1      = 0x5E8;
 
 static constexpr uint32_t EMC_INT_CLKCHANGE_COMPLETE = 1u << 4;
 static constexpr uint32_t EMC_INT_MRR_DIVLD          = 1u << 5;
@@ -3747,8 +3750,14 @@ uint32_t emc_read(EmuState *state, uint64_t addr) {
   case EMC_CFG_DIG_DLL:
     // Bits 31, 30, 26, 4 and 1 are write-1 triggers; they read 0.
     return mmio_regs.get(addr) & ~0xC4000012u;
-  case EMC_DIG_DLL_STATUS:
-    return (1u << 17) | (1u << 15);        // DLL_PRIV_UPDATED | DLL_LOCK
+  case EMC_DIG_DLL_STATUS: {
+    // DLL_PRIV_UPDATED | DLL_LOCK, and DLL_OUT at the calibration start.
+    uint32_t cfg1 = mmio_regs.get((ch ? EMC1_BASE : EMC0_BASE) + EMC_DLL_CFG_1,
+                                  0x20);
+    return (1u << 17) | (1u << 15) | (cfg1 & 0x7FF);
+  }
+  case EMC_DLL_CFG_1:
+    return mmio_regs.get(addr, 0x20);
   case EMC_CCFIFO_STATUS:
     return (uint32_t)emc.ccfifo.size();
   case EMC_FBIO_CFG7:

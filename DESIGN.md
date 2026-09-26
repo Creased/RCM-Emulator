@@ -204,7 +204,12 @@ frequency-switching module, depend on:
   400 ps tDQS2DQ. Minerva divides by that count.
 - **Digital DLL.** `EMC_DIG_DLL_STATUS` reports lock as soon as the DLL is
   (re)started; `EMC_CFG_DIG_DLL.CFG_DLL_EN` reads back as written, which is
-  what Minerva spins on around each DLL restart.
+  what Minerva spins on around each DLL restart. The DLL's code, `DLL_OUT`
+  (10:0), is where its calibration starts: the channel's
+  `EMC_DLL_CFG_1.DDLLCAL_CTRL_START_TRIM` (10:0, reset 0x20, TRM
+  18.11.2.219), which the timing table programs per frequency. With no
+  delay line to drift, calibration has nothing to move it by. (Minerva's
+  `_digital_dll_prelock()` returns it; nothing reads it further.)
 - **Clock change.** A new source or divisor in CAR `CLK_SOURCE_EMC` (TRM
   5.2.73) is the CAR/EMC handshake: the EMC replays the writes queued in its
   clock-change FIFO (`EMC_CCFIFO_DATA` / `_ADDR`) and raises
@@ -215,8 +220,6 @@ frequency-switching module, depend on:
   DRAM active and the state machines idle.
 - **Measured clock.** bdk's PTO counter measures the EMC at the modelled
   clock (the measured 204 MHz figure at the boot clock).
-- **Not modelled.** The DLL's delay code (`DLL_OUT`) reads 0: the TRM gives
-  no tap delay to derive it from.
 
 With the stock `bootloader/` folder, hekate's IPL trains 204, 800 and
 1600 MHz, and Nyx then switches between 800 and 1600 MHz on every GUI loop,
