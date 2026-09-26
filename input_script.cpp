@@ -12,6 +12,11 @@
 //             VOL_UP   | VOLUP   | UP   | U
 //   hold_ms   how long to hold the button, default 200 ms.
 //
+//     <when> TAP <x> <y> [hold_ms]
+//
+//   touches the screen at (x, y) in the 1280x720 landscape picture bdk's
+//   touch driver reports (Nyx's coordinates), and lifts after hold_ms.
+//
 // '#' starts a comment. Example - walk 6 entries down a menu and select:
 //
 //     rcm_emu payload.bin --input-script "3000 D, + D, + D, + D, + D, + D, + P"
@@ -27,6 +32,7 @@
 #include "input_script.h"
 #include "emu_state.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -36,7 +42,7 @@
 
 namespace {
 
-enum class Key { Power, VolUp, VolDown, Uart, UartFile };
+enum class Key { Power, VolUp, VolDown, Uart, UartFile, Tap };
 
 struct Event {
   uint64_t at_us = 0;   // press time
@@ -45,6 +51,7 @@ struct Event {
   bool pressed = false;
   bool released = false;
   std::string data;      // UART / UARTFILE payload
+  uint16_t x = 0, y = 0; // TAP: panel-raw coordinates
 };
 
 std::vector<Event> g_events;
@@ -60,6 +67,7 @@ const char *key_name(Key k) {
   case Key::VolUp: return "VOL+";
   case Key::Uart: return "UART";
   case Key::UartFile: return "UARTFILE";
+  case Key::Tap: return "TAP";
   default: return "VOL-";
   }
 }
@@ -80,6 +88,7 @@ bool parse_key(const std::string &tok, Key *out) {
   // UARTFILE pushes a file's raw contents, for binary protocol work.
   if (s == "UART") { *out = Key::Uart; return true; }
   if (s == "UARTFILE") { *out = Key::UartFile; return true; }
+  if (s == "TAP" || s == "T") { *out = Key::Tap; return true; }
   return false;
 }
 
@@ -184,8 +193,24 @@ bool parse_text(const std::string &text) {
       continue;
     }
 
-    uint64_t hold_ms = (tok.size() >= 3) ? strtoull(tok[2].c_str(), nullptr, 10)
-                                         : kDefaultHoldMs;
+    size_t hold_tok = 2;
+    if (ev.key == Key::Tap) {
+      if (tok.size() < 4) {
+        fprintf(stderr, "[input-script] entry %d: expected '<when> TAP <x> <y> [hold_ms]'\n",
+                lineno);
+        return false;
+      }
+      // bdk's touch.c clamps raw samples to 15..1264 and 15..704 and
+      // stretches that span over 1280x720; invert it.
+      uint32_t x = std::min<uint32_t>(strtoul(tok[2].c_str(), nullptr, 10), 1279);
+      uint32_t y = std::min<uint32_t>(strtoul(tok[3].c_str(), nullptr, 10), 719);
+      ev.x = (uint16_t)(15 + (x * (1264 - 15) + 1279) / 1280);
+      ev.y = (uint16_t)(15 + (y * (704 - 15) + 719) / 720);
+      hold_tok = 4;
+    }
+    uint64_t hold_ms = (tok.size() > hold_tok)
+                           ? strtoull(tok[hold_tok].c_str(), nullptr, 10)
+                           : kDefaultHoldMs;
     if (hold_ms == 0) hold_ms = kDefaultHoldMs;
     ev.until_us = ev.at_us + hold_ms * 1000ULL;
     prev_release_us = ev.until_us;
@@ -269,6 +294,30 @@ void input_script_tick(EmuState &state) {
         continue;
       }
       break;
+    }
+
+    if (ev.key == Key::Tap) {
+      if (!ev.pressed && now >= ev.at_us) {
+        state.tc_pressed.store(true);
+        state.touch_post(0x03, ev.x, ev.y);     // FTS4 ENTER
+        ev.pressed = true;
+        printf("[input-script] TAP down panel=(%u,%u) @%llu us (%zu/%zu)\n",
+               ev.x, ev.y, (unsigned long long)now, i + 1, g_events.size());
+        fflush(stdout);
+        break;
+      }
+      if (ev.pressed && !ev.released && now >= ev.until_us) {
+        state.tc_pressed.store(false);
+        state.touch_post(0x04, ev.x, ev.y);     // FTS4 LEAVE
+        ev.released = true;
+        if (i == g_done) {
+          g_done++;
+          if (g_done == g_events.size())
+            printf("[input-script] sequence complete\n");
+        }
+      }
+      if (!ev.released) break;
+      continue;
     }
 
     std::atomic<bool> *btn = (ev.key == Key::Power)   ? &state.btn_power

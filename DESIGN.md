@@ -631,7 +631,11 @@ while (te_idx < n && state.emu_usec >= te_events[te_idx].at_us) {
 
 Because `emu_usec` is deterministic, the same timestamps land at the same UI
 states across runs. Adding a new automated flow is "press the buttons once
-with `[input]` logging on, copy the timestamps".
+with `[input]` logging on, copy the timestamps". `--input-script` does the
+same for any payload without a rebuild (`input_script.cpp`): button presses
+and touchscreen taps (`<ms> TAP <x> <y>`, in the 1280x720 picture, inverted
+through bdk's touch scaling) keyed to `emu_usec`. That is how Nyx's USB tools
+are reached headless.
 
 ## CCPLEX CPU0
 
