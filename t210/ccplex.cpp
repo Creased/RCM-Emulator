@@ -30,6 +30,18 @@
 #define  CLK_V_MSELECT         3
 #define CAR_RST_CPUG_CMPLX_SET 0x450
 #define CAR_RST_CPUG_CMPLX_CLR 0x454
+// RST_CPU_CMPLX_SET (TRM 5.2.113) has RST_CPUG_CMPLX's fields and reset value:
+// it is the active cluster's view, and the Switch runs the G cluster. Its
+// CLR partner at 0x344 is not in the TRM; it pairs the way every SET does.
+#define CAR_RST_CPU_CMPLX_SET  0x340
+#define CAR_RST_CPU_CMPLX_CLR  0x344
+// CLK_CPUG_CMPLX (TRM 5.2.122, reset 0) and its SET/CLR strobes (5.2.154/155):
+// CPUGn_CLK_STP (bits 11:8) stops core n's clock. Like the peripheral banks,
+// all three read back the register.
+#define CAR_CLK_CPUG_CMPLX     0x378
+#define CAR_CLK_CPUG_CMPLX_SET 0x460
+#define CAR_CLK_CPUG_CMPLX_CLR 0x464
+#define  CPU0_CLK_STP          (1u << 8)
 // RST_CPUG_CMPLX (TRM 5.2.152, reset 0x2000feef). CPU0 runs once nCPUPORESET
 // (CPURESET0, bit 0), nCORERESET (CORERESET0, bit 16), nL2RESET (bit 24) and
 // the nonCPU region's reset (NONCPURESET, bit 29) are all released.
@@ -102,6 +114,7 @@ enum class Cpu0 { Off, Running, Hung };
 
 struct Model {
   uint32_t rst_cpug = RST_CPUG_CMPLX_RESET;
+  uint32_t clk_cpug = 0;
   uint32_t clk_enb_v = 0;
   uint32_t cclk_burst = 0;
   uint32_t pllx_base = 0;
@@ -457,11 +470,16 @@ void ccplex_car_write(EmuState *state, uint32_t offset, uint32_t val) {
     }
     break;
   case CAR_RST_CPUG_CMPLX_SET:
+  case CAR_RST_CPU_CMPLX_SET:
     m.rst_cpug |= val;
     if (val & (RST_CPU0_MASK | RST_NONCPU))
       stop_cpu0("held in reset");
     break;
-  case CAR_RST_CPUG_CMPLX_CLR: {
+  case CAR_CLK_CPUG_CMPLX:     m.clk_cpug = val;   break;
+  case CAR_CLK_CPUG_CMPLX_SET: m.clk_cpug |= val;  break;
+  case CAR_CLK_CPUG_CMPLX_CLR: m.clk_cpug &= ~val; break;
+  case CAR_RST_CPUG_CMPLX_CLR:
+  case CAR_RST_CPU_CMPLX_CLR: {
     bool was_held = held();
     m.rst_cpug &= ~val;
     if (was_held && !held() && m.cpu0 == Cpu0::Off)
@@ -480,7 +498,14 @@ bool ccplex_car_read(uint32_t offset, uint32_t *out) {
     return true;
   case CAR_RST_CPUG_CMPLX_SET:
   case CAR_RST_CPUG_CMPLX_CLR:
+  case CAR_RST_CPU_CMPLX_SET:
+  case CAR_RST_CPU_CMPLX_CLR:
     *out = m.rst_cpug;
+    return true;
+  case CAR_CLK_CPUG_CMPLX:
+  case CAR_CLK_CPUG_CMPLX_SET:
+  case CAR_CLK_CPUG_CMPLX_CLR:
+    *out = m.clk_cpug;
     return true;
   default:
     return false;
@@ -544,6 +569,12 @@ void ccplex_run(EmuState *state, uint64_t until_us) {
   uint64_t target = until_us * 1000;
   if (m.ns >= target)
     return;
+  // CPU0's clock stopped: the core keeps its state, time passes, nothing
+  // executes. Clearing CPU0_CLK_STP resumes it where it was.
+  if (m.clk_cpug & CPU0_CLK_STP) {
+    m.ns = target;
+    return;
+  }
 
   // While CPU0 runs, it is the bus master and "now" is its clock: every
   // register model reads state->emu_usec, and must see CPU0's time - a

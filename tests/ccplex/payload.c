@@ -13,6 +13,8 @@
  *      of reset, PLLX, RAM repair, SB_AA64_RESET_LOW - then release it. An
  *      AArch64 blob copied to DRAM records CurrentEL and a TIMERUS delta in
  *      a mailbox, writes a magic word last, and parks in WFE.
+ *      Released first with its clock stopped (CLK_CPUG_CMPLX), it must
+ *      stay still until the stop is cleared.
  *   3. Put CPU0 back into reset and power the console off.
  *
  * Built by `make test` with arm-none-eabi-gcc; no other toolchain needed, as
@@ -139,7 +141,23 @@ void _start(void) {
     while (!(REG(FLOW + 0x40) & 2))
         ;
     REG(CAR + 0x434) = 1u << 3;                  /* RST_DEV_V_CLR: MSELECT */
+
+    /* Released with its clock stopped, CPU0 must not run until the stop is
+     * cleared; the strobes and the active-cluster reset view read back. */
+    REG(CAR + 0x460) = 1u << 8;                  /* CLK_CPUG_CMPLX_SET: CPU0 */
     release_cpu0();
+    udelay(5000);
+    puts_(mb[0] == PCIE_MAGIC ? "clock stopped: CPU0 RAN (wrong)\n"
+                              : "clock stopped: CPU0 held still\n");
+    puts_("clock stop reads ");
+    puthex(REG(CAR + 0x378));                    /* CLK_CPUG_CMPLX */
+    putc_(' ');
+    puthex(REG(CAR + 0x464));                    /* CLK_CPUG_CMPLX_CLR */
+    putc_('\n');
+    puts_(REG(CAR + 0x340) == REG(CAR + 0x450)   /* RST_CPU(G)_CMPLX_SET */
+              ? "reset view: RST_CPU_CMPLX matches RST_CPUG_CMPLX\n"
+              : "reset view: RST_CPU_CMPLX differs\n");
+    REG(CAR + 0x464) = 1u << 8;                  /* CLK_CPUG_CMPLX_CLR */
 
     u32 start = REG(TIMERUS);
     while (mb[0] != PCIE_MAGIC && REG(TIMERUS) - start < 100000)

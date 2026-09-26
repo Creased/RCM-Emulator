@@ -659,6 +659,14 @@ cannot run: <reason>` and the core stays dark, which is what silicon does,
 minus the explanation. Asserting a reset bit, gating a partition or dropping
 the rail stops a running core.
 
+`RST_CPU_CMPLX_SET` (0x340, TRM 5.2.113) carries `RST_CPUG_CMPLX`'s fields and
+reset value: it is the active cluster's view, and the Switch runs the G
+cluster, so it and its CLR partner at 0x344 act on the same reset state.
+`CLK_CPUG_CMPLX` (0x378, TRM 5.2.122) and its SET/CLR strobes (0x460/0x464)
+stop a core's clock with `CPUGn_CLK_STP`; all three read the register back.
+CPU0 with its clock stopped keeps its state and executes nothing while
+emulated time passes, and carries on where it was once the stop is cleared.
+
 **Entry at EL3.** A real A57 leaves reset at EL3, AArch64, MMU off. Unicorn
 builds its ARM64 core at EL1 and cannot be moved: a PSTATE write does not
 rebuild the translator's cached `hflags`, and Unicorn never delivers guest
@@ -703,7 +711,8 @@ final `for(;;) wfe;` would otherwise spin through a billion instructions per
 emulated second.
 
 `make test` runs `tests/ccplex/`, a self-contained payload that checks the
-refusal, the EL3 entry, the mailbox, WFE parking and the reset;
+refusal, the EL3 entry, a core released with its clock stopped, the
+mailbox, WFE parking and the reset;
 `tests/se/`, which runs the SE's RSA, SHA-256, AES and RNG against vectors
 computed in Python (`gen_vectors.py` writes `vectors.h`); and
 `tests/display/`, one payload built per scenario that drives the display
