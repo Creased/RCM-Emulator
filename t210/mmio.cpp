@@ -4189,21 +4189,45 @@ static void i2s_write(EmuState *state, uint64_t addr, uint32_t val) {
 
 // ADMAIF + AXBAR. Two offsets carry behaviour, the rest is write-back:
 //
-//   +0x32C  TX channel 0 FIFO_WRITE - the PIO sample port. Accept and drop.
-//           This MUST be silent: it is written ~224k times per run.
-//   +0x744  TX ACIF FIFO_FULL - the flag the sample loop spins on. Bit 0
-//           must stay clear or hwtest burns 200,001 reads per sample before
-//           giving up, i.e. ~45 billion reads for one melody.
+//   +0x32C  TX channel 0 FIFO_WRITE - the PIO sample port. Silent: it is
+//           written ~224k times per run.
+//   +0x744  TX ACIF FIFO_FULL - the flag the sample loop spins on.
+//
+// The FIFO drains at the frame rate the payload programmed into I2S_TIMING
+// (audio_rate_hz below), on the emulated clock: a frame pushed is gone fs
+// frames per second later, and FIFO_FULL reads set while more than the
+// FIFO's depth is still waiting. That back-pressure is what paces a PIO
+// sample loop on silicon, and a payload that checks it played at the right
+// rate - hwtest's melody test measures its own duration against fs - needs
+// it here too. It used to read never-full, which let a run finish ~30x
+// early and looked, to such a check, like a port that was not clocking.
 //
 // Soft-reset registers read back 0 because the payload polls them until they
 // self-clear (bdk's usual "write 1, wait for 0" handshake).
+static uint32_t audio_rate_hz(void);
+static uint64_t audio_fifo_t0_us = 0;    // emulated time of the take's first frame
+static uint64_t audio_fifo_pushed = 0;   // frames pushed since then
+static const uint64_t AUDIO_FIFO_DEPTH = 64; // frames held before FIFO_FULL
+
+static void audio_fifo_reset(void) {
+  audio_fifo_t0_us = 0;
+  audio_fifo_pushed = 0;
+}
+
+static bool audio_fifo_full(EmuState *state) {
+  if (!audio_fifo_pushed)
+    return false;
+  uint64_t drained = (state->emu_usec - audio_fifo_t0_us) * audio_rate_hz() / 1000000u;
+  return audio_fifo_pushed > drained + AUDIO_FIFO_DEPTH;
+}
+
 static uint32_t admaif_read(EmuState *state, uint64_t addr) {
-  (void)state;
   uint32_t offset = (uint32_t)(addr - ADMAIF_BASE);
   switch (offset) {
   case 0x704:            // global soft reset - completed
-  case 0x744:            // TX ACIF FIFO_FULL - never full, so PIO never spins
     return 0;
+  case 0x744:            // TX ACIF FIFO_FULL, bit 0
+    return audio_fifo_full(state) ? 1u : 0u;
   default:
     return mmio_regs.get(addr);
   }
@@ -4339,12 +4363,22 @@ static void audio_write_wav(void) {
   audio_play_take();          // buffer is complete: safe to play it straight
   audio_pcm.clear();
   audio_pcm_full = false;
+  audio_fifo_reset();
 }
 
 static void admaif_write(EmuState *state, uint64_t addr, uint32_t val) {
-  (void)state;
   uint32_t offset = (uint32_t)(addr - ADMAIF_BASE);
   if (offset == 0x32C) {
+    // A new take starts its drain clock at the first frame; a frame that
+    // arrives after the previous ones have all drained also starts afresh,
+    // so a pause between phrases (codec I2C traffic) is not counted as
+    // backlog the port never had.
+    if (!audio_fifo_pushed ||
+        (state->emu_usec - audio_fifo_t0_us) * audio_rate_hz() / 1000000u >= audio_fifo_pushed)
+      audio_fifo_reset();
+    if (!audio_fifo_pushed)
+      audio_fifo_t0_us = state->emu_usec;
+    audio_fifo_pushed++;
     // One packed word = one stereo frame. Record it rather than dropping it.
     if (audio_pcm.size() / 2 < AUDIO_PCM_MAX_FRAMES) {
       audio_pcm.push_back((int16_t)(val & 0xFFFF));          // left
@@ -5192,6 +5226,7 @@ void mmio_soft_reset(EmuState *state, bool power_cycle) {
   actmon_glb_period = 0;
   audio_pcm.clear();
   audio_pcm_full = false;
+  audio_fifo_reset();
 
   // Storage controllers. The images stay open; the eMMC is back in its user
   // area, as after CMD0.
