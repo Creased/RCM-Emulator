@@ -57,8 +57,16 @@ bool pmc_partition_on(int part);
 void pmc_secure_scratch_write(unsigned n, uint32_t value);
 
 // True when the CCPLEX CPU rail is up: the MAX77621 on Erista (enabled, and
-// its EN pin driven by MAX77620 GPIO5), the MAX77812 M4 phase on Mariko.
+// its EN pin driven by MAX77620 GPIO5), the MAX77812 M4 phase on Mariko -
+// and no fault has taken its output away.
 bool cpu_rail_on(EmuState *state);
+
+// The fault name ("vdd_cpu", or the dead buck's) that keeps the CPU rail
+// down, or nullptr. A dead chip takes its rails with it.
+const char *cpu_rail_fault(EmuState *state);
+
+// A fault was set or cleared while running: tell the models that cache it.
+void faults_changed(EmuState *state);
 
 // Individual peripheral handlers.
 uint32_t timer_read(EmuState *state, uint64_t addr);

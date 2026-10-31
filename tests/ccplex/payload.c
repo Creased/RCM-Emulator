@@ -124,6 +124,11 @@ void _start(void) {
                               : "unpowered: CPU0 stayed dark\n");
     hold_cpu0();
 
+    /* A write to the MAX77812, which the Erista this runs as does not have:
+     * it must land nowhere, and under --fault max77812 must not be reported
+     * as a chip that died. */
+    i2c5_write(0x33, 0x06, 0x00);                /* MAX77812 EN_CTRL */
+
     /* 2. The real bring-up, in ccplex_boot_cpu0() order. */
     i2c5_write(0x3C, 0x40, 0x1C);                /* MAX77620 AME_GPIO: GPIO5 plain */
     i2c5_write(0x3C, 0x3B, 0x09);                /* GPIO5: push-pull, out high */
@@ -138,8 +143,17 @@ void _start(void) {
     pwrgate_on(15);                              /* C0NC */
     pwrgate_on(14);                              /* CE0 */
     REG(FLOW + 0x40) = 1;                        /* RAM_REPAIR_REQ */
-    while (!(REG(FLOW + 0x40) & 2))
-        ;
+    /* bdk spins on STS forever. Bounded here so a run with a dead CPU rail
+     * (the --fault scenarios in run.sh) says where silicon would have hung
+     * and still reaches its power-off. 10 ms is thousands of times what a
+     * powered repair takes. */
+    {
+        u32 t = REG(TIMERUS);
+        while (!(REG(FLOW + 0x40) & 2) && REG(TIMERUS) - t < 10000)
+            ;
+        puts_((REG(FLOW + 0x40) & 2) ? "ram repair: done\n"
+                                     : "ram repair: never completed\n");
+    }
     REG(CAR + 0x434) = 1u << 3;                  /* RST_DEV_V_CLR: MSELECT */
 
     /* Released with its clock stopped, CPU0 must not run until the stop is

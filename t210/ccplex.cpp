@@ -177,10 +177,20 @@ const uint8_t *host_ptr(uint64_t a, uint32_t len) {
 // Everything the core needs to actually execute once released. Returns the
 // first thing missing, or nullptr.
 const char *boot_blocked(EmuState *state) {
-  if (!cpu_rail_on(state))
+  if (!cpu_rail_on(state)) {
+    // A fault first: the registers may well say "on", and the reason has to
+    // name what is actually wrong.
+    if (const char *f = cpu_rail_fault(state)) {
+      if (!strcmp(f, "vdd_cpu"))
+        return "CPU rail has no output (fault: vdd_cpu, buck answers but does not deliver)";
+      if (!strcmp(f, "max77812"))
+        return "CPU rail has no output (fault: max77812 dead)";
+      return "CPU rail has no output (fault: max77621_cpu dead)";
+    }
     return state->pmic_otp.load() == 0x53
                ? "CPU rail off (MAX77812 EN_CTRL.EN_M4 clear)"
                : "CPU rail off (MAX77621 VOUT_EN / MAX77620 GPIO5 EN pin)";
+  }
   if (!pmc_partition_on(POWER_RAIL_CRAIL)) return "CRAIL partition powergated";
   if (!pmc_partition_on(POWER_RAIL_C0NC))  return "C0NC partition powergated";
   if (!pmc_partition_on(POWER_RAIL_CE0))   return "CE0 partition powergated";
@@ -546,7 +556,8 @@ void ccplex_partition_changed(EmuState *state, int part, bool on) {
 
 void ccplex_rail_changed(EmuState *state) {
   if (m.cpu0 != Cpu0::Off && !cpu_rail_on(state))
-    stop_cpu0("CPU rail switched off");
+    stop_cpu0(cpu_rail_fault(state) ? "CPU rail lost its output (fault injected)"
+                                    : "CPU rail switched off");
   else
     maybe_release(state);
 }

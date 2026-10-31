@@ -91,6 +91,88 @@ inline bool wifi_radio_parse(const char *s, uint8_t *out) {
     return false;
 }
 
+// ---- Fault injection ------------------------------------------------------
+//
+// Named hardware faults, set by `[faults]` in rcm_emu.ini, `--fault NAME` on
+// the command line or the config window's Faults section. They are hardware,
+// so a payload reboot keeps them. Two kinds:
+//
+//   chip  The part is dead. It NAKs its I2C address, takes no writes, and
+//         every rail it supplies goes down with it.
+//   rail  The regulator answers, takes its enable and reads back as on, but
+//         its output never comes up: an open inductor, a shorted output cap.
+//         Nothing visible over I2C; only what the rail feeds notices. This is
+//         the hard case, and the one a probe that only reads regulator
+//         registers back cannot catch.
+//
+// Coherence is the rule: a part is listed only once everything it feeds that
+// the emulator models reacts to it. A name with no modelled consequence would
+// let a payload "pass" against a fault that cannot fail it, so it is left out
+// rather than accepted. DESIGN.md "Fault injection" has what each one does.
+//
+// Deliberately absent:
+//   MAX77620   the main PMIC: with it dead nothing would run to test.
+//   ALC5639    the codec: audio leaves the emulator through I2S whether or not
+//              the codec answers, so "dead" would be half-modelled.
+//   GPU / DRAM rails  (MAX77621 0x1C output, MAX77812 M1/M3): no consumer is
+//              modelled. The chips' own death is offered, since all it does
+//              is NAK.
+enum FaultId : uint32_t {
+    FAULT_MAX77621_CPU = 1u << 0,  // Erista CPU buck, I2C5 0x1B; feeds vdd_cpu
+    FAULT_MAX77621_GPU = 1u << 1,  // Erista GPU buck, I2C5 0x1C
+    FAULT_MAX77812     = 1u << 2,  // Mariko CPU/GPU/DRAM buck, I2C5 0x33; feeds vdd_cpu
+    FAULT_BQ24193      = 1u << 3,  // charger, I2C1 0x6B
+    FAULT_MAX17050     = 1u << 4,  // fuel gauge, I2C1 0x36
+    FAULT_TMP451       = 1u << 5,  // thermal sensor, I2C1 0x4C
+    FAULT_BM92T36      = 1u << 6,  // USB-PD controller, I2C1 0x18
+    FAULT_VDD_CPU      = 1u << 7,  // the CPU rail's output, whichever buck drives it
+};
+
+struct FaultDef {
+    uint32_t    id;
+    const char *name;   // ini key and --fault value
+    const char *kind;   // "chip" or "rail"
+    const char *what;   // one line, for --fault list and the config window
+};
+
+inline const FaultDef kFaults[] = {
+    {FAULT_MAX77621_CPU, "max77621_cpu", "chip",
+     "Erista CPU buck (I2C5 0x1B): NAKs; vdd_cpu dead with it"},
+    {FAULT_MAX77621_GPU, "max77621_gpu", "chip",
+     "Erista GPU buck (I2C5 0x1C): NAKs"},
+    {FAULT_MAX77812,     "max77812",     "chip",
+     "Mariko CPU/GPU/DRAM buck (I2C5 0x33): NAKs; vdd_cpu dead with it"},
+    {FAULT_BQ24193,      "bq24193",      "chip", "charger (I2C1 0x6B): NAKs"},
+    {FAULT_MAX17050,     "max17050",     "chip", "fuel gauge (I2C1 0x36): NAKs"},
+    {FAULT_TMP451,       "tmp451",       "chip", "thermal sensor (I2C1 0x4C): NAKs"},
+    {FAULT_BM92T36,      "bm92t36",      "chip", "USB-PD (I2C1 0x18): NAKs"},
+    {FAULT_VDD_CPU,      "vdd_cpu",      "rail",
+     "CPU rail output dead, buck still answers: CPU RAM repair never "
+     "completes, CPU0 cannot run"},
+};
+
+inline const FaultDef *fault_find(const char *name) {
+    if (!name) return nullptr;
+    for (const FaultDef &f : kFaults)
+        if (!strcmp(name, f.name)) return &f;
+    return nullptr;
+}
+
+inline const char *fault_name(uint32_t id) {
+    for (const FaultDef &f : kFaults)
+        if (f.id == id) return f.name;
+    return "?";
+}
+
+// Fault value in the ini: dead/1 sets it, ok/0 clears it. Anything else is
+// refused so a typo cannot silently mean "healthy".
+inline bool fault_value_parse(const char *s, bool *dead) {
+    if (!s) return false;
+    if (!strcmp(s, "dead") || !strcmp(s, "1")) { *dead = true;  return true; }
+    if (!strcmp(s, "ok")   || !strcmp(s, "0")) { *dead = false; return true; }
+    return false;
+}
+
 // Tegra DC window registers (TRM 24.10-24.11) as slots in a window's
 // register file: the indirect window page 0x700-0x7FF is slots 0x000-0x0FF,
 // the WINBUF page 0x800-0x83F slots 0x100-0x13F.
@@ -367,6 +449,9 @@ struct EmuState {
     // WLAN radio (the other half of the same CYW4356, a PCIe endpoint on
     // root port 1). See WifiRadioMode above for what each mode models.
     std::atomic<uint8_t>  wifi_radio{WIFI_RADIO_HEALTHY};
+
+    // Dead chips and rails, a FaultId bitmask. See FaultId above.
+    std::atomic<uint32_t> faults{0};
 
     // SoC thermal sensor (TMP451, I2C5 @ 0x4C).
     std::atomic<int16_t>  soc_temp_c10{420};        // remote channel (SoC die): °C * 10

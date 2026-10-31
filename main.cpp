@@ -268,6 +268,16 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--trace") == 0)
             emu_trace_enabled = true;
 
+    // "--fault list" names the faults and exits. Scanned here, like --trace,
+    // so it works without a payload: it is how you find the names to use.
+    for (int i = 1; i + 1 < argc; i++)
+        if (strcmp(argv[i], "--fault") == 0 && strcmp(argv[i + 1], "list") == 0) {
+            printf("Faults (--fault NAME, or NAME=dead under [faults] in rcm_emu.ini):\n");
+            for (const FaultDef &f : kFaults)
+                printf("  %-13s %-4s  %s\n", f.name, f.kind, f.what);
+            return 0;
+        }
+
     // Started with no payload - usually a double-click, where a usage line
     // on stderr goes to a console nobody is looking at. Offer the picker
     // instead: drop a file on its window, or press O for the system dialog.
@@ -277,7 +287,7 @@ int main(int argc, char *argv[]) {
     if (argc < 2) {
         picked = payload_picker_run();
         if (picked.empty()) {
-            fprintf(stderr, "Usage: %s <payload.bin> [--sd <sd.img>] [--boot0 <boot0.bin>] [--rawnand <rawnand_prefix>] [--prod-keys <prod.keys>] [--oem erista|mariko] [--bt-radio healthy|faulty|absent] [--wifi-radio healthy|faulty|absent]\n", argv[0]);
+            fprintf(stderr, "Usage: %s <payload.bin> [--sd <sd.img>] [--boot0 <boot0.bin>] [--rawnand <rawnand_prefix>] [--prod-keys <prod.keys>] [--oem erista|mariko] [--bt-radio healthy|faulty|absent] [--wifi-radio healthy|faulty|absent] [--fault NAME[,NAME]|list]\n", argv[0]);
             fprintf(stderr, "\nControls:\n");
             fprintf(stderr, "  Arrow Up/Down = VOL+/VOL- buttons\n");
             fprintf(stderr, "  Enter         = POWER button\n");
@@ -380,6 +390,25 @@ int main(int argc, char *argv[]) {
                 state.usb_nbd_port = 0;
                 printf("[emu] USB host connected [overrides ini]\n");
             }
+        } else if (strcmp(argv[i], "--fault") == 0 && i + 1 < argc) {
+            // Kill a chip or a rail. Repeatable, and comma lists work too.
+            // Adds to whatever the ini set: a fault is a one-shot override
+            // the same way --oem is, so the same payload+ini can be re-run
+            // against broken hardware. ("--fault list" is handled at the top
+            // of main, before a payload is needed.)
+            const char *arg = argv[++i];
+            char buf[256];
+            snprintf(buf, sizeof(buf), "%s", arg);
+            for (char *tok = strtok(buf, ","); tok; tok = strtok(nullptr, ",")) {
+                if (const FaultDef *f = fault_find(tok)) {
+                    state.faults |= f->id;
+                } else {
+                    fprintf(stderr, "[emu] Unknown --fault '%s'; expected one of:", tok);
+                    for (const FaultDef &d : kFaults)
+                        fprintf(stderr, " %s", d.name);
+                    fprintf(stderr, " (or 'list')\n");
+                }
+            }
         } else if (strcmp(argv[i], "--wifi-radio") == 0 && i + 1 < argc) {
             // WLAN half of the same package, on PCIe. 'faulty' means
             // something different here from the Bluetooth side: the link
@@ -397,6 +426,12 @@ int main(int argc, char *argv[]) {
             }
         }
     }
+
+    // Say which hardware is broken before anything runs, so a capture can
+    // never be mistaken for one from a healthy console.
+    for (const FaultDef &f : kFaults)
+        if (state.faults.load() & f.id)
+            printf("[fault] %s (%s): %s\n", f.name, f.kind, f.what);
 
     if (prod_keys_path) {
         extern int se_engine_load_prod_keys(const char *);

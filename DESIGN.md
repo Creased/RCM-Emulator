@@ -804,7 +804,8 @@ emulated second.
 
 `make test` runs `tests/ccplex/`, a self-contained payload that checks the
 refusal, the EL3 entry, a core released with its clock stopped, the
-mailbox, WFE parking and the reset;
+mailbox, WFE parking and the reset, then the same payload under the
+`vdd_cpu`, `max77621_cpu` and `max77812` faults (see Fault injection);
 `tests/se/`, which runs the SE's RSA, SHA-256, AES and RNG against vectors
 computed in Python (`gen_vectors.py` writes `vectors.h`); `tests/usb/`, a
 mass storage gadget over a RAM disk on each device controller (writable, and
@@ -821,6 +822,56 @@ own column scan with an address offset; a mirrored window with window D
 blended over it). `check.py` compares every pixel of the frame the emulator
 shows with the picture the payload drew. `tests/hwtest/` builds hwtest-rcm
 with distro toolchains and runs its whole sweep; CI runs all four.
+
+## Fault injection
+
+A diagnostic payload is only tested once it has seen broken hardware, so
+chips and rails can be killed: `--fault NAME` (repeatable, comma lists),
+`NAME=dead` under `[faults]` in `rcm_emu.ini`, or the config window's Faults
+section, which applies a change at once. The table is `kFaults` in
+`emu_state.h`; `--fault list` prints it. A fault is hardware, so a payload
+reboot keeps it.
+
+**Coherence is the rule.** A fault has to show up identically in every model
+that depends on it, because a payload judges a part by what its neighbours
+do. So a part is listed only once all of its modelled consequences are wired,
+and a name with none is left out rather than accepted - otherwise a payload
+could "pass" against a fault that cannot fail it. The two kinds:
+
+| Kind | What it models | Where it acts |
+| --- | --- | --- |
+| chip | The part is dead. | `i2c_slave_present()` NAKs its address (normal and packet mode alike, both read `I2C_STATUS`); the regulator write paths commit nothing to a NAKing slave; `cpu_rail_fault()` takes down every rail the chip supplies. |
+| rail | The regulator answers and takes its enable, but delivers nothing - an open inductor, a shorted output cap. | Only what the rail feeds. Nothing changes over I2C: that is the case a probe reading regulator registers back cannot see, and the reason it is worth modelling. |
+
+| Fault | Consequences |
+| --- | --- |
+| `vdd_cpu` | `cpu_rail_on()` is false whatever the registers say. `FLOW_CTLR_RAM_REPAIR` leaves a request pending with STS clear (no rail, no acks from the CPU repair chain - see below), CPU0 refuses release with `CPU rail has no output (fault: vdd_cpu ...)`, and a running CPU0 stops. bdk's `ccplex_boot_cpu0()` spins on that STS with no timeout, so an unguarded payload hangs there - the "frozen while booting the CPU" console. |
+| `max77621_cpu` (Erista), `max77812` (Mariko) | The chip fault, plus `vdd_cpu`. This matters on Erista, where the MAX77621's register file is seeded with VOUT_EN set: without the cascade the rail would stay up behind a chip that no longer answers. A fault on the other generation's chip changes nothing. |
+| `max77621_gpu`, `bq24193`, `max17050`, `tmp451`, `bm92t36` | NAK only. Nothing else in the emulator consumes them. |
+
+The RAM repair coupling also holds with no fault at all, because it is how
+the part works: software powers the CPU rail, then sets `RAM_REPAIR[REQ]`
+and polls `[STS]`, which reports the acknowledgments of every segment of the
+CPU repair chain, and a request "must remain high for as long as it does not
+receive the corresponding ack signal" (TRM 17.1.3.2). So a repair requested
+with the rail off stays pending and completes once the rail is up. Every
+payload seen so far powers the rail first, as bdk does.
+
+The PMC partitions (CRAIL, C0NC, CE0) still ungate under a dead rail. The PMC
+only takes a CPU power-good indication from the PMIC when
+`PMC_CNTRL.CPUPWRGOOD_EN` is set; it resets to 0, bdk never sets it, and the
+CPUPWRGOOD/CPUPWROFF timers "are used only when the platform supports a CPU
+power good indication" (TRM 12.4.5 CPU Rail Partitions, 12.6.1
+APBDEV_PMC_CNTRL_0). So the
+partition reads powered either way and the step that really needs the rail
+is the RAM repair. A payload that did enable CPUPWRGOOD would make the ungate
+wait on the PMIC's pin; none does, and that is not modelled.
+
+Deliberately not offered: the MAX77620 itself (nothing would run), the
+ALC5639 codec (audio leaves through I2S whether or not it answers, so "dead"
+would be half-modelled), and the GPU and DRAM rails (no consumer modelled).
+Adding one means wiring every consequence first; `tests/ccplex/run.sh` shows
+how a fault scenario is checked.
 
 ## Bug history
 

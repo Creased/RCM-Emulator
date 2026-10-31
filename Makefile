@@ -124,7 +124,7 @@ test: $(OUTPUT) tests/ccplex/payload.bin tests/se/payload.bin $(USB_PAYLOADS) $(
 
 clean:
 	rm -f $(OUTPUT) $(OBJS) $(OBJS:.o=.d) \
-	      tests/ccplex/payload.elf tests/ccplex/payload.bin tests/ccplex/out.log \
+	      tests/ccplex/payload.elf tests/ccplex/payload.bin tests/ccplex/out.log tests/ccplex/out_fault_*.log \
 	      tests/se/payload.elf tests/se/payload.bin tests/se/out.log \
 	      tests/usb/payload_*.elf tests/usb/payload_*.bin tests/usb/out_*.log \
 	      tests/display/payload_*.elf tests/display/payload_*.bin \

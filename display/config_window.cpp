@@ -3,6 +3,7 @@
 
 #include "config_window.h"
 #include "emu_state.h"
+#include "t210/mmio.h"
 
 #include "imgui.h"
 #include "backends/imgui_impl_sdl2.h"
@@ -58,6 +59,7 @@ void reset_to_defaults(EmuState *s) {
     s->pmic_cnfg1_32k    = 0xFC;          // 32K_OK | 32K_OUT0_EN
     s->bt_radio          = BT_RADIO_HEALTHY;
     s->wifi_radio        = WIFI_RADIO_HEALTHY;
+    s->faults            = 0;
     s->sd_inserted       = true;
     s->sd_cid_manfid     = 0x03;
     s->sd_cid_oemid      = 0x5344;        // "SD"
@@ -218,6 +220,12 @@ bool config_window_save_ini_impl(const EmuState *s, const char *path) {
     write_header("wifi");
     fprintf(f, "radio=%s\n", wifi_radio_name(s->wifi_radio.load()));
 
+    // Every fault, set or not, so the file itself lists what can be broken.
+    write_header("faults");
+    for (const FaultDef &d : kFaults)
+        fprintf(f, "%s=%s\n", d.name, (s->faults.load() & d.id) ? "dead" : "ok");
+
+
     // Fuses are dumped wholesale — small enough (256 × 4 bytes) and keeps the
     // load path branch-free. Zero words too: loading layers the file over
     // init_fuse_defaults(), so a fuse cleared in the UI and left out here
@@ -307,6 +315,25 @@ bool config_window_load_ini_impl(EmuState *s, const char *path) {
             } else {
                 fprintf(stderr, "[config] Unknown [wifi] radio value '%s';"
                                 " expected healthy, faulty or absent\n", val);
+            }
+            continue;
+        }
+        if (strcmp(section, "faults") == 0) {
+            // One key per fault, value dead or ok. Same string-vs-schema
+            // reasoning as [bluetooth]: an unknown name or value is reported,
+            // never quietly read as healthy.
+            const FaultDef *f = fault_find(key);
+            bool dead = false;
+            if (!f) {
+                fprintf(stderr, "[config] Unknown fault '%s' in [faults];"
+                                " run with --fault list for the names\n", key);
+            } else if (!fault_value_parse(val, &dead)) {
+                fprintf(stderr, "[config] [faults] %s='%s': expected dead or ok\n",
+                        key, val);
+            } else if (dead) {
+                s->faults |= f->id;
+            } else {
+                s->faults &= ~f->id;
             }
             continue;
         }
@@ -463,6 +490,30 @@ void build_ui(EmuState *state) {
         // difference is per unit, so it is a value, not a generation switch.
         atomic_slider_int<uint8_t>("MAX77620 CNFG1_32K",      state->pmic_cnfg1_32k,   0, 255, "0x%02X");
     }
+
+    if (ImGui::CollapsingHeader("Faults (dead chips and rails)")) {
+        // Applied at once. A chip fault NAKs from the next transaction; a
+        // rail fault stops a running CPU0 on the spot, as silicon would.
+        // Reboot for a clean POR with the fault already in place.
+        for (const FaultDef &d : kFaults) {
+            bool dead = (state->faults.load() & d.id) != 0;
+            char label[48];
+            snprintf(label, sizeof(label), "%s (%s)", d.name, d.kind);
+            if (ImGui::Checkbox(label, &dead)) {
+                if (dead)
+                    state->faults |= d.id;
+                else
+                    state->faults &= ~d.id;
+                printf("[fault] %s %s (config window)\n", d.name,
+                       dead ? "set" : "cleared");
+                fflush(stdout);
+                faults_changed(state);
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", d.what);
+        }
+    }
+
 
     if (ImGui::CollapsingHeader("Bluetooth (CYW4356)")) {
         // Selected before the probe runs; press 'a' on the payload's pager to
@@ -934,6 +985,9 @@ void build_ui(EmuState *state) {
     ImGui::Separator();
     if (ImGui::Button("Reset to defaults")) {
         reset_to_defaults(state);
+        // Defaults clear every fault (and pick a SoC generation), so a CPU0
+        // release a fault was holding back must be looked at again.
+        faults_changed(state);
     }
     ImGui::SameLine();
     static double g_save_msg_until = 0.0;

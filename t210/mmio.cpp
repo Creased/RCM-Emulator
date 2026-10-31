@@ -705,7 +705,27 @@ static void max77812_regs_init() {
 static void max77620_regs_init(EmuState *state);
 static uint8_t max77620_regs[256];
 
+// The fault, if any, that has taken the CPU rail's output away: the rail
+// itself, or the buck this SoC generation drives it from. A dead chip takes
+// its rails with it - that is what makes a chip fault coherent rather than
+// just a NAK: on Erista the MAX77621 register file still reads as enabled
+// (its seed has VOUT_EN set), so without this the rail would stay "up" behind
+// a chip that no longer exists.
+const char *cpu_rail_fault(EmuState *state) {
+  uint32_t f = state->faults.load();
+  if (f & FAULT_VDD_CPU)
+    return "vdd_cpu";
+  bool mariko = state->pmic_otp.load() == 0x53;
+  if (mariko && (f & FAULT_MAX77812))
+    return "max77812";
+  if (!mariko && (f & FAULT_MAX77621_CPU))
+    return "max77621_cpu";
+  return nullptr;
+}
+
 bool cpu_rail_on(EmuState *state) {
+  if (cpu_rail_fault(state))
+    return false;
   if (state->pmic_otp.load() == 0x53) {
     max77812_regs_init();
     return (max77812_regs[0x06] >> 6) & 1;        // EN_CTRL.EN_M4 (CPU)
@@ -721,6 +741,34 @@ bool cpu_rail_on(EmuState *state) {
   return en_pin && (max77621_regs[0][0] & 0x80);
 }
 
+// A fault was set or cleared while running (config window). Everything that
+// depends on one re-reads it on its next access; only CPU0 has to be told,
+// because silicon stops a core the moment its rail goes and starts a
+// refused release the moment the last precondition arrives.
+void faults_changed(EmuState *state) {
+  ccplex_rail_changed(state);
+}
+
+// Which fault, if any, kills the chip at this bus and address. Kept beside
+// i2c_slave_present() so the two lists cannot drift apart.
+static uint32_t fault_for_slave(bool on_i2c5, uint8_t addr) {
+  if (on_i2c5) {
+    switch (addr) {
+    case 0x1B: return FAULT_MAX77621_CPU;
+    case 0x1C: return FAULT_MAX77621_GPU;
+    case 0x33: return FAULT_MAX77812;
+    default:   return 0;
+    }
+  }
+  switch (addr) {
+  case 0x18: return FAULT_BM92T36;
+  case 0x36: return FAULT_MAX17050;
+  case 0x4C: return FAULT_TMP451;
+  case 0x6B: return FAULT_BQ24193;
+  default:   return 0;
+  }
+}
+
 // Which slaves actually answer, per bus. This is the emulator's answer to
 // "is that chip fitted?", so it must list exactly what is modelled below and
 // nothing else - a bus scan is a real diagnostic and an emulator that ACKs
@@ -733,7 +781,7 @@ bool cpu_rail_on(EmuState *state) {
 // the address byte (TRM 35.x). bdk tests the whole nibble.
 #define I2C_STATUS_NOACK (1u << 0)
 
-static bool i2c_slave_present(EmuState *state, bool on_i2c5, uint8_t addr) {
+static bool i2c_slave_fitted(EmuState *state, bool on_i2c5, uint8_t addr) {
   if (on_i2c5) {
     bool mariko = state && state->pmic_otp.load() == 0x53;
     switch (addr) {
@@ -761,6 +809,26 @@ static bool i2c_slave_present(EmuState *state, bool on_i2c5, uint8_t addr) {
     (void)state;
     return false;
   }
+}
+
+// Fitted, and not killed by a fault. A fault only means something for a chip
+// this board has: a dead MAX77621 on a Mariko is a chip that was never there,
+// and must not be reported as one that died.
+static bool i2c_slave_present(EmuState *state, bool on_i2c5, uint8_t addr) {
+  if (!i2c_slave_fitted(state, on_i2c5, addr))
+    return false;
+  uint32_t dead = state ? state->faults.load() & fault_for_slave(on_i2c5, addr) : 0;
+  if (dead) {
+    static uint32_t logged = 0;
+    if (!(logged & dead)) {
+      logged |= dead;
+      printf("[fault] I2C%d 0x%02X NAK: %s is dead\n", on_i2c5 ? 5 : 1,
+             addr, fault_name(dead));
+      fflush(stdout);
+    }
+    return false;
+  }
+  return true;
 }
 // I2C_CNFG has to read back what was written: bdk sets NORMAL_MODE_GO with a
 // read-modify-write (`cnfg = (cnfg & ~GO) | GO`), so returning 0 would drop the
@@ -1388,7 +1456,8 @@ static uint32_t i2c_device_reg_read(EmuState *state, bool on_i2c5, uint8_t slave
 // effect on the modelled chips as a normal-mode [reg, value] write.
 static void i2c_packet_reg_write(EmuState *state, bool on_i2c5, uint8_t dev,
                                  uint8_t reg, uint8_t v) {
-  if (!on_i2c5)
+  // Nothing to write to on I2C1, and a NAKed write lands nowhere.
+  if (!on_i2c5 || !i2c_slave_present(state, on_i2c5, dev))
     return;
   bool mariko = state->pmic_otp.load() == 0x53;
   if (dev == MAX77620_I2C_ADDR) {
@@ -1440,7 +1509,9 @@ void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
     }
     // CPU/GPU rail bucks. Same wire format; only the chip this SoC
     // generation is fitted with takes the write (the other one NAKs).
-    if ((val & (1u << 9)) && is_write && size >= 2 && on_i2c5) {
+    // A NAKed write lands nowhere: a dead buck must not switch its rail.
+    if ((val & (1u << 9)) && is_write && size >= 2 && on_i2c5 &&
+        i2c_slave_present(state, on_i2c5, i2c_slave_addr)) {
       uint8_t reg = (uint8_t)(i2c_cmd_data1 & 0xFF);
       uint8_t v   = (uint8_t)((i2c_cmd_data1 >> 8) & 0xFF);
       bool mariko = state->pmic_otp.load() == 0x53;
@@ -3160,10 +3231,14 @@ static bool tmr_fire_next(EmuState *state, uint64_t *when) {
 }
 
 static uint32_t flow_read(EmuState *state, uint64_t addr) {
-  (void)state;
   uint32_t offset = (uint32_t)(addr - 0x60007000);
-  if (offset == 0x40)
+  if (offset == 0x40) {
+    // A request left pending for want of a rail completes once the rail is
+    // up (modelled as immediate: the repair itself takes microseconds).
+    if ((flow_ram_repair & RAM_REPAIR_REQ) && cpu_rail_on(state))
+      flow_ram_repair = (flow_ram_repair & ~RAM_REPAIR_REQ) | RAM_REPAIR_STS;
     return flow_ram_repair;
+  }
   return mmio_regs.get(addr);
 }
 
@@ -3172,8 +3247,24 @@ static void flow_write(EmuState *state, uint64_t addr, uint32_t val) {
   if (offset == 0x40) {
     flow_ram_repair = (val & ~(RAM_REPAIR_REQ | RAM_REPAIR_STS)) |
                       (flow_ram_repair & RAM_REPAIR_STS);
-    if (val & RAM_REPAIR_REQ)
-      flow_ram_repair |= RAM_REPAIR_STS;
+    if (val & RAM_REPAIR_REQ) {
+      // STS reports the acks of every segment of the CPU repair chain, which
+      // software is to request only after powering the CPU rail, and REQ
+      // stays high until they arrive (TRM 17.1.3.2). No rail, no acks: the
+      // request is left pending with STS clear - and bdk's ccplex_boot_cpu0()
+      // spins on STS with no timeout, which is exactly where a console with
+      // a dead CPU rail hangs.
+      if (cpu_rail_on(state)) {
+        flow_ram_repair |= RAM_REPAIR_STS;
+      } else {
+        flow_ram_repair = (flow_ram_repair & ~RAM_REPAIR_STS) | RAM_REPAIR_REQ;
+        const char *f = cpu_rail_fault(state);
+        printf("[ccplex] RAM repair requested with no CPU rail (%s%s): "
+               "STS stays clear until it comes up\n",
+               f ? "fault: " : "rail off", f ? f : "");
+        fflush(stdout);
+      }
+    }
     return;
   }
   if (offset == 0x04) {
