@@ -39,6 +39,11 @@ slow or destructive.
 - Boot a Linux kernel on CPU0 (switchroot's L4T 4.9), with a GIC-400, the
   generic timer, PSCI and the clock controller's reset values for it. See
   [Booting Linux on CPU0](#booting-linux-on-cpu0).
+- Put a dock on the USB-C port (`--dock`): a Nintendo dock, a third-party
+  USB-C adapter or a Nintendo charger on the BM92T36, the dock's
+  DisplayPort-to-HDMI converter on DPAUX1, and a TV in a second window that
+  shows what display head B sends through SOR1. hwtest-rcm's Dock Test runs
+  its whole handshake and TV link against it.
 - Tweak emulated hardware live (battery, charger, thermal, USB-PD, PMIC,
   fuses, SD insertion, the USB host) from a side window. See [Live hardware tweaks](#live-hardware-tweaks).
 - Inspect each Tegra UART port (TX history) and inject keystrokes into the
@@ -365,6 +370,7 @@ needed.
 | `--fault`             | `NAME[,NAME…]` \| `list` | Break a chip or a rail; repeatable. A **chip** fault (`max77812`, `max77621_cpu`, `max77621_gpu`, `bq24193`, `max17050`, `tmp451`, `bm92t36`) makes the part NAK its I2C address, refuse writes and take every rail it supplies down with it. A **rail** fault (`vdd_cpu`) leaves the regulator answering and reading back as enabled while its output never comes up, so only what the rail feeds notices: the CPU RAM repair never completes and CPU0 cannot run. `list` prints the names and exits. Faults survive a payload reboot, like the hardware they model, and add to `[faults]` in the ini (`NAME=dead`). See [DESIGN.md](DESIGN.md#fault-injection). |
 | `--usb-host`          | `nbd[:port]` (optional) | A PC on the USB-C port. It enumerates whatever USB gadget the payload brings up; a mass storage disk is read back (checked against the SD image), its last 8 sectors are written back unchanged and read again unless it is write-protected, and it is ejected; HID reports are polled. With `nbd` the disk is served over NBD on 127.0.0.1 (port 10809 by default) until the client disconnects, then ejected - see [Mounting a gadget's disk](#mounting-a-gadgets-disk). Logged as `[usb-host]`; `RCM_USB_TRACE=1` traces every transfer. Overrides `[usb] host` and `[usb] nbd_port` in the ini. |
 | `--load`              | `FILE@ADDR`   | Place a file in DRAM before the payload starts, the way a bootloader leaves a kernel and its device tree; repeatable. See [Booting Linux on CPU0](#booting-linux-on-cpu0). |
+| `--dock`              | `nintendo` \| `thirdparty` \| `charger` \| `none`, `:notv` | What is on the USB-C port, behind the BM92T36: a Nintendo dock (057E:2003, 15 V, Nintendo's alt mode, DisplayPort on pin D), a third-party adapter (Fresco Logic 1D5C:7102, four power profiles, the DisplayPort SVID) or the Nintendo charger (057E:2004, no video). A dock's DisplayPort-to-HDMI converter answers on DPAUX1 (DPCD 1.2, the TV's EDID over I2C-over-AUX), and SOR1 judges link training lane by lane against the board's wiring; once trained, head B's frames show in a TV window. `:notv` leaves the dock's HDMI empty. `RCM_EMU_TV_SNAP=file` saves the TV picture, `RCM_EMU_DPTRACE=file` traces DPAUX1 and SOR1. Overrides `[dock] kind` and `[dock] tv` in the ini. Default `none`. |
 | `--input-script`      | file or spec  | Scripted input keyed to emulated time: `<ms> P\|U\|D [hold_ms]` presses POWER / VOL+ / VOL-, `<ms> TAP <x> <y> [hold_ms]` taps the touchscreen at (x, y) in the 1280x720 picture, `<ms> SNAP <file>` saves the next displayed frame to `<file>` (raw B, G, R, A like `last_fb.rgba`, size in the matching `.meta`), `+N` times an event N ms after the previous one. Events are separated by `,`, `;` or newlines. |
 | `--auto-pin-recovery` | (none)        | Drive the Lockpick PIN-recovery menu without user input.  |
 | `--auto-te-script`    | (none)        | Drive `recover_pin.te` in TegraExplorer without input.    |
@@ -386,6 +392,7 @@ flowchart LR
     t210 --> se["se_engine.{h,cpp}<br/>AES-128, SHA-256, RSA, RNG"]
     t210 --> i2c["i2c3.{h,cpp}<br/>STMFTS / FTS4 touch"]
     t210 --> usb["usb.{h,cpp}<br/>USB device controllers + host PC"]
+    t210 --> dock["dock.{h,cpp}<br/>BM92T36, the dock, DPAUX1, SOR1"]
 
     display --> sdl["sdl_display.{h,cpp}<br/>DC window scan-out<br/>+ SDL2"]
 ```

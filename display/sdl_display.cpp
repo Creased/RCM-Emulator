@@ -1,4 +1,6 @@
 #include "sdl_display.h"
+#include "../t210/dock.h"
+#include "../t210/mmio.h"
 #include <string>
 #include "config_window.h"
 #include "console_window.h"
@@ -291,8 +293,9 @@ uint32_t dst_factor(uint32_t sel, uint32_t k1, uint32_t k2, uint32_t sa) {
   }
 }
 
-// Draw window w onto the panel picture.
-void draw_window(const Win &w, std::vector<uint32_t> &panel) {
+// Draw window w onto the panel picture (pw x ph, row-major).
+void draw_window(const Win &w, std::vector<uint32_t> &panel, uint32_t pw = kPanelW,
+                 uint32_t ph = kPanelH) {
   bool blend = !(w.blend_layer & (1u << 24));
   uint32_t k1 = (w.blend_layer >> 8) & 0xFF, k2 = (w.blend_layer >> 16) & 0xFF;
   uint32_t ssel = w.blend_match & 7, dsel = (w.blend_match >> 4) & 7;
@@ -305,12 +308,12 @@ void draw_window(const Win &w, std::vector<uint32_t> &panel) {
     txs[ox] = (uint32_t)((uint64_t)ox * w.pre_w / w.out_w);
   for (uint32_t oy = 0; oy < w.out_h; oy++) {
     int32_t py = w.y + (int32_t)oy;
-    if (py < 0 || py >= (int32_t)kPanelH)
+    if (py < 0 || py >= (int32_t)ph)
       continue;
     uint32_t ty = (uint32_t)((uint64_t)oy * w.pre_h / w.out_h);
     for (uint32_t ox = 0; ox < w.out_w; ox++) {
       int32_t px = w.x + (int32_t)ox;
-      if (px < 0 || px >= (int32_t)kPanelW)
+      if (px < 0 || px >= (int32_t)pw)
         continue;
       uint32_t tx = txs[ox];
       // (tx, ty) is post-turn; walk it back to the surface.
@@ -323,7 +326,7 @@ void draw_window(const Win &w, std::vector<uint32_t> &panel) {
       if (off + w.bpp > w.len)
         continue;
       uint32_t s = depth_argb(w.mem + off, w.depth);
-      uint32_t &d = panel[(size_t)py * kPanelW + px];
+      uint32_t &d = panel[(size_t)py * pw + px];
       if (!blend) {
         d = s | 0xFF000000u;
         continue;
@@ -340,9 +343,98 @@ void draw_window(const Win &w, std::vector<uint32_t> &panel) {
   }
 }
 
+// ---- The TV on the dock ------------------------------------------------------
+//
+// A second window, shown while a dock with video is configured: head B's
+// windows composed at the head's active size, as SOR1 sends them, when the
+// dock model says frames reach the TV; otherwise a dark screen, and the
+// window title says why there is no picture.
+SDL_Window *tv_window = nullptr;
+SDL_Renderer *tv_renderer = nullptr;
+SDL_Texture *tv_texture = nullptr;
+uint32_t tv_tex_w = 0, tv_tex_h = 0;
+std::string tv_title;
+
+void tv_update(EmuState *state, uc_engine *uc) {
+  uint8_t k = state->dock_kind.load();
+  bool want = (k == 1 || k == 2) && state->dock_tv.load();
+  if (!want) {
+    if (tv_window)
+      SDL_HideWindow(tv_window);
+    return;
+  }
+  if (!tv_window) {
+    tv_window = SDL_CreateWindow("TV (dock HDMI)", SDL_WINDOWPOS_UNDEFINED,
+                                 SDL_WINDOWPOS_UNDEFINED, 960, 540,
+                                 SDL_WINDOW_RESIZABLE);
+    if (!tv_window)
+      return;
+    tv_renderer = SDL_CreateRenderer(tv_window, -1, SDL_RENDERER_ACCELERATED);
+    if (!tv_renderer)
+      tv_renderer = SDL_CreateRenderer(tv_window, -1, SDL_RENDERER_SOFTWARE);
+  }
+  SDL_ShowWindow(tv_window);
+  TvState t;
+  dock_tv_state(state, &t);
+  uint32_t act = mmio_bus_read(state, 0x54240000 + 0x409 * 4, 4);
+  uint32_t w = act & 0x1FFF, h = (act >> 16) & 0x1FFF;
+  char title[256];
+  if (t.video && w && h)
+    snprintf(title, sizeof(title), "TV (dock HDMI) - %ux%u, %s", w, h, t.status);
+  else
+    snprintf(title, sizeof(title), "TV (dock HDMI) - no signal: %s", t.status);
+  if (tv_title != title) {
+    tv_title = title;
+    SDL_SetWindowTitle(tv_window, title);
+    printf("[tv] %s\n", title + 16);
+    fflush(stdout);
+  }
+  SDL_SetRenderDrawColor(tv_renderer, 8, 8, 24, 255);
+  SDL_RenderClear(tv_renderer);
+  if (t.video && w && h && w <= 4096 && h <= 4096) {
+    std::vector<uint32_t> pic((size_t)w * h, 0xFF000000u);
+    std::vector<Win> wins;
+    for (int i = 0; i < 4; i++) {
+      Win wn;
+      if (load_window(state, uc, i, state->dcb_win_active[i], -1, wn))
+        wins.push_back(std::move(wn));
+    }
+    std::stable_sort(wins.begin(), wins.end(),
+                     [](const Win &a, const Win &b) { return a.layer > b.layer; });
+    for (const Win &wn : wins)
+      draw_window(wn, pic, w, h);
+    if (!tv_texture || tv_tex_w != w || tv_tex_h != h) {
+      if (tv_texture)
+        SDL_DestroyTexture(tv_texture);
+      tv_texture = SDL_CreateTexture(tv_renderer, SDL_PIXELFORMAT_ARGB8888,
+                                     SDL_TEXTUREACCESS_STREAMING, (int)w, (int)h);
+      tv_tex_w = w;
+      tv_tex_h = h;
+    }
+    if (tv_texture) {
+      SDL_UpdateTexture(tv_texture, nullptr, pic.data(), (int)(w * 4));
+      SDL_RenderCopy(tv_renderer, tv_texture, nullptr, nullptr);
+    }
+    if (const char *snap = getenv("RCM_EMU_TV_SNAP")) {
+      static uint64_t last = 0;
+      if (state->emu_usec - last > 500000) {
+        last = state->emu_usec;
+        if (FILE *f = fopen(snap, "wb")) {
+          fwrite(&w, 4, 1, f);
+          fwrite(&h, 4, 1, f);
+          fwrite(pic.data(), 4, pic.size(), f);
+          fclose(f);
+        }
+      }
+    }
+  }
+  SDL_RenderPresent(tv_renderer);
+}
+
 } // namespace
 
 void sdl_display_update(EmuState *state, uc_engine *uc) {
+  tv_update(state, uc);
   if (!renderer)
     return;
 

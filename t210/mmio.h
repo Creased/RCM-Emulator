@@ -39,6 +39,8 @@ void mmio_unmap_bus(uc_engine *uc);
 // Map one 4 KiB page of the peripheral band as a register window (CPU0's
 // first access to a block the emulator does not model).
 bool mmio_map_page(uc_engine *uc, EmuState *state, uint64_t page);
+// Display head B's frame clock (interrupt latch, GIC line); called often.
+void display_tick(EmuState *state);
 
 // The shared dispatch both engines' MMIO callbacks funnel into. `size` is the
 // access width in bytes (1, 2 or 4).

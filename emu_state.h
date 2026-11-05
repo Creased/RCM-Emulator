@@ -290,6 +290,12 @@ struct EmuState {
     uint32_t dc_win[4][dcwin::kRegs] = {};
     uint32_t dc_win_active[4][dcwin::kRegs] = {};
     uint32_t dc_window_header = 0; // DC_CMD_DISPLAY_WINDOW_HEADER
+    // Display head B (DC1, 0x54240000): the head that feeds SOR1 and the
+    // dock. Same window model as head A, scanned out to the TV window.
+    uint32_t dcb_win[4][dcwin::kRegs] = {};
+    uint32_t dcb_win_active[4][dcwin::kRegs] = {};
+    uint32_t dcb_window_header = 0;
+    bool dcb_programmed = false;
     // False from reset until the payload first activates a window. Until
     // then the scan-out shows the emulator's own framebuffer (FB_BASE).
     bool dc_programmed = false;
@@ -499,6 +505,11 @@ struct EmuState {
 
     // USB-PD controller (BM92T36, I2C1 @ 0x18). One synthesized fixed PDO.
     std::atomic<bool>     usb_pd_inserted{false};
+    // The dock on the USB-C port (t210/dock.h DockKind) and whether a TV is
+    // on its HDMI output. [dock] kind=0 none, 1 Nintendo dock, 2 third-party
+    // adapter, 3 Nintendo charger; tv=0/1. --dock overrides.
+    std::atomic<uint8_t>  dock_kind{0};
+    std::atomic<bool>     dock_tv{true};
     std::atomic<uint16_t> usb_pd_voltage_mv{5000};
     std::atomic<uint16_t> usb_pd_amperage_ma{1500};
 

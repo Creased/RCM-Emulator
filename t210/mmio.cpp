@@ -9,6 +9,7 @@
 #include "ccplex.h"
 #include "pcie.h"
 #include "gic.h"
+#include "dock.h"
 #include "usb.h"
 #include "regcache.h"
 #include "se_engine.h"
@@ -541,6 +542,19 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
   // PH5/BT_HOST_WAKE and PH3/BT_DEV_WAKE are read while the Tegra is
   // deliberately not driving them, and mirroring OUT there answers 0 to every
   // question regardless of what is on the board.
+  // Port K (bank 2, port 2): PK4 is the PD controller's alert, active low.
+  // Port CC (bank 7, port 0): CC1 is HPD from the dock. Both read the pin
+  // when it is an input, as in GPIO mode they are.
+  if (offset == 0x238 || offset == 0x730) {
+    uint32_t v = mmio_regs.get(addr - 0x10);
+    uint32_t oe = mmio_regs.get(addr - 0x20);
+    uint32_t bit = offset == 0x238 ? (1u << 4) : (1u << 1);
+    bool level = offset == 0x238 ? bm92_alert_line(state) : dock_hpd(state);
+    if (!(oe & bit))
+      v = level ? (v | bit) : (v & ~bit);
+    return v;
+  }
+
   if (offset == 0x13C) {
     uint32_t v = gpio_h_in(state);
     TRACE("[gpio] R: Port H IN = 0x%02X\n", v);
@@ -624,6 +638,13 @@ void gpio_write(EmuState *state, uint64_t addr, uint32_t val) {
     gpio_h_update(state);
     sd_card_gpio_update();
   }
+  // Port V (bank 5, port 1): PV5 drives the PD controller's reset, high =
+  // held. Only once it is a GPIO output: as the SFIO it rests low.
+  if (offset >= 0x500 && offset < 0x600) {
+    uint32_t cnf = mmio_regs.get(GPIO_BASE + 0x504), oe = mmio_regs.get(GPIO_BASE + 0x514);
+    uint32_t out = mmio_regs.get(GPIO_BASE + 0x524);
+    bm92_reset_line(state, (cnf & oe & out & (1u << 5)) != 0);
+  }
 }
 
 // ==================== I2C ====================
@@ -647,6 +668,8 @@ void gpio_write(EmuState *state, uint64_t addr, uint32_t val) {
 
 static uint8_t i2c_slave_addr = 0;
 static uint8_t i2c_reg_addr = 0;
+// What the last normal-mode read of the BM92T36 returned, for CMD_DATA1/2.
+static uint8_t bm92_normal_rx[8];
 // Last full CMD_DATA1 word, committed when I2C_CNFG starts the transfer.
 static uint32_t i2c_cmd_data1 = 0;
 
@@ -799,7 +822,8 @@ static bool i2c_slave_fitted(EmuState *state, bool on_i2c5, uint8_t addr) {
     }
   }
   switch (addr) {
-  case 0x18:                      // BM92T36 USB-PD
+  case 0x18:                      // BM92T36 USB-PD: NAKs in reset and while it boots
+    return bm92_present(state);
   case 0x36:                      // MAX17050 fuel gauge
   case 0x4C:                      // TMP451 thermal
   case 0x6B:                      // BQ24193 charger
@@ -987,49 +1011,22 @@ struct PacketState {
     uint8_t  rx_buf[64]    = {0};
     uint32_t rx_size       = 0;
     uint32_t rx_pos        = 0;
+    uint8_t  tx_buf[64]    = {0};  // a write's payload, for chips that take
+                                   // whole messages (the BM92T36)
 };
 static PacketState pkt_i2c1;
 static PacketState pkt_i2c5;
+// I2C_INT_STATUS per controller (I2C1, I2C5): PACKET_XFER_COMPLETE (7) and
+// ALL_PACKETS_XFER_COMPLETE (6) latch when a packet finishes, NO_ACK (3)
+// when nobody answered; write 1 to clear. BUS_CLEAR_DONE (11) always reads
+// set, as before.
+static uint32_t i2c_int_latch[2];
 
 #define I2C_PACKET_PROT_I2C  (1u << 4)
 #define I2C_HEADER_READ      (1u << 19)
 
-static void bm92t36_fill_rx(EmuState *state, uint8_t reg, uint8_t *buf, uint32_t size) {
-    // All multi-byte values are little-endian on the wire (Hekate reassembles
-    // with `(buf[1] << 8) | buf[0]`). FW_TYPE is the exception — Hekate uses
-    // `(buf[0] << 4) | buf[1]` and expects 0x36, so buf[0]=3, buf[1]=6.
-    auto put = [&](uint32_t i, uint8_t v) { if (i < size) buf[i] = v; };
-    switch (reg) {
-    case 0x03: // STATUS1: bit 7 = cable inserted
-        put(0, state->usb_pd_inserted.load() ? 0x80 : 0x00);
-        break;
-    case 0x4B: // FW_TYPE_REG -> VER_36 = 0x36
-        put(0, 0x03); put(1, 0x06);
-        break;
-    case 0x4D: // MAN_ID_REG -> MAN_ROHM = 0x04B5
-        put(0, 0xB5); put(1, 0x04);
-        break;
-    case 0x4E: // DEV_ID_REG -> DEV_BM92T = 0x03B0
-        put(0, 0xB0); put(1, 0x03);
-        break;
-    case 0x08:   // READ_PDOS_SRC: byte0 = PDO-bytes count, then 4-byte PDOs
-    case 0x28: { // CURRENT_PDO:    same layout, 1 PDO
-        // Synthesize a single Fixed-type PDO from the EmuState values.
-        // pd_object_t bitfields (LSB->MSB): amp:10, volt:10, info:10, type:2.
-        uint32_t amp_lsb  = (uint32_t)(state->usb_pd_amperage_ma.load() / 10) & 0x3FF;
-        uint32_t volt_lsb = (uint32_t)(state->usb_pd_voltage_mv.load() / 50) & 0x3FF;
-        uint32_t pdo = amp_lsb | (volt_lsb << 10);
-        put(0, 4);
-        put(1, (uint8_t)(pdo >>  0));
-        put(2, (uint8_t)(pdo >>  8));
-        put(3, (uint8_t)(pdo >> 16));
-        put(4, (uint8_t)(pdo >> 24));
-        break;
-    }
-    default:
-        break;
-    }
-}
+// The BM92T36 itself is t210/dock.cpp; packet and normal-mode accesses
+// to I2C1 0x18 are routed there.
 
 // ==================== I2C_2: Rohm BH1730 ambient light sensor ============
 //
@@ -1097,7 +1094,7 @@ static void packet_populate_rx(EmuState *state, bool on_i2c5, PacketState &p) {
     p.rx_size = std::min((uint32_t)sizeof(p.rx_buf), p.payload_size);
     memset(p.rx_buf, 0, sizeof(p.rx_buf));
     if (!on_i2c5 && p.dev_addr == 0x18) {
-        bm92t36_fill_rx(state, p.reg_addr, p.rx_buf, p.rx_size);
+        bm92_read(state, p.reg_addr, p.rx_buf, p.rx_size);
         return;
     }
     // Every other slave: serve packet-mode reads from the same register models
@@ -1134,7 +1131,7 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
   case 0x8C:          // I2C_CONFIG_LOAD
     return 0;         // MSTR_CONFIG_LOAD (bit 0) cleared = load complete
   case 0x68:          // I2C_INT_STATUS
-    return (1 << 11); // BUS_CLEAR_DONE (bit 11)
+    return i2c_int_latch[on_i2c5 ? 1 : 0] | (1 << 11);
   case 0x54: {        // I2C_RX_FIFO  (packet-mode receive)
     uint32_t word = 0;
     uint32_t n = std::min((uint32_t)4, pkt.rx_size - pkt.rx_pos);
@@ -1156,9 +1153,15 @@ uint32_t i2c_read(EmuState *state, uint64_t addr) {
     }
     return 0;
   }
-  case 0x10:          // I2C_CMD_DATA2 (bytes 4-7) — no slaves currently need a >4 byte response
+  case 0x10:          // I2C_CMD_DATA2 (bytes 4-7): only the PD controller fills it
+    if (!on_i2c5 && i2c_slave_addr == 0x18)
+      return bm92_normal_rx[4] | bm92_normal_rx[5] << 8 | bm92_normal_rx[6] << 16 |
+             (uint32_t)bm92_normal_rx[7] << 24;
     return 0;
   case 0x0C:          // I2C_CMD_DATA1
+    if (!on_i2c5 && i2c_slave_addr == 0x18)
+      return bm92_normal_rx[0] | bm92_normal_rx[1] << 8 | bm92_normal_rx[2] << 16 |
+             (uint32_t)bm92_normal_rx[3] << 24;
     // TMP451 SoC/PCB thermal sensor (slave 0x4C on I2C_1).
     // Hekate reads (per bdk/thermal/tmp451.c) the integer °C from
     //   PCB: 0x00, SoC: 0x01
@@ -1503,6 +1506,20 @@ void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
     i2c_cnfg_reg[on_i2c5 ? 1 : 0] = val;
     bool is_write = (val & (1u << 6)) == 0;
     uint32_t size = ((val >> 1) & 7) + 1;
+    // BM92T36: whole messages, normal mode (up to 8 bytes in CMD_DATA1/2).
+    if ((val & (1u << 9)) && !on_i2c5 && i2c_slave_addr == 0x18 &&
+        i2c_slave_present(state, false, 0x18)) {
+      uint32_t d2 = mmio_regs.get(I2C1_BASE + 0x10);
+      uint8_t b[8];
+      for (int k = 0; k < 4; k++) {
+        b[k] = (uint8_t)(i2c_cmd_data1 >> (8 * k));
+        b[4 + k] = (uint8_t)(d2 >> (8 * k));
+      }
+      if (is_write && size >= 2)
+        bm92_write(state, b, size);
+      else if (!is_write)
+        bm92_read(state, i2c_reg_addr, bm92_normal_rx, size);
+    }
     if ((val & (1u << 9)) && is_write && size >= 2 && on_i2c5 &&
         i2c_slave_addr == MAX77620_I2C_ADDR) {
       max77620_regs_init(state);
@@ -1598,6 +1615,8 @@ void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
       if (pkt.is_read) {
         packet_populate_rx(state, on_i2c5, pkt);
         pkt.hdr_idx = 0;
+        i2c_int_latch[on_i2c5 ? 1 : 0] |= (1u << 7) | (1u << 6) |
+            (i2c_slave_present(state, on_i2c5, pkt.dev_addr) ? 0 : (1u << 3));
       } else {
         pkt.hdr_idx = 3;
       }
@@ -1605,6 +1624,8 @@ void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
     default:
       for (int k = 0; k < 4 && pkt.tx_seen < pkt.payload_size; k++) {
         uint8_t b = (uint8_t)(val >> (8 * k));
+        if (pkt.tx_seen < sizeof(pkt.tx_buf))
+          pkt.tx_buf[pkt.tx_seen] = b;
         if (pkt.tx_seen == 0)
           pkt.reg_addr = b;   // first payload byte: the register address
         else
@@ -1612,12 +1633,22 @@ void i2c_write(EmuState *state, uint64_t addr, uint32_t val) {
                                (uint8_t)(pkt.reg_addr + pkt.tx_seen - 1), b);
         pkt.tx_seen++;
       }
-      if (pkt.tx_seen >= pkt.payload_size)
+      if (pkt.tx_seen >= pkt.payload_size) {
         pkt.hdr_idx = 0;
+        i2c_int_latch[on_i2c5 ? 1 : 0] |= (1u << 7) | (1u << 6) |
+            (i2c_slave_present(state, on_i2c5, pkt.dev_addr) ? 0 : (1u << 3));
+        if (!on_i2c5 && pkt.dev_addr == 0x18 && pkt.payload_size >= 2 &&
+            i2c_slave_present(state, false, 0x18))
+          bm92_write(state, pkt.tx_buf,
+                     std::min<uint32_t>(pkt.payload_size, sizeof(pkt.tx_buf)));
+      }
       break;
     }
     break;
   }
+  case 0x68:          // I2C_INT_STATUS: write 1 to clear
+    i2c_int_latch[on_i2c5 ? 1 : 0] &= ~val;
+    break;
   case 0x5C:          // I2C_FIFO_CONTROL — TX/RX flush at the start of each xfer
     if (val & 0x3) {
       pkt.hdr_idx = 0;
@@ -1653,15 +1684,15 @@ static constexpr uint32_t kDcIntFrameEndVBlank = (1u << 1) | (1u << 2);
 
 // Resolve a DC word index to the windows it addresses and the register-file
 // slot. False for anything that is not a window register.
-static bool dc_window_reg(const EmuState *state, uint32_t index,
+static bool dc_window_reg(uint32_t header, uint32_t index,
                           uint32_t *mask, uint32_t *slot) {
   if (index >= 0x700 && index < 0x800) {
-    *mask = (state->dc_window_header >> 4) & 0xF;
+    *mask = (header >> 4) & 0xF;
     *slot = index - 0x700;
     return true;
   }
   if (index >= 0x800 && index < 0x840) {
-    *mask = (state->dc_window_header >> 4) & 0xF;
+    *mask = (header >> 4) & 0xF;
     *slot = 0x100 + (index - 0x800);
     return true;
   }
@@ -1677,28 +1708,101 @@ static bool dc_window_reg(const EmuState *state, uint32_t index,
   return false;
 }
 
+// The two heads share one model; this is a head's slice of EmuState.
+struct DcHead {
+  uint64_t base;
+  uint32_t (*win)[dcwin::kRegs];
+  uint32_t (*act)[dcwin::kRegs];
+  uint32_t *header;
+  bool *programmed;
+  char name;
+};
+
+static DcHead dc_head(EmuState *s, uint64_t addr) {
+  if (addr >= DISPLAY_B_BASE)
+    return {DISPLAY_B_BASE, s->dcb_win, s->dcb_win_active, &s->dcb_window_header,
+            &s->dcb_programmed, 'B'};
+  return {DISPLAY_A_BASE, s->dc_win, s->dc_win_active, &s->dc_window_header,
+          &s->dc_programmed, 'A'};
+}
+
+// Head B's interrupts are real: FRAME_END and V_BLANK latch once per frame
+// while the head runs (DISPLAY_COMMAND C_DISPLAY), clear on a write of 1,
+// and drive GIC SPI 74 when enabled - which a kernel's vblank waits need.
+// Head A keeps reading "a frame has just ended" for the payloads that poll.
+static uint32_t dcb_int_latch = 0;
+static uint64_t dcb_last_frame = 0;
+static bool dcb_running(EmuState *s) {
+  return ((mmio_regs.get(DISPLAY_B_BASE + 0x032 * 4) >> 5) & 3) == 1;
+}
+static void dcb_frames(EmuState *s) {
+  if (!dcb_running(s))
+    return;
+  uint64_t f = s->emu_usec / 16667;
+  if (f != dcb_last_frame) {
+    dcb_last_frame = f;
+    dcb_int_latch |= (1u << 1) | (1u << 2);
+  }
+  uint32_t en = mmio_regs.get(DISPLAY_B_BASE + 0x039 * 4);
+  gic_set_spi(74, (dcb_int_latch & en) != 0);
+}
+
+// DC_CMD_CONT_SYNCPT_VSYNC (0x028): SYNCPT_VSYNC_ENABLE (bit 8) makes the
+// head increment host1x syncpoint INDX (7:0) once per frame. A frame counter
+// that needs no interrupt logic: hekate's panel uses 9, hwtest's TV check 11.
+static void dc_syncpt_tick(EmuState *s, uint64_t base, uint64_t *last) {
+  uint32_t cmd = mmio_regs.get(base + 0x032 * 4);
+  uint32_t sv = mmio_regs.get(base + 0x028 * 4);
+  uint64_t f = s->emu_usec / 16667;
+  if (((cmd >> 5) & 3) != 1 || !(sv & (1u << 8))) {
+    *last = f;
+    return;
+  }
+  if (f == *last)
+    return;
+  uint64_t reg = HOST1X_BASE + 0x2100 + 0xF80 + 4 * (sv & 0xFF);
+  mmio_regs[reg] = mmio_regs.get(reg) + (uint32_t)(f - *last);
+  *last = f;
+}
+
+void display_tick(EmuState *s) {
+  static uint64_t last_a = 0, last_b = 0;
+  dcb_frames(s);
+  dc_syncpt_tick(s, DISPLAY_A_BASE, &last_a);
+  dc_syncpt_tick(s, DISPLAY_B_BASE, &last_b);
+}
+
 static void dc_reset(EmuState *state) {
   memset(state->dc_win, 0, sizeof(state->dc_win));
   memset(state->dc_win_active, 0, sizeof(state->dc_win_active));
-  for (int w = 0; w < 4; w++)
+  memset(state->dcb_win, 0, sizeof(state->dcb_win));
+  memset(state->dcb_win_active, 0, sizeof(state->dcb_win_active));
+  for (int w = 0; w < 4; w++) {
     state->dc_win[w][dcwin::BLEND_LAYER] =
         state->dc_win_active[w][dcwin::BLEND_LAYER] = dcwin::BLEND_LAYER_RESET;
+    state->dcb_win[w][dcwin::BLEND_LAYER] =
+        state->dcb_win_active[w][dcwin::BLEND_LAYER] = dcwin::BLEND_LAYER_RESET;
+  }
   state->dc_window_header = 0;
   state->dc_programmed = false;
+  state->dcb_window_header = 0;
+  state->dcb_programmed = false;
+  dcb_int_latch = 0;
   state->vic_out_addr = 0;
   state->vic_out_xform = 0;
 }
 
 // One line per window whose picture changed (not for moves: bdk slides its
 // log window in 16 pixels at a time).
-static void dc_log_window(int w, const uint32_t *r) {
+static void dc_log_window(char head, int w, const uint32_t *r) {
+  const char *hn = head == 'B' ? " (head B)" : "";
   if (!(r[dcwin::OPTIONS] & dcwin::WIN_ENABLE)) {
-    printf("[display] window %c off\n", 'A' + w);
+    printf("[display] window %c%s off\n", 'A' + w, hn);
     return;
   }
   static const char *const kKind[4] = {"pitch", "tiled", "block", "?"};
   uint32_t kind = r[dcwin::SURFACE_KIND];
-  printf("[display] window %c: %ux%u @ 0x%08X, %s", 'A' + w,
+  printf("[display] window %c%s: %ux%u @ 0x%08X, %s", 'A' + w, hn,
          r[dcwin::SIZE] & 0x1FFF, (r[dcwin::SIZE] >> 16) & 0x1FFF,
          r[dcwin::START_ADDR], kKind[kind & 3]);
   if ((kind & 3) == 2)
@@ -1709,52 +1813,71 @@ static void dc_log_window(int w, const uint32_t *r) {
 }
 
 uint32_t display_read(EmuState *state, uint64_t addr) {
-  uint32_t index = (uint32_t)(addr - DISPLAY_A_BASE) / 4;
+  DcHead h = dc_head(state, addr);
+  uint32_t index = (uint32_t)(addr - h.base) / 4;
   uint32_t mask, slot;
-  if (dc_window_reg(state, index, &mask, &slot)) {
+  if (dc_window_reg(*h.header, index, &mask, &slot)) {
     for (int w = 0; w < 4; w++)
       if (mask & (1u << w))
-        return state->dc_win[w][slot];
+        return h.win[w][slot];
     return 0;
   }
   switch (index) {
-  case kDcCmdIntStatus:    return kDcIntFrameEndVBlank;
+  case kDcCmdIntStatus:
+    if (h.name == 'B') {
+      dcb_frames(state);
+      return dcb_int_latch;
+    }
+    return kDcIntFrameEndVBlank;
   case kDcCmdStateControl: return 0;
-  case kDcCmdWindowHeader: return state->dc_window_header;
+  case kDcCmdWindowHeader: return *h.header;
   default:                 return mmio_regs.get(addr);
   }
 }
 
 void display_write(EmuState *state, uint64_t addr, uint32_t val) {
-  uint32_t index = (uint32_t)(addr - DISPLAY_A_BASE) / 4;
+  DcHead h = dc_head(state, addr);
+  uint32_t index = (uint32_t)(addr - h.base) / 4;
   uint32_t mask, slot;
-  if (dc_window_reg(state, index, &mask, &slot)) {
+  if (dc_window_reg(*h.header, index, &mask, &slot)) {
     for (int w = 0; w < 4; w++)
       if (mask & (1u << w))
-        state->dc_win[w][slot] = val;
+        h.win[w][slot] = val;
     return;
   }
+  if (h.name == 'B' && index == kDcCmdIntStatus) {
+    dcb_int_latch &= ~val;                       // write 1 to clear
+    dcb_frames(state);
+    return;
+  }
+  if (h.name == 'B' && index == 0x032) {
+    static uint32_t last = 0;
+    if (((val >> 5) & 3) != ((last >> 5) & 3))
+      printf("[display] head B %s\n", ((val >> 5) & 3) == 1 ? "running (C_DISPLAY)" :
+             ((val >> 5) & 3) == 0 ? "stopped" : "one-shot");
+    last = val;
+  }
   if (index == kDcCmdWindowHeader) {
-    state->dc_window_header = val;
+    *h.header = val;
   } else if (index == kDcCmdStateControl) {
     uint32_t req = (val >> 1) & 0xF; // WIN_A..D_ACT_REQ
     for (int w = 0; w < 4; w++) {
       if (!(req & (1u << w)))
         continue;
-      uint32_t *act = state->dc_win_active[w];
-      const uint32_t *asm_ = state->dc_win[w];
+      uint32_t *act = h.act[w];
+      const uint32_t *asm_ = h.win[w];
       static const uint32_t kShown[] = {
           dcwin::OPTIONS, dcwin::COLOR_DEPTH, dcwin::SIZE, dcwin::LINE_STRIDE,
           dcwin::START_ADDR, dcwin::SURFACE_KIND};
-      bool changed = !state->dc_programmed;
+      bool changed = !*h.programmed;
       for (uint32_t r : kShown)
         changed |= act[r] != asm_[r];
       memcpy(act, asm_, sizeof(state->dc_win_active[w]));
       if (changed)
-        dc_log_window(w, act);
+        dc_log_window(h.name, w, act);
     }
     if (req) {
-      state->dc_programmed = true;
+      *h.programmed = true;
       state->display_dirty = true;
     }
   }
@@ -4688,6 +4811,13 @@ static uint32_t i2c_empty_bus_read(uint64_t address) {
 
 uint32_t mmio_bus_read(EmuState *state, uint64_t address, unsigned size) {
   (void)size;
+  // host1x syncpoints: the heads' per-frame increments are brought up to
+  // date before a read, so a payload timing frames inside one BPMP batch
+  // (a paced TIMERUS wait) sees them.
+  if (address >= HOST1X_BASE + 0x3080 && address < HOST1X_BASE + 0x3080 + 0x300) {
+    display_tick(state);
+    return mmio_regs.get(address);
+  }
   if (address >= TMR_BASE && address < TMR_BASE + TMR_SIZE) {
     // TIMERUS_CNTR_1US. The rest of the timer block reads 0. The BPMP's
     // reads go through the clock's poll pacing; CPU0 has its own clock.
@@ -4723,6 +4853,10 @@ uint32_t mmio_bus_read(EmuState *state, uint64_t address, unsigned size) {
     return bpmp_cache_read(state, address);
   if (address >= GICD_BASE && address < GICD_BASE + GICD_SIZE)
     return gic_dist_read((uint32_t)(address - GICD_BASE), size);
+  if (address >= 0x54040000 && address < 0x54041000)
+    return dpaux1_read(state, (uint32_t)(address - 0x54040000));
+  if (address >= 0x54580000 && address < 0x54581000)
+    return sor1_read(state, (uint32_t)(address - 0x54580000));
   if (address >= GICC_BASE && address < GICC_BASE + GICC_SIZE)
     return gic_cpu_read((uint32_t)(address - GICC_BASE), size);
   if (address >= SOC_THERM_BASE && address < SOC_THERM_BASE + SOC_THERM_SIZE)
@@ -4751,7 +4885,7 @@ uint32_t mmio_bus_read(EmuState *state, uint64_t address, unsigned size) {
   if ((address >= I2C4_BASE && address < I2C4_BASE + I2C_CTRL_SIZE) ||
       (address >= I2C6_BASE && address < I2C6_BASE + I2C_CTRL_SIZE))
     return i2c_empty_bus_read(address);
-  if (address >= DISPLAY_A_BASE && address < DISPLAY_A_BASE + DISPLAY_SIZE)
+  if (address >= DISPLAY_A_BASE && address < DISPLAY_B_BASE + DISPLAY_SIZE)
     return display_read(state, address);
   if (address >= PMC_BASE && address < PMC_BASE + PMC_SIZE)
     return pmc_read(state, address);
@@ -4896,6 +5030,10 @@ void mmio_bus_write(EmuState *state, uint64_t address, unsigned size,
   } else if (address >= BPMP_CACHE_BASE &&
              address < BPMP_CACHE_BASE + BPMP_CACHE_SIZE) {
     bpmp_cache_write(state, address, val);
+  } else if (address >= 0x54040000 && address < 0x54041000) {
+    dpaux1_write(state, (uint32_t)(address - 0x54040000), val);
+  } else if (address >= 0x54580000 && address < 0x54581000) {
+    sor1_write(state, (uint32_t)(address - 0x54580000), val);
   } else if (address >= GICD_BASE && address < GICD_BASE + GICD_SIZE) {
     gic_dist_write((uint32_t)(address - GICD_BASE), size, val);
   } else if (address >= GICC_BASE && address < GICC_BASE + GICC_SIZE) {
@@ -4920,7 +5058,7 @@ void mmio_bus_write(EmuState *state, uint64_t address, unsigned size,
   } else if (address >= I2C5_BASE && address < I2C5_BASE + I2C_CTRL_SIZE) {
     i2c_write(state, address, val);
   } else if (address >= DISPLAY_A_BASE &&
-             address < DISPLAY_A_BASE + DISPLAY_SIZE) {
+             address < DISPLAY_B_BASE + DISPLAY_SIZE) {
     display_write(state, address, val);
   } else if (address >= DSI_BASE && address < DSI_BASE + DSI_SIZE) {
     dsi_write(state, address, val);
@@ -5035,6 +5173,7 @@ const struct {
     {EMC1_BASE, EMC_SIZE},
     {MC_BASE, MC_SIZE},
     {DISPLAY_A_BASE, DISPLAY_SIZE},
+    {DISPLAY_B_BASE, DISPLAY_SIZE},
     {DSI_BASE, DSI_SIZE},
     {I2C2_BASE, I2C2_SIZE},
     {SOC_THERM_BASE, SOC_THERM_SIZE},
@@ -5059,6 +5198,9 @@ const struct {
     {MSELECT_BASE, MSELECT_SIZE},
     // GIC-400 distributor, CPU interface and the virtualisation pages.
     {GICD_BASE, 0x7000},
+    // The DisplayPort path to the dock: DPAUX1, SOR1, display head B.
+    {0x54040000, 0x1000},
+    {0x54580000, 0x1000},
     // PCIe. T210 puts the root complex at the BOTTOM of the address map,
     // below every other peripheral.
     {PCIE_BLOCK_BASE, PCIE_BLOCK_SIZE},
@@ -5148,6 +5290,7 @@ void mmio_init(uc_engine *uc, EmuState *state) {
   pcie_reset(state);
   ccplex_reset(state);
   gic_reset();
+  dock_reset(state);
   sdhci_reset_regs(sdhci_regs[0]);
   sdhci_reset_regs(sdhci_regs[1]);
   dc_reset(state);

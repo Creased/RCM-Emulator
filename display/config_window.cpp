@@ -140,6 +140,8 @@ void reset_to_defaults(EmuState *s) {
     X(usb_pd_inserted,     "usb_pd",  "inserted",        0)                  \
     X(usb_pd_voltage_mv,   "usb_pd",  "voltage_mv",      0)                  \
     X(usb_pd_amperage_ma,  "usb_pd",  "amperage_ma",     0)                  \
+    X(dock_kind,           "dock",    "kind",            0)                  \
+    X(dock_tv,             "dock",    "tv",              0)                  \
     X(usb_host,            "usb",     "host",            0)                  \
     X(usb_nbd_port,        "usb",     "nbd_port",        0)                  \
     /* SoC / PMIC */                                                         \

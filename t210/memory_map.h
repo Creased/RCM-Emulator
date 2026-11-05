@@ -108,6 +108,7 @@ constexpr uint64_t MC_SIZE = 0x1000;
 
 // Display Controller (DC/DSI)
 constexpr uint64_t DISPLAY_A_BASE = 0x54200000;
+constexpr uint64_t DISPLAY_B_BASE = 0x54240000;   // DC1: feeds SOR1 / the dock
 constexpr uint64_t DISPLAY_SIZE   = 0x40000;
 
 // DSI Controller

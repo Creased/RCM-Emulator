@@ -27,6 +27,7 @@
 #include "trace.h"
 #include "t210/bpmp.h"
 #include "t210/ccplex.h"
+#include "t210/dock.h"
 #include "t210/memory_map.h"
 #include "t210/mmio.h"
 #include "display/sdl_display.h"
@@ -340,6 +341,23 @@ int main(int argc, char *argv[]) {
             rawnand_prefix = argv[++i];
         } else if (strcmp(argv[i], "--prod-keys") == 0 && i + 1 < argc) {
             prod_keys_path = argv[++i];
+        } else if (strcmp(argv[i], "--dock") == 0 && i + 1 < argc) {
+            // What is on the USB-C port. Same contract as --oem: overrides
+            // the ini. "nintendo", "thirdparty" (Ugreen-style), "charger",
+            // "none"; append ":notv" for a dock with nothing on its HDMI.
+            const char *d = argv[++i];
+            uint8_t k = 0xFF;
+            if (!strncmp(d, "nintendo", 8)) k = 1;
+            else if (!strncmp(d, "thirdparty", 10) || !strncmp(d, "ugreen", 6)) k = 2;
+            else if (!strncmp(d, "charger", 7)) k = 3;
+            else if (!strncmp(d, "none", 4)) k = 0;
+            if (k == 0xFF) {
+                fprintf(stderr, "[emu] Unknown --dock '%s'; expected nintendo, thirdparty, charger or none\n", d);
+                return 1;
+            }
+            state.dock_kind = k;
+            state.dock_tv = strstr(d, ":notv") == nullptr;
+            printf("[emu] Dock: %s%s [overrides ini]\n", d, "");
         } else if (strcmp(argv[i], "--oem") == 0 && i + 1 < argc) {
             const char *oem = argv[++i];
             if (strcmp(oem, "mariko") == 0 || strcmp(oem, "t210b01") == 0) {
@@ -802,6 +820,8 @@ int main(int argc, char *argv[]) {
                     state.emu_usec += CPU0_QUANTUM_INSTRUCTIONS / 10;
                     state.bpmp_slept_us += CPU0_QUANTUM_INSTRUCTIONS / 10;
                     ccplex_run(&state, state.emu_usec);
+                    dock_tick(&state);
+                    display_tick(&state);
                     if (state.reboot_requested.load())
                         break;
                     continue;
@@ -825,6 +845,8 @@ int main(int argc, char *argv[]) {
                 }
                 // CPU0 catches up to the BPMP's clock.
                 ccplex_run(&state, state.emu_usec);
+                dock_tick(&state);
+                display_tick(&state);
                 if (state.reboot_requested.load())
                     break;
             }
