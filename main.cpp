@@ -719,6 +719,18 @@ int main(int argc, char *argv[]) {
 
             // Scripted button input (--input-script).
             input_script_tick(state);
+            // Keyboard VOL presses end after their fixed guest duration.
+            for (int k = 0; k < 2; k++) {
+                std::atomic<uint64_t> &until = k ? state.kbd_vol_down_until : state.kbd_vol_up_until;
+                std::atomic<bool> &btn = k ? state.btn_vol_down : state.btn_vol_up;
+                uint64_t u = until.load();
+                if (u && state.emu_usec >= u) {
+                    until = 0;
+                    btn = false;
+                    printf("[input] UP   %s @emu_usec=%llu\n", k ? "VOL_DOWN" : "VOL_UP  ",
+                           (unsigned long long)state.emu_usec);
+                }
+            }
 
             // Touch injection for the Nyx GUI popup (eMMC Issues Warning).
             // Nyx initializes after the IPL stage; we inject a tap once enough

@@ -17,6 +17,13 @@
 //   touches the screen at (x, y) in the 1280x720 landscape picture bdk's
 //   touch driver reports (Nyx's coordinates), and lifts after hold_ms.
 //
+//     <when> SNAP <file>
+//
+//   writes the next frame the display shows to <file>, raw like last_fb.rgba
+//   (B, G, R, A bytes) with its size in the matching .meta. For screenshots
+//   at a known point of a run: guest time runs faster than the wall clock,
+//   so the once-a-second last_fb.rgba cannot be timed from outside.
+//
 // '#' starts a comment. Example - walk 6 entries down a menu and select:
 //
 //     rcm_emu payload.bin --input-script "3000 D, + D, + D, + D, + D, + D, + P"
@@ -42,7 +49,7 @@
 
 namespace {
 
-enum class Key { Power, VolUp, VolDown, Uart, UartFile, Tap };
+enum class Key { Power, VolUp, VolDown, Uart, UartFile, Tap, Snap };
 
 struct Event {
   uint64_t at_us = 0;   // press time
@@ -50,7 +57,7 @@ struct Event {
   Key key = Key::Power;
   bool pressed = false;
   bool released = false;
-  std::string data;      // UART / UARTFILE payload
+  std::string data;      // UART / UARTFILE payload, SNAP file
   uint16_t x = 0, y = 0; // TAP: panel-raw coordinates
 };
 
@@ -68,6 +75,7 @@ const char *key_name(Key k) {
   case Key::Uart: return "UART";
   case Key::UartFile: return "UARTFILE";
   case Key::Tap: return "TAP";
+  case Key::Snap: return "SNAP";
   default: return "VOL-";
   }
 }
@@ -89,6 +97,7 @@ bool parse_key(const std::string &tok, Key *out) {
   if (s == "UART") { *out = Key::Uart; return true; }
   if (s == "UARTFILE") { *out = Key::UartFile; return true; }
   if (s == "TAP" || s == "T") { *out = Key::Tap; return true; }
+  if (s == "SNAP") { *out = Key::Snap; return true; }
   return false;
 }
 
@@ -175,7 +184,7 @@ bool parse_text(const std::string &text) {
       return false;
     }
 
-    if (ev.key == Key::Uart || ev.key == Key::UartFile) {
+    if (ev.key == Key::Uart || ev.key == Key::UartFile || ev.key == Key::Snap) {
       // Everything after the keyword is the payload; keep interior spacing.
       size_t kpos = raw.find(tok[1]);
       std::string rest = (kpos == std::string::npos)
@@ -260,6 +269,23 @@ void input_script_tick(EmuState &state) {
     Event &ev = g_events[i];
     // Events are ordered by press time; stop at the first future one.
     if (!ev.pressed && now < ev.at_us) break;
+
+    // SNAP is one-shot too: hand the file name to the display thread.
+    if (ev.key == Key::Snap) {
+      if (now < ev.at_us)
+        break;
+      state.snap_request(ev.data);
+      ev.pressed = ev.released = true;
+      printf("[input-script] SNAP %s @%llu us (%zu/%zu)\n", ev.data.c_str(),
+             (unsigned long long)now, i + 1, g_events.size());
+      fflush(stdout);
+      if (i == g_done) {
+        g_done++;
+        if (g_done == g_events.size())
+          printf("[input-script] sequence complete\n");
+      }
+      continue;
+    }
 
     // UART events are one-shot: push the bytes into UART_B's receive FIFO
     // (index 1 = UART_B, the port payloads use for their debug console) and

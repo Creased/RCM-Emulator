@@ -1,4 +1,5 @@
 #include "sdl_display.h"
+#include <string>
 #include "config_window.h"
 #include "console_window.h"
 #include "../emu_state.h"
@@ -475,6 +476,25 @@ void sdl_display_update(EmuState *state, uc_engine *uc) {
     SDL_UpdateTexture(texture, nullptr, g_frame.data(), out_w * 4);
   }
 
+  // Snapshots the input script asked for, from this frame.
+  std::string snap;
+  while (!g_frame.empty() && state->snap_take(&snap)) {
+    if (FILE *f = fopen(snap.c_str(), "wb")) {
+      fwrite(g_frame.data(), 1, g_frame.size() * 4, f);
+      fclose(f);
+      std::string meta = snap;
+      if (meta.size() > 5 && meta.compare(meta.size() - 5, 5, ".rgba") == 0)
+        meta.resize(meta.size() - 5);
+      meta += ".meta";
+      if (FILE *fm = fopen(meta.c_str(), "w")) {
+        fprintf(fm, "%u %u\n", out_w, out_h);
+        fclose(fm);
+      }
+      printf("[snap] %s (%ux%u)\n", snap.c_str(), out_w, out_h);
+      fflush(stdout);
+    }
+  }
+
   // Snapshot for PNG conversion - at most once a second (~60 frames), and
   // only when the frame has changed since the last one written, so an idle
   // payload does not rewrite a 3.5 MB file every second.
@@ -632,14 +652,20 @@ bool sdl_display_poll_events(EmuState *state, uc_engine *uc) {
       uint32_t step = shift ? 4096 : 128;
       switch (event.key.keysym.sym) {
       case SDLK_UP:
-        if (!state->btn_vol_up)
+        // One press of 150 ms guest time per keydown (the host's
+        // auto-repeat makes more while the key is held).
+        if (!state->btn_vol_up) {
           printf("[input] DOWN VOL_UP    @emu_usec=%llu\n", (unsigned long long)state->emu_usec);
-        state->btn_vol_up = true;
+          state->kbd_vol_up_until = state->emu_usec + 150000;
+          state->btn_vol_up = true;
+        }
         break;
       case SDLK_DOWN:
-        if (!state->btn_vol_down)
+        if (!state->btn_vol_down) {
           printf("[input] DOWN VOL_DOWN  @emu_usec=%llu\n", (unsigned long long)state->emu_usec);
-        state->btn_vol_down = true;
+          state->kbd_vol_down_until = state->emu_usec + 150000;
+          state->btn_vol_down = true;
+        }
         break;
       case SDLK_RETURN:
         if (!state->btn_power)
@@ -707,14 +733,8 @@ bool sdl_display_poll_events(EmuState *state, uc_engine *uc) {
     if (event.type == SDL_KEYUP) {
       switch (event.key.keysym.sym) {
       case SDLK_UP:
-        if (state->btn_vol_up)
-          printf("[input] UP   VOL_UP    @emu_usec=%llu\n", (unsigned long long)state->emu_usec);
-        state->btn_vol_up = false;
-        break;
       case SDLK_DOWN:
-        if (state->btn_vol_down)
-          printf("[input] UP   VOL_DOWN  @emu_usec=%llu\n", (unsigned long long)state->emu_usec);
-        state->btn_vol_down = false;
+        // The press ends on its own, 150 ms of guest time after it began.
         break;
       case SDLK_RETURN:
         if (state->btn_power)

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <mutex>
 #include <vector>
 #include <string>
 
@@ -215,6 +216,12 @@ struct EmuState {
     std::atomic<bool> btn_vol_up{false};
     std::atomic<bool> btn_vol_down{false};
     std::atomic<bool> btn_power{false};
+    // A keyboard VOL press ends at this guest time (0: none running). The
+    // arrow keys press for a fixed guest duration: guest time outruns the
+    // wall clock while the guest sleeps, so a held key's wall time means
+    // little to the guest.
+    std::atomic<uint64_t> kbd_vol_up_until{0};
+    std::atomic<uint64_t> kbd_vol_down_until{0};
 
     // Touchscreen state (FTS4/STMFTS stub on I2C3 @ slave 0x49).
     // Updated by SDL mouse events; consumed by i2c3_*/STMFTS code on CPU thread.
@@ -248,6 +255,24 @@ struct EmuState {
         return false;
       *ev = tc_queue[tail % TC_QUEUE];
       tc_q_tail.store(tail + 1);
+      return true;
+    }
+
+    // Framebuffer snapshots asked for by the input script (SNAP), written by
+    // the display thread from the next frame it shows. CPU thread produces,
+    // display thread consumes.
+    std::mutex               snap_mtx;
+    std::vector<std::string> snap_paths;
+    void snap_request(const std::string &path) {
+      std::lock_guard<std::mutex> lk(snap_mtx);
+      snap_paths.push_back(path);
+    }
+    bool snap_take(std::string *path) {
+      std::lock_guard<std::mutex> lk(snap_mtx);
+      if (snap_paths.empty())
+        return false;
+      *path = snap_paths.front();
+      snap_paths.erase(snap_paths.begin());
       return true;
     }
     // last_rot mirrors the rotation last applied by sdl_display_update.

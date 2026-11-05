@@ -29,7 +29,7 @@ slow or destructive.
 - Replay deterministic button sequences via `--auto-pin-recovery` or
   `--auto-te-script`, so a payload flow can be exercised from a CI run or a
   one-shot script. `--input-script` scripts buttons and touchscreen taps for
-  any payload.
+  any payload, and can save the screen at a given point of a run.
 - Plug an emulated PC into the USB-C port (`--usb-host`): Nyx's USB mass
   storage and gamepad gadgets enumerate on both the Erista (USB2) and Mariko
   (XUSB) device controllers, and the PC reads a mass storage disk back,
@@ -322,7 +322,7 @@ needed.
 | `--wifi-radio`        | `healthy` \| `faulty` \| `absent` | The WLAN half of the same CYW4356: a PCI Express endpoint on root port 1, reachable only from CPU0 (the BPMP reads all ones, as on silicon). `healthy` trains the link, enumerates as `14E4:43EC` and answers a ChipCommon ChipID read with `0x4356`; `faulty` still trains and enumerates but reads all ones on the backplane (live PCIe front-end, dead radio die); `absent` never leaves detect. The model also enforces the datasheet's power-up ordering, so a payload that releases PERST# too early gets a link that stays down and a `[pcie]` line naming the reason. Overrides `[wifi] radio` in the ini. Default `healthy`. |
 | `--fault`             | `NAME[,NAME…]` \| `list` | Break a chip or a rail; repeatable. A **chip** fault (`max77812`, `max77621_cpu`, `max77621_gpu`, `bq24193`, `max17050`, `tmp451`, `bm92t36`) makes the part NAK its I2C address, refuse writes and take every rail it supplies down with it. A **rail** fault (`vdd_cpu`) leaves the regulator answering and reading back as enabled while its output never comes up, so only what the rail feeds notices: the CPU RAM repair never completes and CPU0 cannot run. `list` prints the names and exits. Faults survive a payload reboot, like the hardware they model, and add to `[faults]` in the ini (`NAME=dead`). See [DESIGN.md](DESIGN.md#fault-injection). |
 | `--usb-host`          | `nbd[:port]` (optional) | A PC on the USB-C port. It enumerates whatever USB gadget the payload brings up; a mass storage disk is read back (checked against the SD image), its last 8 sectors are written back unchanged and read again unless it is write-protected, and it is ejected; HID reports are polled. With `nbd` the disk is served over NBD on 127.0.0.1 (port 10809 by default) until the client disconnects, then ejected - see [Mounting a gadget's disk](#mounting-a-gadgets-disk). Logged as `[usb-host]`; `RCM_USB_TRACE=1` traces every transfer. Overrides `[usb] host` and `[usb] nbd_port` in the ini. |
-| `--input-script`      | file or spec  | Scripted input keyed to emulated time: `<ms> P\|U\|D [hold_ms]` presses POWER / VOL+ / VOL-, `<ms> TAP <x> <y> [hold_ms]` taps the touchscreen at (x, y) in the 1280x720 picture, `+N` times an event N ms after the previous one. Events are separated by `,`, `;` or newlines. |
+| `--input-script`      | file or spec  | Scripted input keyed to emulated time: `<ms> P\|U\|D [hold_ms]` presses POWER / VOL+ / VOL-, `<ms> TAP <x> <y> [hold_ms]` taps the touchscreen at (x, y) in the 1280x720 picture, `<ms> SNAP <file>` saves the next displayed frame to `<file>` (raw B, G, R, A like `last_fb.rgba`, size in the matching `.meta`), `+N` times an event N ms after the previous one. Events are separated by `,`, `;` or newlines. |
 | `--auto-pin-recovery` | (none)        | Drive the Lockpick PIN-recovery menu without user input.  |
 | `--auto-te-script`    | (none)        | Drive `recover_pin.te` in TegraExplorer without input.    |
 
