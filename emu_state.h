@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
-#include <mutex>
 #include <vector>
 #include <string>
 
@@ -260,20 +259,24 @@ struct EmuState {
 
     // Framebuffer snapshots asked for by the input script (SNAP), written by
     // the display thread from the next frame it shows. CPU thread produces,
-    // display thread consumes.
-    std::mutex               snap_mtx;
+    // display thread consumes. A spin lock, not std::mutex: the Windows
+    // build's MinGW uses the win32 thread model, which has none.
+    std::atomic<bool>        snap_busy{false};
     std::vector<std::string> snap_paths;
     void snap_request(const std::string &path) {
-      std::lock_guard<std::mutex> lk(snap_mtx);
+      while (snap_busy.exchange(true, std::memory_order_acquire)) {}
       snap_paths.push_back(path);
+      snap_busy.store(false, std::memory_order_release);
     }
     bool snap_take(std::string *path) {
-      std::lock_guard<std::mutex> lk(snap_mtx);
-      if (snap_paths.empty())
-        return false;
-      *path = snap_paths.front();
-      snap_paths.erase(snap_paths.begin());
-      return true;
+      while (snap_busy.exchange(true, std::memory_order_acquire)) {}
+      bool got = !snap_paths.empty();
+      if (got) {
+        *path = snap_paths.front();
+        snap_paths.erase(snap_paths.begin());
+      }
+      snap_busy.store(false, std::memory_order_release);
+      return got;
     }
     // last_rot mirrors the rotation last applied by sdl_display_update.
     // Read from the SDL event handler to invert the display→window transform.

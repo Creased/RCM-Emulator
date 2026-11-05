@@ -204,7 +204,7 @@ real consoles. Details in [DESIGN.md](DESIGN.md#ccplex-cpu0).
 way a bootloader would hand over to it:
 
 ```bash
-linux/build.sh                                  # linux/boot.bin (devkitARM + devkitA64)
+linux/build.sh                                  # linux/boot.bin (arm-none-eabi + aarch64 gcc)
 linux/mkdtb.sh tegra210-odin.dtb odin-emu.dtb   # console on UART-B, one CPU
 linux/run.sh Image odin-emu.dtb boot.log 120
 ```
@@ -228,7 +228,7 @@ initialisation.
 ## Tests
 
 ```bash
-make test                                   # CCPLEX, kernel CPU, SE, USB + display regression payloads (arm-none-eabi-gcc, devkitA64, python3)
+make test                                   # CCPLEX, kernel CPU, SE, USB + display regression payloads (arm-none-eabi-gcc, aarch64 gcc, python3)
 tests/hwtest/build.sh build-hwtest          # build hwtest-rcm (+ gcc-aarch64-linux-gnu)
 tests/hwtest/run.sh ./rcm_emu build-hwtest/hwtest-rcm/build/hwtest.bin
 ```

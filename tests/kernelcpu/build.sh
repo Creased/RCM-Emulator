@@ -1,10 +1,19 @@
 #!/bin/sh
-# Builds tests/kernelcpu/payload.bin: cpu0.S with devkitA64's assembler,
+# Builds tests/kernelcpu/payload.bin: cpu0.S with an AArch64 assembler,
 # embedded as a word array into the BPMP payload built with arm-none-eabi.
 set -e
 D=$(dirname "$0")
-A64=${A64:-/opt/devkitpro/devkitA64/bin/aarch64-none-elf-}
-ARM=${ARM:-/opt/devkitpro/devkitARM/bin/arm-none-eabi-}
+# devkitPro when it is installed, else the distribution's cross compilers
+# (gcc-aarch64-linux-gnu, gcc-arm-none-eabi), as on CI.
+DKP=${DEVKITPRO:-/opt/devkitpro}
+if [ -z "$A64" ]; then
+    A64=aarch64-linux-gnu-
+    if [ -x "$DKP/devkitA64/bin/aarch64-none-elf-gcc" ]; then A64=$DKP/devkitA64/bin/aarch64-none-elf-; fi
+fi
+if [ -z "$ARM" ]; then
+    ARM=arm-none-eabi-
+    if [ -x "$DKP/devkitARM/bin/arm-none-eabi-gcc" ]; then ARM=$DKP/devkitARM/bin/arm-none-eabi-; fi
+fi
 ${A64}gcc -c -o "$D/cpu0.o" "$D/cpu0.S"
 ${A64}ld -Ttext=0xA0000000 -o "$D/cpu0.elf" "$D/cpu0.o"
 ${A64}objcopy -O binary "$D/cpu0.elf" "$D/cpu0.bin"

@@ -1,9 +1,18 @@
 #!/bin/sh
-# Builds linux/boot.bin: shim.S (devkitA64) embedded in the BPMP payload.
+# Builds linux/boot.bin: shim.S (an AArch64 assembler) embedded in the BPMP payload.
 set -e
 D=$(dirname "$0")
-A64=${A64:-/opt/devkitpro/devkitA64/bin/aarch64-none-elf-}
-ARM=${ARM:-/opt/devkitpro/devkitARM/bin/arm-none-eabi-}
+# devkitPro when it is installed, else the distribution's cross compilers
+# (gcc-aarch64-linux-gnu, gcc-arm-none-eabi), as on CI.
+DKP=${DEVKITPRO:-/opt/devkitpro}
+if [ -z "$A64" ]; then
+    A64=aarch64-linux-gnu-
+    if [ -x "$DKP/devkitA64/bin/aarch64-none-elf-gcc" ]; then A64=$DKP/devkitA64/bin/aarch64-none-elf-; fi
+fi
+if [ -z "$ARM" ]; then
+    ARM=arm-none-eabi-
+    if [ -x "$DKP/devkitARM/bin/arm-none-eabi-gcc" ]; then ARM=$DKP/devkitARM/bin/arm-none-eabi-; fi
+fi
 ${A64}gcc -c -o "$D/shim.o" "$D/shim.S"
 ${A64}ld -Ttext=0xA0000000 -o "$D/shim.elf" "$D/shim.o"
 ${A64}objcopy -O binary "$D/shim.elf" "$D/shim.bin"
