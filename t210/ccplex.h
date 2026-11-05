@@ -58,6 +58,11 @@ void     ccplex_bus_tick(EmuState *state);
 // True while CPU0 is out of reset and executing (not parked on a hung bus).
 bool     ccplex_cpu0_running();
 
+// TMR10..TMR13 (TMR base + 0x90..0xAF): the timers Tegra210 kernels use as
+// per-CPU clock event devices. Their interrupts go to GIC SPI 176..179 on
+// CPU0's clock.
+void     ccplex_tmr_write(uint32_t off, uint32_t val);
+
 // Run CPU0 until its clock reaches `until_us` - the BPMP's current time.
 void     ccplex_run(EmuState *state, uint64_t until_us);
 

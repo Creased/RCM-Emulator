@@ -8,6 +8,7 @@
 #include "bpmp.h"
 #include "ccplex.h"
 #include "pcie.h"
+#include "gic.h"
 #include "usb.h"
 #include "regcache.h"
 #include "se_engine.h"
@@ -3198,6 +3199,8 @@ static constexpr uint32_t TMR_EN = 1u << 31, TMR_PER = 1u << 30;
 
 static void tmr_write(EmuState *state, uint64_t addr, uint32_t val) {
   uint32_t off = (uint32_t)(addr - TMR_BASE);
+  if (off >= 0x90 && off < 0xB0)          // TMR10..13: CPU clock event timers
+    ccplex_tmr_write(off, val);
   for (int t = 0; t < 10; t++)
     if (off == kTmrPtv[t] && (val & TMR_EN))
       tmr_armed_us[t] = state->emu_usec;
@@ -3391,6 +3394,19 @@ static const CarBank *car_bank_of(uint32_t off) {
 // The EMC clock as CAR sets it (EMC section below).
 static uint32_t emc_rate_khz();
 
+#include "car_reset.h"
+static uint32_t car_trm_reset(uint32_t off) {
+  static uint32_t table[0x800 / 4];
+  static bool built = false;
+  if (!built) {
+    for (const CarReset &r : kCarReset)
+      if (r.off < 0x800)
+        table[r.off / 4] = r.val;
+    built = true;
+  }
+  return off < 0x800 ? table[off / 4] : 0;
+}
+
 uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
   uint32_t offset = (uint32_t)(addr - CLK_RST_BASE);
   if (const CarBank *b = car_bank_of(offset)) {
@@ -3582,8 +3598,11 @@ uint32_t clk_rst_read(EmuState *state, uint64_t addr) {
       return v;
   }
   // Everything else is a plain R/W register (the CLK_SOURCE_* dividers,
-  // PLL MISC words, ...): it reads back what was written.
-  return mmio_regs.get(addr);
+  // PLL MISC words, ...): it reads back what was written, and its TRM reset
+  // value until then (car_reset.h). A kernel's clock driver reads hundreds
+  // of these to find each clock's parent; 0 is a reset value the hardware
+  // never has for many (a super clock's burst policy BUG()s in STANDBY).
+  return mmio_regs.get(addr, car_trm_reset(offset));
 }
 
 // A CLK_SOURCE_EMC write is the CAR/EMC clock-change handshake (EMC below).
@@ -4702,6 +4721,10 @@ uint32_t mmio_bus_read(EmuState *state, uint64_t address, unsigned size) {
     return sysreg_read(state, address);
   if (address >= BPMP_CACHE_BASE && address < BPMP_CACHE_BASE + BPMP_CACHE_SIZE)
     return bpmp_cache_read(state, address);
+  if (address >= GICD_BASE && address < GICD_BASE + GICD_SIZE)
+    return gic_dist_read((uint32_t)(address - GICD_BASE), size);
+  if (address >= GICC_BASE && address < GICC_BASE + GICC_SIZE)
+    return gic_cpu_read((uint32_t)(address - GICC_BASE), size);
   if (address >= SOC_THERM_BASE && address < SOC_THERM_BASE + SOC_THERM_SIZE)
     return soc_therm_read(state, address);
   if (address >= FLOW_CTLR_BASE && address < FLOW_CTLR_BASE + FLOW_CTLR_SIZE)
@@ -4873,6 +4896,10 @@ void mmio_bus_write(EmuState *state, uint64_t address, unsigned size,
   } else if (address >= BPMP_CACHE_BASE &&
              address < BPMP_CACHE_BASE + BPMP_CACHE_SIZE) {
     bpmp_cache_write(state, address, val);
+  } else if (address >= GICD_BASE && address < GICD_BASE + GICD_SIZE) {
+    gic_dist_write((uint32_t)(address - GICD_BASE), size, val);
+  } else if (address >= GICC_BASE && address < GICC_BASE + GICC_SIZE) {
+    gic_cpu_write((uint32_t)(address - GICC_BASE), size, val);
   } else if (address >= SOC_THERM_BASE &&
              address < SOC_THERM_BASE + SOC_THERM_SIZE) {
     soc_therm_write(state, address, val);
@@ -5030,6 +5057,8 @@ const struct {
     {USB_OTG_BASE, USB_OTG_SIZE},
     {XUSB_DEV_BASE, XUSB_DEV_SIZE},
     {MSELECT_BASE, MSELECT_SIZE},
+    // GIC-400 distributor, CPU interface and the virtualisation pages.
+    {GICD_BASE, 0x7000},
     // PCIe. T210 puts the root complex at the BOTTOM of the address map,
     // below every other peripheral.
     {PCIE_BLOCK_BASE, PCIE_BLOCK_SIZE},
@@ -5100,6 +5129,10 @@ void mmio_map_bus(uc_engine *uc, EmuState *state) {
     uc_mem_map_ptr(uc, TZRAM_BASE, TZRAM_SIZE, UC_PROT_ALL, g_tzram);
 }
 
+bool mmio_map_page(uc_engine *uc, EmuState *state, uint64_t page) {
+  return map_window(uc, state, page & ~0xFFFULL, 0x1000) == UC_ERR_OK;
+}
+
 void mmio_unmap_bus(uc_engine *uc) {
   g_windows.erase(std::remove_if(g_windows.begin(), g_windows.end(),
                                  [uc](const std::unique_ptr<MmioWindow> &w) {
@@ -5114,6 +5147,7 @@ void mmio_init(uc_engine *uc, EmuState *state) {
   mmio_map_bus(uc, state);
   pcie_reset(state);
   ccplex_reset(state);
+  gic_reset();
   sdhci_reset_regs(sdhci_regs[0]);
   sdhci_reset_regs(sdhci_regs[1]);
   dc_reset(state);

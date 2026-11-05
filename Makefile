@@ -28,6 +28,16 @@ CXXFLAGS = -Wall -g -O2 -std=c++17 -MMD -MP -I. -I$(IMGUI_DIR) -I$(IMGUI_DIR)/ba
 LDFLAGS =
 LIBS = -lunicorn -lSDL2 -lpthread
 
+# UNICORN_DIR=<prefix>: build against a Unicorn installed there (statically)
+# instead of the system one. Booting a kernel on CPU0 needs Unicorn 2.1 or
+# later: 2.0.x checks guest accesses against its memory map by VIRTUAL
+# address once the guest MMU is on, so every access through a kernel's
+# TTBR1 mapping looks unmapped. Everything else works on either. Run
+# `make clean` when switching, since the objects depend on its headers.
+ifneq ($(strip $(UNICORN_DIR)),)
+CXXFLAGS += -I$(UNICORN_DIR)/include
+endif
+
 # pkg-config for SDL2 if available
 SDL2_CFLAGS := $(shell pkg-config --cflags sdl2 2>/dev/null)
 SDL2_LIBS := $(shell pkg-config --libs sdl2 2>/dev/null)
@@ -35,6 +45,11 @@ SDL2_LIBS := $(shell pkg-config --libs sdl2 2>/dev/null)
 ifneq ($(SDL2_CFLAGS),)
     CXXFLAGS += $(SDL2_CFLAGS)
     LIBS = -lunicorn $(SDL2_LIBS) -lpthread
+endif
+
+# After the SDL2 block above, which sets LIBS again.
+ifneq ($(strip $(UNICORN_DIR)),)
+LIBS := $(UNICORN_DIR)/lib/libunicorn.a $(if $(SDL2_LIBS),$(SDL2_LIBS),-lSDL2) -lpthread -lm
 endif
 
 # ---- Windows cross-build ---------------------------------------------------
@@ -98,6 +113,9 @@ tests/ccplex/payload.bin: tests/ccplex/payload.c tests/ccplex/link.ld
 	$(TEST_CC) $(TEST_CFLAGS) -T tests/ccplex/link.ld -o tests/ccplex/payload.elf $<
 	$(TEST_OBJCOPY) -O binary tests/ccplex/payload.elf $@
 
+tests/kernelcpu/payload.bin: tests/kernelcpu/payload.c tests/kernelcpu/cpu0.S tests/kernelcpu/link.ld
+	sh tests/kernelcpu/build.sh
+
 tests/se/payload.bin: tests/se/payload.c tests/se/vectors.h tests/se/link.ld
 	$(TEST_CC) $(TEST_CFLAGS) -T tests/se/link.ld -o tests/se/payload.elf $<
 	$(TEST_OBJCOPY) -O binary tests/se/payload.elf $@
@@ -116,8 +134,9 @@ tests/display/payload_%.bin: tests/display/payload.c tests/display/link.ld
 	$(TEST_CC) $(TEST_CFLAGS) -DSCENARIO=$* -T tests/display/link.ld -o tests/display/payload_$*.elf $<
 	$(TEST_OBJCOPY) -O binary tests/display/payload_$*.elf $@
 
-test: $(OUTPUT) tests/ccplex/payload.bin tests/se/payload.bin $(USB_PAYLOADS) $(DISPLAY_PAYLOADS)
+test: $(OUTPUT) tests/ccplex/payload.bin tests/kernelcpu/payload.bin tests/se/payload.bin $(USB_PAYLOADS) $(DISPLAY_PAYLOADS)
 	sh tests/ccplex/run.sh ./$(OUTPUT) tests/ccplex/payload.bin
+	sh tests/kernelcpu/run.sh ./$(OUTPUT) tests/kernelcpu/payload.bin
 	sh tests/se/run.sh ./$(OUTPUT) tests/se/payload.bin
 	sh tests/usb/run.sh ./$(OUTPUT) tests/usb
 	sh tests/display/run.sh ./$(OUTPUT) tests/display

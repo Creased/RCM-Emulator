@@ -36,6 +36,9 @@ slow or destructive.
   checks it against the SD image, writes a few sectors back unchanged and
   ejects it. With `--usb-host nbd` the PC serves the disk over NBD instead,
   so it can be mounted on the machine running the emulator.
+- Boot a Linux kernel on CPU0 (switchroot's L4T 4.9), with a GIC-400, the
+  generic timer, PSCI and the clock controller's reset values for it. See
+  [Booting Linux on CPU0](#booting-linux-on-cpu0).
 - Tweak emulated hardware live (battery, charger, thermal, USB-PD, PMIC,
   fuses, SD insertion, the USB host) from a side window. See [Live hardware tweaks](#live-hardware-tweaks).
 - Inspect each Tegra UART port (TX history) and inject keystrokes into the
@@ -53,6 +56,16 @@ slow or destructive.
 ```bash
 sudo apt-get install -y build-essential libunicorn-dev libsdl2-dev
 make
+```
+
+Booting a kernel on CPU0 needs Unicorn 2.1 or later: 2.0.x, which some
+distributions still ship, checks guest accesses by virtual address once the
+guest MMU is on. Build one into a prefix and point the Makefile at it, which
+links it statically (`make clean` first when switching):
+
+```bash
+make UNICORN_DIR=$HOME/opt/unicorn-2.1
+ldd rcm_emu | grep unicorn      # prints nothing when the static one is in
 ```
 
 ### Build (Docker)
@@ -180,10 +193,37 @@ run: CPU rail off (MAX77621 VOUT_EN / MAX77620 GPIO5 EN pin)`. PCIe and
 MSELECT answer CPU0 only; the BPMP reads all ones from them, as measured on
 real consoles. Details in [DESIGN.md](DESIGN.md#ccplex-cpu0).
 
+### Booting Linux on CPU0
+
+`linux/` boots an arm64 kernel Image, switchroot's L4T 4.9 for instance, the
+way a bootloader would hand over to it:
+
+```bash
+linux/build.sh                                  # linux/boot.bin (devkitARM + devkitA64)
+linux/mkdtb.sh tegra210-odin.dtb odin-emu.dtb   # console on UART-B, one CPU
+linux/run.sh Image odin-emu.dtb boot.log 120
+```
+
+`--load FILE@ADDR` places the Image at 0x80080000 and the device tree at
+0x83000000 before the payload starts; `linux/boot.bin` sets the clocks and
+the CPU rail, releases CPU0 into `linux/shim.S`, which drops to EL1 with the
+device tree in x0, and halts the BPMP. For the kernel, CPU0 has a GIC-400
+(distributor and CPU interface), the generic timer counting emulated time
+at 19.2 MHz, interrupts taken at block boundaries, BRK and undefined
+instructions taken to its own vectors (WARN and BUG), PSCI on SMC, WFI
+sleeping to the next timer, TMR10..13 as clock event timers, and every
+unmodelled page of the peripheral band mapped as plain registers on first
+access. The clock controller's registers read their TRM reset values until
+written ([t210/car_reset.h](t210/car_reset.h)), since the kernel's clock
+driver walks hundreds of them. `RCM_EMU_CPU0_PROFILE=1` prints where CPU0 is
+once a second of real time, to tell a hung kernel from a slow one. The
+console comes out on UART-B; the saved runs reach the kernel's core
+initialisation.
+
 ## Tests
 
 ```bash
-make test                                   # CCPLEX, SE, USB + display regression payloads (arm-none-eabi-gcc, python3)
+make test                                   # CCPLEX, kernel CPU, SE, USB + display regression payloads (arm-none-eabi-gcc, devkitA64, python3)
 tests/hwtest/build.sh build-hwtest          # build hwtest-rcm (+ gcc-aarch64-linux-gnu)
 tests/hwtest/run.sh ./rcm_emu build-hwtest/hwtest-rcm/build/hwtest.bin
 ```
@@ -192,6 +232,8 @@ tests/hwtest/run.sh ./rcm_emu build-hwtest/hwtest-rcm/build/hwtest.bin
 refusal of an unpowered release, the EL3 entry, the mailbox, a stopped clock,
 WFE parking and the reset, then runs again with a dead CPU rail and dead
 bucks (`--fault`) and checks the RAM repair is held and the core stays dark;
+one drops CPU0 to EL1 and checks it takes timer interrupts through the GIC,
+a BRK into its own vector and a PSCI call over SMC;
 one checks the Security Engine's RSA, SHA-256, AES
 and RNG against vectors computed in Python; one brings up a USB mass storage
 gadget on each device controller (and a HID gadget) for the `--usb-host` PC to
@@ -322,6 +364,7 @@ needed.
 | `--wifi-radio`        | `healthy` \| `faulty` \| `absent` | The WLAN half of the same CYW4356: a PCI Express endpoint on root port 1, reachable only from CPU0 (the BPMP reads all ones, as on silicon). `healthy` trains the link, enumerates as `14E4:43EC` and answers a ChipCommon ChipID read with `0x4356`; `faulty` still trains and enumerates but reads all ones on the backplane (live PCIe front-end, dead radio die); `absent` never leaves detect. The model also enforces the datasheet's power-up ordering, so a payload that releases PERST# too early gets a link that stays down and a `[pcie]` line naming the reason. Overrides `[wifi] radio` in the ini. Default `healthy`. |
 | `--fault`             | `NAME[,NAME…]` \| `list` | Break a chip or a rail; repeatable. A **chip** fault (`max77812`, `max77621_cpu`, `max77621_gpu`, `bq24193`, `max17050`, `tmp451`, `bm92t36`) makes the part NAK its I2C address, refuse writes and take every rail it supplies down with it. A **rail** fault (`vdd_cpu`) leaves the regulator answering and reading back as enabled while its output never comes up, so only what the rail feeds notices: the CPU RAM repair never completes and CPU0 cannot run. `list` prints the names and exits. Faults survive a payload reboot, like the hardware they model, and add to `[faults]` in the ini (`NAME=dead`). See [DESIGN.md](DESIGN.md#fault-injection). |
 | `--usb-host`          | `nbd[:port]` (optional) | A PC on the USB-C port. It enumerates whatever USB gadget the payload brings up; a mass storage disk is read back (checked against the SD image), its last 8 sectors are written back unchanged and read again unless it is write-protected, and it is ejected; HID reports are polled. With `nbd` the disk is served over NBD on 127.0.0.1 (port 10809 by default) until the client disconnects, then ejected - see [Mounting a gadget's disk](#mounting-a-gadgets-disk). Logged as `[usb-host]`; `RCM_USB_TRACE=1` traces every transfer. Overrides `[usb] host` and `[usb] nbd_port` in the ini. |
+| `--load`              | `FILE@ADDR`   | Place a file in DRAM before the payload starts, the way a bootloader leaves a kernel and its device tree; repeatable. See [Booting Linux on CPU0](#booting-linux-on-cpu0). |
 | `--input-script`      | file or spec  | Scripted input keyed to emulated time: `<ms> P\|U\|D [hold_ms]` presses POWER / VOL+ / VOL-, `<ms> TAP <x> <y> [hold_ms]` taps the touchscreen at (x, y) in the 1280x720 picture, `<ms> SNAP <file>` saves the next displayed frame to `<file>` (raw B, G, R, A like `last_fb.rgba`, size in the matching `.meta`), `+N` times an event N ms after the previous one. Events are separated by `,`, `;` or newlines. |
 | `--auto-pin-recovery` | (none)        | Drive the Lockpick PIN-recovery menu without user input.  |
 | `--auto-te-script`    | (none)        | Drive `recover_pin.te` in TegraExplorer without input.    |
@@ -334,10 +377,11 @@ flowchart LR
     root --> top["main.cpp<br/>emu_state.h<br/>Makefile<br/>Dockerfile<br/>README.md / DESIGN.md"]
     root --> t210["t210/<br/>(SoC peripheral models)"]
     root --> display["display/"]
-    root --> tests["tests/<br/>ccplex/, se/, usb/, display/, hwtest/"]
+    root --> linux["linux/<br/>kernel boot: boot.c, shim.S, run.sh"]
+    root --> tests["tests/<br/>ccplex/, kernelcpu/, se/, usb/, display/, hwtest/"]
 
     t210 --> mmio["mmio.{h,cpp}<br/>memory_map.h<br/>regcache.h, tegra_bl.h"]
-    t210 --> cpus["bpmp.{h,cpp} BPMP clock<br/>ccplex.{h,cpp} CPU0 (A57)"]
+    t210 --> cpus["bpmp.{h,cpp} BPMP clock<br/>ccplex.{h,cpp} CPU0 (A57)<br/>gic.{h,cpp} GIC-400"]
     t210 --> pcie["pcie.{h,cpp}<br/>root complex + CYW4356"]
     t210 --> se["se_engine.{h,cpp}<br/>AES-128, SHA-256, RSA, RNG"]
     t210 --> i2c["i2c3.{h,cpp}<br/>STMFTS / FTS4 touch"]

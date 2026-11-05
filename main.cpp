@@ -510,6 +510,40 @@ int main(int argc, char *argv[]) {
     state.payload_len = payload_size;
     if (!uc) { free(payload); return 1; }
 
+    // --load FILE@ADDR (repeatable): place a file in DRAM before the payload
+    // starts, the way a bootloader would have left a kernel and its device
+    // tree there. The payload decides what to do with it.
+    for (int i = 2; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--load") != 0)
+            continue;
+        const char *spec = argv[++i];
+        const char *at = strrchr(spec, '@');
+        if (!at) {
+            fprintf(stderr, "[error] --load expects FILE@ADDR, got '%s'\n", spec);
+            return 1;
+        }
+        std::string path(spec, at - spec);
+        uint64_t addr = strtoull(at + 1, nullptr, 0);
+        FILE *f = fopen(path.c_str(), "rb");
+        if (!f) {
+            fprintf(stderr, "[error] --load cannot open '%s'\n", path.c_str());
+            return 1;
+        }
+        fseek(f, 0, SEEK_END);
+        long len = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (len < 0 || addr < DRAM_BASE || addr + (uint64_t)len > DRAM_BASE + DRAM_WINDOW_SIZE) {
+            fprintf(stderr, "[error] --load '%s' (%ld bytes) does not fit in DRAM at 0x%llX\n",
+                    path.c_str(), len, (unsigned long long)addr);
+            fclose(f);
+            return 1;
+        }
+        size_t got = fread(state.dram_low_ptr + (addr - DRAM_BASE), 1, (size_t)len, f);
+        fclose(f);
+        printf("[loader] --load %s: %zu bytes at 0x%08llX\n", path.c_str(), got,
+               (unsigned long long)addr);
+    }
+
     // Initialize SDL2 display
     if (!sdl_display_init()) {
         fprintf(stderr, "[error] Failed to initialize display\n");

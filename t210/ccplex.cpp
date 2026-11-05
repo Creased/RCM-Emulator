@@ -1,7 +1,10 @@
 #include "ccplex.h"
 #include "bpmp.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 #include <memory>
@@ -12,6 +15,7 @@
 #include "memory_map.h"
 #include "mmio.h"
 #include "pcie.h"
+#include "gic.h"
 
 // ==========================================================================
 // Registers (bdk soc/clock.h, soc/t210.h, soc/pmc.h; Tegra X1 TRM ch.5/16)
@@ -138,6 +142,16 @@ struct Model {
   uint64_t bus_accesses = 0;
   uint32_t boots = 0;
   const char *last_refusal = nullptr;
+
+  // Generic timer (ARM ARM D11): the EL1 physical and virtual timers.
+  uint64_t cntp_cval = 0, cntv_cval = 0, cntvoff = 0;
+  uint32_t cntp_ctl = 0, cntv_ctl = 0, cntkctl = 0, cnthctl = 0;
+
+  // An interrupt found pending and unmasked at a block boundary: the run
+  // stops there and ccplex_run() takes it.
+  bool irq_take = false;
+  uint64_t irqs_taken = 0, syncs_taken = 0, smcs = 0;
+  uint32_t xlat_gen = 1;     // bumped when TTBR/TCR/SCTLR change
 };
 
 Model m;
@@ -151,9 +165,200 @@ struct CodePage {
 };
 std::vector<std::unique_ptr<CodePage>> code_pages;
 uint64_t last_code_page = ~0ULL;
-uc_hook h_block, h_unmapped, h_intr;
+uc_hook h_block, h_unmapped, h_intr, h_mrs, h_msr;
 
 bool held() { return (m.rst_cpug & (RST_CPU0_MASK | RST_NONCPU)) != 0; }
+
+// ---- Generic timer -------------------------------------------------------
+//
+// The A57s' system counter runs from the 19.2 MHz TSC on the Tegra X1 (the
+// device tree's arch timer node says 19200000), so the count is CPU0's own
+// clock in those units: deterministic, like everything else here. Every
+// access to the timer registers is answered from this model; QEMU's own
+// timers never see one.
+static constexpr uint64_t CNT_HZ = 19200000;
+
+uint64_t cnt_now() { return m.ns * 12 / 625; }          // ns * 19.2e6 / 1e9
+
+// TMR10..13 (see ccplex.h): PTV bit 31 EN, bit 30 PER, 28:0 the count of
+// microseconds in the n+1 scheme (TRM 8.7.1); PCR bit 30 clears the
+// interrupt. Kept with CPU0 because only its clock times them.
+struct CpuTmr { uint32_t ptv = 0; uint64_t armed_ns = 0; bool pending = false; };
+CpuTmr cpu_tmr[4];
+
+uint64_t tmr_deadline(const CpuTmr &t) {
+  return t.armed_ns + ((uint64_t)(t.ptv & 0x1FFFFFFF) + 1) * 1000;
+}
+
+void cpu_tmrs_update() {
+  for (int i = 0; i < 4; i++) {
+    CpuTmr &t = cpu_tmr[i];
+    if ((t.ptv & (1u << 31)) && m.ns >= tmr_deadline(t)) {
+      t.pending = true;
+      if (t.ptv & (1u << 30)) {
+        uint64_t per = ((uint64_t)(t.ptv & 0x1FFFFFFF) + 1) * 1000;
+        while (tmr_deadline(t) <= m.ns)
+          t.armed_ns += per;
+      } else {
+        t.ptv &= ~(1u << 31);
+      }
+    }
+    gic_set_spi(176 + i, t.pending);
+  }
+}
+uint64_t ns_of_cnt(uint64_t c) {
+  return c > UINT64_MAX / 625 ? UINT64_MAX : (c * 625 + 11) / 12;
+}
+
+void timers_update() {
+  cpu_tmrs_update();
+  uint64_t p = cnt_now(), v = p - m.cntvoff;
+  bool pt = (m.cntp_ctl & 1) && p >= m.cntp_cval;
+  bool vt = (m.cntv_ctl & 1) && v >= m.cntv_cval;
+  gic_set_ppi(GIC_PPI_PTIMER, pt && !(m.cntp_ctl & 2));
+  gic_set_ppi(GIC_PPI_VTIMER, vt && !(m.cntv_ctl & 2));
+}
+
+// When the next unmasked timer fires, on CPU0's clock; UINT64_MAX for never.
+uint64_t next_timer_ns() {
+  uint64_t t = UINT64_MAX;
+  for (const CpuTmr &c : cpu_tmr)
+    if (c.ptv & (1u << 31))
+      t = std::min(t, tmr_deadline(c));
+  if ((m.cntp_ctl & 3) == 1)
+    t = std::min(t, ns_of_cnt(m.cntp_cval));
+  if ((m.cntv_ctl & 3) == 1) {
+    uint64_t c = m.cntv_cval + m.cntvoff;
+    if (c >= m.cntv_cval)            // no wrap
+      t = std::min(t, ns_of_cnt(c));
+  }
+  return t;
+}
+
+// ---- EL1&0 stage-1 translation ---------------------------------------------
+//
+// Only for the emulator's own peeks (is the last instruction of a block a
+// WFI?), so 4 KiB granules only, which is what Linux and the stubs use. A
+// small direct-mapped cache, emptied when the translation registers change.
+uint64_t cp_read(uc_engine *uc, uint32_t op0, uint32_t op1, uint32_t crn,
+                 uint32_t crm, uint32_t op2) {
+  uc_arm64_cp_reg r = {crn, crm, op0, op1, op2, 0};
+  uc_reg_read(uc, UC_ARM64_REG_CP_REG, &r);
+  return r.val;
+}
+
+void cp_write(uc_engine *uc, uint32_t op0, uint32_t op1, uint32_t crn,
+              uint32_t crm, uint32_t op2, uint64_t val) {
+  uc_arm64_cp_reg r = {crn, crm, op0, op1, op2, val};
+  uc_reg_write(uc, UC_ARM64_REG_CP_REG, &r);
+}
+
+const uint8_t *host_ptr(uint64_t a, uint32_t len);
+
+bool walk_va(uc_engine *uc, uint64_t va, uint64_t *pa) {
+  uint64_t sctlr = cp_read(uc, 3, 0, 1, 0, 0);
+  if (!(sctlr & 1)) {
+    *pa = va;
+    return true;
+  }
+  uint64_t tcr = cp_read(uc, 3, 0, 2, 0, 2);
+  bool hi = (va >> 55) & 1;
+  uint64_t ttbr = hi ? cp_read(uc, 3, 0, 2, 0, 1) : cp_read(uc, 3, 0, 2, 0, 0);
+  unsigned tsz = hi ? (tcr >> 16) & 0x3F : tcr & 0x3F;
+  unsigned tg = hi ? (tcr >> 30) & 3 : (tcr >> 14) & 3;
+  if ((hi && tg != 2) || (!hi && tg != 0))
+    return false;                    // not a 4 KiB granule
+  unsigned va_bits = 64 - tsz;
+  if (va_bits < 25 || va_bits > 48)
+    return false;
+  int levels = (int)(va_bits - 12 + 8) / 9;
+  uint64_t table = ttbr & 0x0000FFFFFFFFF000ULL;
+  for (int lvl = 4 - levels; lvl <= 3; lvl++) {
+    unsigned shift = 12 + 9 * (3 - lvl);
+    uint64_t idx = (va >> shift) & 0x1FF;
+    const uint8_t *p = host_ptr(table + idx * 8, 8);
+    if (!p)
+      return false;
+    uint64_t d;
+    memcpy(&d, p, 8);
+    if (!(d & 1))
+      return false;
+    if (lvl == 3 || !(d & 2)) {
+      if (lvl == 3 && !(d & 2))
+        return false;
+      uint64_t mask = (1ULL << shift) - 1;
+      *pa = (d & 0x0000FFFFFFFFF000ULL & ~mask) | (va & mask);
+      return true;
+    }
+    table = d & 0x0000FFFFFFFFF000ULL;
+  }
+  return false;
+}
+
+struct XlatEntry { uint64_t va_page; uint64_t pa_page; uint32_t gen; };
+XlatEntry xlat_cache[1024];
+
+bool va_to_pa(uc_engine *uc, uint64_t va, uint64_t *pa) {
+  uint64_t page = va >> 12;
+  XlatEntry &e = xlat_cache[page & 1023];
+  if (e.gen == m.xlat_gen && e.va_page == page) {
+    *pa = (e.pa_page << 12) | (va & 0xFFF);
+    return true;
+  }
+  uint64_t p;
+  if (!walk_va(uc, va & ~0xFFFULL, &p))
+    return false;
+  e = {page, p >> 12, m.xlat_gen};
+  *pa = p | (va & 0xFFF);
+  return true;
+}
+
+bool read_insn(uc_engine *uc, uint64_t va, uint32_t *insn) {
+  uint64_t pa;
+  if (!va_to_pa(uc, va, &pa))
+    return false;
+  const uint8_t *p = host_ptr(pa, 4);
+  if (!p)
+    return false;
+  memcpy(insn, p, 4);
+  return true;
+}
+
+// ---- Exception entry ---------------------------------------------------------
+//
+// Unicorn never delivers guest exceptions (see the reset-entry note), so the
+// model takes them itself: SPSR/ELR/ESR, PSTATE, then the vector. Only to
+// EL1 from EL1 on SP_EL1, which is every exception a kernel without
+// userspace or hypervisor takes - and it is the case where the translator's
+// cached EL stays right, because the EL does not change.
+enum ExcKind { EXC_SYNC = 0, EXC_IRQ = 1, EXC_FIQ = 2, EXC_SERROR = 3 };
+
+bool take_exception(uc_engine *uc, uint64_t ret_pc, ExcKind kind,
+                    uint32_t esr, uint64_t far) {
+  uint64_t ps = 0, vbar = 0;
+  uc_reg_read(uc, UC_ARM64_REG_PSTATE, &ps);
+  unsigned el = (ps >> 2) & 3;
+  if (el != 1 || !(ps & 1)) {
+    printf("[ccplex] CPU0 exception (kind %d, ESR 0x%08X) at PC=0x%llX from "
+           "EL%u%c: only EL1h->EL1 entry is modelled, CPU0 halted\n", kind,
+           esr, (unsigned long long)ret_pc, el, (ps & 1) ? 'h' : 't');
+    fflush(stdout);
+    return false;
+  }
+  uc_reg_read(uc, UC_ARM64_REG_VBAR_EL1, &vbar);
+  cp_write(uc, 3, 0, 4, 0, 0, ps);            // SPSR_EL1
+  uc_reg_write(uc, UC_ARM64_REG_ELR_EL1, &ret_pc);
+  if (kind == EXC_SYNC) {
+    uint64_t e = esr;
+    uc_reg_write(uc, UC_ARM64_REG_ESR_EL1, &e);
+    uc_reg_write(uc, UC_ARM64_REG_FAR_EL1, &far);
+  }
+  uint64_t nps = (ps & 0xF0000000ULL) | 0x3C0 | 0x5;   // EL1h, DAIF masked
+  uc_reg_write(uc, UC_ARM64_REG_PSTATE, &nps);
+  uint64_t vec = vbar + 0x200 + 0x80 * (uint64_t)kind;
+  uc_reg_write(uc, UC_ARM64_REG_PC, &vec);
+  return true;
+}
 
 uint64_t entry_vector() {
   return ((uint64_t)m.sb_rst_hi << 32) | (m.sb_rst_lo & ~1u);
@@ -290,28 +495,158 @@ void hook_block(uc_engine *uc, uint64_t address, uint32_t size, void *) {
   commit_pending();
   if (m.wfe_next) {
     // The block that just ran ended in WFE/WFI: the core sleeps until
-    // something wakes it. Nothing in this model sends it an event, so it
-    // sleeps to the end of the slice and resumes - a spurious wake-up, which
-    // the architecture allows, and which a `for(;;) wfe;` park loop turns
-    // straight back into sleep. Without this that loop would spin through
-    // hundreds of millions of instructions per emulated second.
+    // something wakes it - an interrupt, which here means a timer firing or
+    // a device line the GIC already holds. With neither in sight it sleeps
+    // to the end of the slice and resumes, a spurious wake-up the
+    // architecture allows and a `for(;;) wfe;` park loop turns straight back
+    // into sleep. Without this that loop would spin through hundreds of
+    // millions of instructions per emulated second.
     m.wfe_next = false;
-    if (m.ns < m.target_ns)
-      m.ns = m.target_ns;
+    if (!gic_irq_pending()) {
+      uint64_t wake = std::min(m.target_ns, next_timer_ns());
+      if (wake > m.ns)
+        m.ns = wake;
+    }
   }
+  timers_update();
   g_state->emu_usec = m.ns / 1000;
   if (m.ns >= m.target_ns || m.kill_pending) {
     uc_emu_stop(uc);
     return;
   }
+  if (gic_irq_pending()) {
+    uint64_t ps = 0;
+    uc_reg_read(uc, UC_ARM64_REG_PSTATE, &ps);
+    if (!(ps & (1u << 7))) {          // PSTATE.I clear: take it before this block
+      m.irq_take = true;
+      uc_emu_stop(uc);
+      return;
+    }
+  }
   note_code_page(address);
   // Every A64 instruction is four bytes.
   m.pending = size >= 4 ? size / 4 : 1;
-  if (const uint8_t *p = host_ptr(address + size - 4, 4)) {
-    uint32_t last;
-    memcpy(&last, p, 4);
+  uint32_t last;
+  if (read_insn(uc, address + size - 4, &last))
     m.wfe_next = (last == A64_WFE || last == A64_WFI);
+}
+
+// ---- System registers --------------------------------------------------------
+//
+// MRS/MSR of the generic timer are answered here (and skipped by Unicorn);
+// writes to the translation registers also empty the emulator's VA cache.
+bool is(const uc_arm64_cp_reg *r, uint32_t op0, uint32_t op1, uint32_t crn,
+        uint32_t crm, uint32_t op2) {
+  return r->op0 == op0 && r->op1 == op1 && r->crn == crn && r->crm == crm &&
+         r->op2 == op2;
+}
+
+uint32_t hook_mrs(uc_engine *uc, uc_arm64_reg reg, const uc_arm64_cp_reg *r,
+                  void *) {
+  if (r->op0 != 3 || r->crn != 14)
+    return 0;
+  uint64_t p = cnt_now(), v = p - m.cntvoff, out;
+  if (is(r, 3, 3, 14, 0, 0))      out = CNT_HZ;                    // CNTFRQ_EL0
+  else if (is(r, 3, 3, 14, 0, 1)) out = p;                         // CNTPCT_EL0
+  else if (is(r, 3, 3, 14, 0, 2)) out = v;                         // CNTVCT_EL0
+  else if (is(r, 3, 3, 14, 2, 0)) out = (uint32_t)(m.cntp_cval - p);
+  else if (is(r, 3, 3, 14, 2, 1)) out = m.cntp_ctl | (((m.cntp_ctl & 1) && p >= m.cntp_cval) ? 4 : 0);
+  else if (is(r, 3, 3, 14, 2, 2)) out = m.cntp_cval;
+  else if (is(r, 3, 3, 14, 3, 0)) out = (uint32_t)(m.cntv_cval - v);
+  else if (is(r, 3, 3, 14, 3, 1)) out = m.cntv_ctl | (((m.cntv_ctl & 1) && v >= m.cntv_cval) ? 4 : 0);
+  else if (is(r, 3, 3, 14, 3, 2)) out = m.cntv_cval;
+  else if (is(r, 3, 0, 14, 1, 0)) out = m.cntkctl;                 // CNTKCTL_EL1
+  else if (is(r, 3, 4, 14, 0, 3)) out = m.cntvoff;                 // CNTVOFF_EL2
+  else if (is(r, 3, 4, 14, 1, 0)) out = m.cnthctl;                 // CNTHCTL_EL2
+  else return 0;
+  if (reg != UC_ARM64_REG_XZR)
+    uc_reg_write(uc, reg, &out);
+  return 1;
+}
+
+uint32_t hook_msr(uc_engine *uc, uc_arm64_reg reg, const uc_arm64_cp_reg *r,
+                  void *) {
+  (void)reg;
+  (void)uc;
+  if (r->op0 == 3 && r->op1 == 0 && ((r->crn == 2 && r->crm == 0 && r->op2 <= 2) ||
+                                     (r->crn == 1 && r->crm == 0 && r->op2 == 0))) {
+    m.xlat_gen++;                    // TTBR0/TTBR1/TCR/SCTLR_EL1
+    return 0;
   }
+  if (r->op0 != 3 || r->crn != 14)
+    return 0;
+  uint64_t p = cnt_now(), v = p - m.cntvoff, val = r->val;
+  if (is(r, 3, 3, 14, 0, 0))      ;                                 // CNTFRQ: fixed
+  else if (is(r, 3, 3, 14, 2, 0)) m.cntp_cval = p + (uint64_t)(int64_t)(int32_t)val;
+  else if (is(r, 3, 3, 14, 2, 1)) m.cntp_ctl = val & 3;
+  else if (is(r, 3, 3, 14, 2, 2)) m.cntp_cval = val;
+  else if (is(r, 3, 3, 14, 3, 0)) m.cntv_cval = v + (uint64_t)(int64_t)(int32_t)val;
+  else if (is(r, 3, 3, 14, 3, 1)) m.cntv_ctl = val & 3;
+  else if (is(r, 3, 3, 14, 3, 2)) m.cntv_cval = val;
+  else if (is(r, 3, 0, 14, 1, 0)) m.cntkctl = (uint32_t)val;
+  else if (is(r, 3, 4, 14, 0, 3)) m.cntvoff = val;
+  else if (is(r, 3, 4, 14, 1, 0)) m.cnthctl = (uint32_t)val;
+  else return 0;
+  timers_update();
+  return 1;
+}
+
+// ---- PSCI (ARM DEN 0022), answered on SMC -------------------------------------
+//
+// On a Switch the secure monitor (ATF) answers these; here the emulator is
+// the monitor. One core is modelled, so CPU_ON is refused.
+void psci_call(uc_engine *uc) {
+  uint64_t x0 = 0, x1 = 0, ret;
+  uc_reg_read(uc, UC_ARM64_REG_X0, &x0);
+  uc_reg_read(uc, UC_ARM64_REG_X1, &x1);
+  uint32_t fid = (uint32_t)x0;
+  m.smcs++;
+  switch (fid) {
+  case 0x84000000: ret = 0x00010000; break;                   // PSCI_VERSION 1.0
+  case 0x84000006: ret = 2; break;                            // MIGRATE_INFO_TYPE: none
+  case 0x8400000A: {                                          // PSCI_FEATURES
+    uint32_t q = (uint32_t)x1;
+    ret = (q == 0x84000000 || q == 0x84000001 || q == 0xC4000001 ||
+           q == 0x84000002 || q == 0x84000003 || q == 0xC4000003 ||
+           q == 0x84000004 || q == 0xC4000004 || q == 0x84000006 ||
+           q == 0x84000008 || q == 0x84000009 || q == 0x8400000A) ? 0 : (uint64_t)-1;
+    break;
+  }
+  case 0x84000001: case 0xC4000001: ret = 0; break;          // CPU_SUSPEND: a WFI
+  case 0x84000003: case 0xC4000003: ret = (uint64_t)-3; break; // CPU_ON: DENIED
+  case 0x84000004: case 0xC4000004: ret = (x1 & 0xFF) == 0 ? 0 : 1; break; // AFFINITY_INFO
+  case 0x84000002:                                            // CPU_OFF
+    printf("[ccplex] PSCI CPU_OFF from CPU0\n");
+    m.kill_pending = true;
+    m.kill_reason = "PSCI CPU_OFF";
+    uc_emu_stop(uc);
+    ret = 0;
+    break;
+  case 0x84000008:                                            // SYSTEM_OFF
+  case 0x84000009:                                            // SYSTEM_RESET
+    printf("[ccplex] PSCI %s from CPU0\n", fid == 0x84000008 ? "SYSTEM_OFF" : "SYSTEM_RESET");
+    m.kill_pending = true;
+    m.kill_reason = fid == 0x84000008 ? "PSCI SYSTEM_OFF" : "PSCI SYSTEM_RESET";
+    uc_emu_stop(uc);
+    ret = 0;
+    break;
+  default: {
+    static uint32_t seen[32];
+    static int nseen;
+    bool known = false;
+    for (int i = 0; i < nseen; i++)
+      known |= seen[i] == fid;
+    if (!known && nseen < 32) {
+      seen[nseen++] = fid;
+      printf("[ccplex] SMC 0x%08X (x1=0x%llX) not implemented, returns NOT_SUPPORTED\n",
+             fid, (unsigned long long)x1);
+      fflush(stdout);
+    }
+    ret = (uint64_t)-1;
+    break;
+  }
+  }
+  uc_reg_write(uc, UC_ARM64_REG_X0, &ret);
 }
 
 bool hook_unmapped(uc_engine *uc, uc_mem_type type, uint64_t address, int size,
@@ -320,6 +655,22 @@ bool hook_unmapped(uc_engine *uc, uc_mem_type type, uint64_t address, int size,
   (void)value;
   uint64_t pc = 0;
   uc_reg_read(uc, UC_ARM64_REG_PC, &pc);
+  // The peripheral band decodes everywhere on the APB/AHB: a register the
+  // emulator does not model reads back what was written, as it does for the
+  // BPMP. Undecoded space outside it (the PCIe apertures' holes, nothing at
+  // all) still wedges the core.
+  if (address >= 0x50000000 && address < 0x80000000 &&
+      type != UC_MEM_FETCH_UNMAPPED) {
+    static std::vector<uint64_t> told;
+    uint64_t page = address & ~0xFFFULL;
+    if (std::find(told.begin(), told.end(), page) == told.end() && told.size() < 512) {
+      told.push_back(page);
+      printf("[ccplex] CPU0 first access to unmodelled page 0x%08llX (PC=0x%llX)\n",
+             (unsigned long long)page, (unsigned long long)pc);
+      fflush(stdout);
+    }
+    return mmio_map_page(uc, g_state, page);
+  }
   const char *kind = type == UC_MEM_FETCH_UNMAPPED   ? "fetch"
                      : type == UC_MEM_WRITE_UNMAPPED ? "write"
                                                      : "read";
@@ -330,16 +681,54 @@ bool hook_unmapped(uc_engine *uc, uc_mem_type type, uint64_t address, int size,
   printf("[ccplex] CPU0 %s of unmapped 0x%llX at PC=0x%llX: nothing answers, "
          "CPU0 wedged\n", kind, (unsigned long long)address,
          (unsigned long long)pc);
+  {
+    uint64_t pa = 0;
+    bool ok = walk_va(uc, address, &pa);
+    printf("[ccplex]   SCTLR_EL1 %08llX TCR_EL1 %llX TTBR0 %llX TTBR1 %llX; walk %s 0x%llX\n",
+           (unsigned long long)cp_read(uc, 3, 0, 1, 0, 0),
+           (unsigned long long)cp_read(uc, 3, 0, 2, 0, 2),
+           (unsigned long long)cp_read(uc, 3, 0, 2, 0, 0),
+           (unsigned long long)cp_read(uc, 3, 0, 2, 0, 1), ok ? "->" : "failed",
+           (unsigned long long)pa);
+  }
   fflush(stdout);
   return false;
 }
 
 void hook_intr(uc_engine *uc, uint32_t intno, void *) {
-  // Unicorn does not deliver guest exceptions (see the reset-entry note),
-  // so a fault cannot reach the stub's own vectors. Say what happened and
-  // stop the core rather than resume past the faulting instruction.
+  // Unicorn does not deliver guest exceptions (see the reset-entry note).
+  // SMC is answered here (PSCI) and execution goes on after it; BRK and
+  // undefined instructions are taken to EL1's own vectors, which is how a
+  // kernel's WARN() and BUG() work. Anything else stops the core rather
+  // than resume past the faulting instruction.
   uint64_t pc = 0;
   uc_reg_read(uc, UC_ARM64_REG_PC, &pc);
+  uint32_t insn = 0;
+  if (intno == 13 || intno == 12) {             // EXCP_SMC (QEMU 5: 13)
+    if (read_insn(uc, pc - 4, &insn) && (insn & 0xFFE0001F) == 0xD4000003) {
+      psci_call(uc);
+      return;
+    }
+  }
+  if (intno == 11 && read_insn(uc, pc - 4, &insn) && (insn & 0xFFE0001F) == 0xD4000002) {
+    uint64_t r = (uint64_t)-1;                  // HVC with no hypervisor
+    uc_reg_write(uc, UC_ARM64_REG_X0, &r);
+    return;
+  }
+  if (intno == 7 && read_insn(uc, pc, &insn) && (insn & 0xFFE0001F) == 0xD4200000) {
+    uint32_t esr = (0x3Cu << 26) | (1u << 25) | ((insn >> 5) & 0xFFFF);
+    m.syncs_taken++;
+    if (take_exception(uc, pc, EXC_SYNC, esr, 0))
+      return;
+  }
+  if (intno == 1) {                             // EXCP_UDEF
+    m.syncs_taken++;
+    if (read_insn(uc, pc, &insn))
+      printf("[ccplex] CPU0 undefined instruction 0x%08X at PC=0x%llX, taken to EL1\n",
+             insn, (unsigned long long)pc);
+    if (take_exception(uc, pc, EXC_SYNC, (1u << 25), 0))
+      return;
+  }
   static const char *names[] = {"?", "UDEF", "SWI", "PREFETCH_ABORT",
                                 "DATA_ABORT", "IRQ", "FIQ", "BKPT", "EXIT",
                                 "KERNEL_TRAP", "HVC", "HYP_TRAP", "SMC"};
@@ -362,6 +751,11 @@ bool start_cpu0(EmuState *state) {
     return false;
   }
   uc_ctl_set_cpu_model(uc, UC_CPU_ARM64_A57);
+#if UC_API_MAJOR > 2 || (UC_API_MAJOR == 2 && UC_API_MINOR >= 1)
+  // Translate through the guest's own page tables (the 2.1 default, set
+  // explicitly): a kernel runs with its MMU on.
+  uc_ctl_tlb_mode(uc, UC_TLB_CPU);
+#endif
 
   // IRAM, DRAM and TZRAM are the same host memory the BPMP engine maps, so
   // a stub the BPMP copies into DRAM and the mailbox both cores poll are one
@@ -397,6 +791,15 @@ bool start_cpu0(EmuState *state) {
   uc_hook_add(uc, &h_unmapped, UC_HOOK_MEM_UNMAPPED, (void *)hook_unmapped,
               nullptr, 1, 0);
   uc_hook_add(uc, &h_intr, UC_HOOK_INTR, (void *)hook_intr, nullptr, 1, 0);
+  uc_hook_add(uc, &h_mrs, UC_HOOK_INSN, (void *)hook_mrs, nullptr, 1, 0,
+              UC_ARM64_INS_MRS);
+  if (!getenv("RCM_EMU_NO_MSR_HOOK"))
+    uc_hook_add(uc, &h_msr, UC_HOOK_INSN, (void *)hook_msr, nullptr, 1, 0,
+                UC_ARM64_INS_MSR);
+  m.cntp_cval = m.cntv_cval = m.cntvoff = 0;
+  m.cntp_ctl = m.cntv_ctl = m.cntkctl = m.cnthctl = 0;
+  m.irq_take = false;
+  m.xlat_gen++;
 
   m.uc = uc;
   m.pc = RESET_TRAMPOLINE;
@@ -572,6 +975,21 @@ void ccplex_bus_tick(EmuState *state) {
 
 uint64_t ccplex_now_us() { return m.ns / 1000; }
 
+void ccplex_tmr_write(uint32_t off, uint32_t val) {
+  if (off < 0x90 || off >= 0xB0)
+    return;
+  CpuTmr &t = cpu_tmr[(off - 0x90) / 8];
+  if ((off - 0x90) % 8 == 4) {            // PCR
+    if (val & (1u << 30)) {
+      t.pending = false;
+      gic_set_spi(176 + (int)((off - 0x90) / 8), false);
+    }
+    return;
+  }
+  t.ptv = val;                            // PTV: (re)armed now
+  t.armed_ns = m.ns;
+}
+
 bool ccplex_cpu0_running() { return m.cpu0 == Cpu0::Running && m.uc; }
 
 void ccplex_run(EmuState *state, uint64_t until_us) {
@@ -601,17 +1019,64 @@ void ccplex_run(EmuState *state, uint64_t until_us) {
   m.target_ns = target;
   m.in_run = true;
 
-  drop_stale_code();
+  // The BPMP can only rewrite CPU0's code while it runs; parked, it cannot,
+  // and comparing hundreds of kernel pages before every slice is the one
+  // thing that would make a booted kernel crawl.
+  if (!state->bpmp_halted)
+    drop_stale_code();
 
   // `until` is an address an A64 PC can never hold (it is not 4-aligned).
   // 0 would make a branch to address 0 end every slice before it starts.
-  uc_err err = uc_emu_start(m.uc, m.pc, ~0ULL, 0, 0);
-
-  commit_pending();
-  uc_reg_read(m.uc, UC_ARM64_REG_PC, &m.pc);
+  uc_err err;
+  for (;;) {
+    err = uc_emu_start(m.uc, m.pc, ~0ULL, 0, 0);
+    commit_pending();
+    uc_reg_read(m.uc, UC_ARM64_REG_PC, &m.pc);
+    if (err != UC_ERR_OK || m.kill_pending || m.cpu0 != Cpu0::Running || !m.irq_take)
+      break;
+    // An interrupt was pending and unmasked at the block that starts at PC:
+    // take it there, then carry on with the slice from the vector.
+    m.irq_take = false;
+    m.irqs_taken++;
+    if (!take_exception(m.uc, m.pc, EXC_IRQ, 0, 0)) {
+      m.cpu0 = Cpu0::Hung;
+      break;
+    }
+    uc_reg_read(m.uc, UC_ARM64_REG_PC, &m.pc);
+    if (m.ns >= m.target_ns)
+      break;
+  }
   m.in_run = false;
   g_bus_master = prev;
   state->emu_usec = bpmp_usec;
+
+  // RCM_EMU_CPU0_PROFILE=1: one line every second of real time with where
+  // CPU0 is, how much it ran and how many interrupts it took - enough to
+  // tell a hung kernel from a slow one.
+  {
+    static int prof = -1;
+    static uint64_t last_wall = 0, last_ret = 0;
+    if (prof < 0)
+      prof = getenv("RCM_EMU_CPU0_PROFILE") ? 1 : 0;
+    if (prof) {
+      uint64_t wall = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch()).count();
+      if (wall - last_wall >= 1000) {
+        last_wall = wall;
+        printf("[cpu0prof] t=%llu us pc=0x%llX retired=%llu (+%llu) irqs=%llu syncs=%llu smcs=%llu gic=%d\n",
+               (unsigned long long)(m.ns / 1000), (unsigned long long)m.pc,
+               (unsigned long long)m.retired, (unsigned long long)(m.retired - last_ret),
+               (unsigned long long)m.irqs_taken, (unsigned long long)m.syncs_taken,
+               (unsigned long long)m.smcs, gic_highest_pending());
+        last_ret = m.retired;
+        char g27[160];
+        gic_describe(GIC_PPI_VTIMER, g27, sizeof(g27));
+        printf("[cpu0prof]   vtimer ctl %u cval %llu cnt %llu; %s\n", m.cntv_ctl,
+               (unsigned long long)m.cntv_cval, (unsigned long long)(cnt_now() - m.cntvoff), g27);
+        fflush(stdout);
+      }
+    }
+  }
 
   if (m.kill_pending) {
     m.kill_pending = false;
