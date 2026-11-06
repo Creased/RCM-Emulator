@@ -561,6 +561,17 @@ uint32_t gpio_read(EmuState *state, uint64_t addr) {
     return v;
   }
 
+  // Port E IN (bank 1, port 0). PE6 is the left Joy-Con rail's attach line,
+  // active low, as PH6 is the right one's: nothing is plugged in, so it reads
+  // high while undriven. Mirroring OUT answered 0, a Joy-Con on the left rail,
+  // and bdk's driver took UART-C over for good. The rest mirror OUT.
+  if (offset == 0x130) {
+    uint32_t v = mmio_regs.get(addr - 0x10);
+    if (!(mmio_regs.get(GPIO_BASE + 0x110) & (1u << 6)))
+      v |= 1u << 6;
+    return v;
+  }
+
   // Tegra X1 GPIO is organized as 8 banks of 256 bytes; within each
   // bank a port occupies a 4-byte slot at offsets:
   //   CNF  +0x00..0x0F    (GPIO vs SPIO mode select per pin)
