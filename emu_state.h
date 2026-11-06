@@ -635,6 +635,8 @@ struct EmuState {
     static constexpr size_t N_UARTS = 5;
     std::string             uart_tx_log[N_UARTS];
     std::deque<uint8_t>     uart_rx_fifo[N_UARTS];
+    // Bytes the emulated PC sends to a USB serial port (USBSER events).
+    std::deque<uint8_t>     usb_serial_rx;
 };
 
 #endif // EMU_STATE_H

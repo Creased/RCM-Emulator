@@ -17,6 +17,10 @@
 //   touches the screen at (x, y) in the 1280x720 landscape picture bdk's
 //   touch driver reports (Nyx's coordinates), and lifts after hold_ms.
 //
+//     <when> USBSER <text>
+//
+//   types text into the USB serial port the PC has open (escapes as UART).
+//
 //     <when> SNAP <file>
 //
 //   writes the next frame the display shows to <file>, raw like last_fb.rgba
@@ -49,7 +53,7 @@
 
 namespace {
 
-enum class Key { Power, VolUp, VolDown, Uart, UartFile, Tap, Snap };
+enum class Key { Power, VolUp, VolDown, Uart, UartFile, UsbSer, Tap, Snap };
 
 struct Event {
   uint64_t at_us = 0;   // press time
@@ -74,6 +78,7 @@ const char *key_name(Key k) {
   case Key::VolUp: return "VOL+";
   case Key::Uart: return "UART";
   case Key::UartFile: return "UARTFILE";
+  case Key::UsbSer: return "USBSER";
   case Key::Tap: return "TAP";
   case Key::Snap: return "SNAP";
   default: return "VOL-";
@@ -96,6 +101,7 @@ bool parse_key(const std::string &tok, Key *out) {
   // UARTFILE pushes a file's raw contents, for binary protocol work.
   if (s == "UART") { *out = Key::Uart; return true; }
   if (s == "UARTFILE") { *out = Key::UartFile; return true; }
+  if (s == "USBSER") { *out = Key::UsbSer; return true; }
   if (s == "TAP" || s == "T") { *out = Key::Tap; return true; }
   if (s == "SNAP") { *out = Key::Snap; return true; }
   return false;
@@ -184,7 +190,8 @@ bool parse_text(const std::string &text) {
       return false;
     }
 
-    if (ev.key == Key::Uart || ev.key == Key::UartFile || ev.key == Key::Snap) {
+    if (ev.key == Key::Uart || ev.key == Key::UartFile || ev.key == Key::UsbSer ||
+        ev.key == Key::Snap) {
       // Everything after the keyword is the payload; keep interior spacing.
       size_t kpos = raw.find(tok[1]);
       std::string rest = (kpos == std::string::npos)
@@ -195,7 +202,7 @@ bool parse_text(const std::string &text) {
       while (!rest.empty() && (rest.back() == ' ' || rest.back() == '\t' ||
                                rest.back() == '\r'))
         rest.pop_back();
-      ev.data = (ev.key == Key::Uart) ? unescape(rest) : rest;
+      ev.data = (ev.key == Key::Uart || ev.key == Key::UsbSer) ? unescape(rest) : rest;
       ev.until_us = ev.at_us;   // instantaneous, nothing to release
       prev_release_us = ev.at_us;
       g_events.push_back(ev);
@@ -290,6 +297,23 @@ void input_script_tick(EmuState &state) {
     // UART events are one-shot: push the bytes into UART_B's receive FIFO
     // (index 1 = UART_B, the port payloads use for their debug console) and
     // retire the event immediately.
+    if (ev.key == Key::UsbSer) {
+      if (now >= ev.at_us && !ev.pressed) {
+        for (unsigned char ch : ev.data)
+          state.usb_serial_rx.push_back(ch);
+        ev.pressed = ev.released = true;
+        printf("[input-script] USB serial <- %zu byte(s) @%llu us (%zu/%zu)\n",
+               ev.data.size(), (unsigned long long)now, i + 1, g_events.size());
+        fflush(stdout);
+        if (i == g_done) {
+          g_done++;
+          if (g_done == g_events.size())
+            printf("[input-script] sequence complete\n");
+        }
+        continue;
+      }
+      break;
+    }
     if (ev.key == Key::Uart || ev.key == Key::UartFile) {
       if (now >= ev.at_us && !ev.pressed) {
         std::string bytes = ev.data;

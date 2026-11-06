@@ -22,6 +22,11 @@
 //                 (START STOP UNIT, LoEj) and polls TEST UNIT READY until
 //                 the gadget lets go, as Linux does
 //   HID           the report descriptor, SET_IDLE, then interrupt IN reports
+//   CDC ACM       SET_LINE_CODING (115200 8N1) and GET_LINE_CODING,
+//                 SET_CONTROL_LINE_STATE (DTR, RTS), then bulk IN read
+//                 continuously and printed as [usb-serial] lines, the
+//                 notification endpoint polled every 16 ms, and what a
+//                 USBSER script event types sent on bulk OUT
 //
 // With --usb-host nbd[:port] (or [usb] nbd_port) the mass storage session
 // instead locks the medium (PREVENT MEDIUM REMOVAL) and serves the disk over
@@ -161,6 +166,7 @@ enum class Step {
   NbdPrevent, NbdRead, NbdWrite, NbdFlush, NbdTur,
   MscAllow, MscEject, MscAfterEject, MscEjectWait, NbdServe,
   HidReport, HidIdle, HidPoll,
+  CdcSetLine, CdcGetLine, CdcSetCtrl, CdcPoll,
   Idle, Failed,
 };
 
@@ -238,6 +244,11 @@ private:
   uint8_t iface_class_ = 0, iface_sub_ = 0, iface_proto_ = 0;
   uint16_t hid_report_len_ = 0;
   Endpoint bulk_in_, bulk_out_, intr_in_;
+  // A serial port: its data interface, the line being received, the next
+  // notification poll.
+  uint8_t data_iface_ = 0;
+  std::string cdc_line_;
+  uint64_t cdc_notif_us_ = 0;
   std::string vendor_, product_, serial_;
 
   // Mass storage.
@@ -466,8 +477,15 @@ private:
       const uint8_t *d = &cfg_[i];
       size_t n = std::min<size_t>(d[0], cfg_.size() - i);
       if (d[1] == 4 && n >= 9) {          // interface
-        if (!first_iface)
+        if (!first_iface) {
+          // A serial port's data interface, with its bulk endpoints,
+          // follows its communications interface.
+          if (iface_class_ == 0x02 && d[5] == 0x0A) {
+            data_iface_ = d[2];
+            continue;
+          }
           break;                          // the first interface is enough
+        }
         first_iface = false;
         iface_ = d[2];
         iface_class_ = d[5];
@@ -497,6 +515,8 @@ private:
       return "mass storage, bulk-only";
     if (iface_class_ == 0x03)
       return "HID";
+    if (iface_class_ == 0x02 && iface_sub_ == 0x02)
+      return "CDC ACM serial port";
     return "a class this host does not drive";
   }
 
@@ -643,7 +663,8 @@ private:
     }
 
     case Step::HidPoll:
-      finish();                                 // polls the endpoint itself
+    case Step::CdcPoll:
+      finish();                                 // polls the endpoints itself
       return;
 
     case Step::NbdServe:
@@ -741,6 +762,12 @@ private:
     if (iface_class_ == 0x03 && intr_in_.addr) {
       control(0x81, 6, 0x2200, iface_, hid_report_len_ ? hid_report_len_ : 256);
       return go(Step::HidReport);
+    }
+    if (iface_class_ == 0x02 && iface_sub_ == 0x02 && bulk_in_.addr &&
+        bulk_out_.addr) {
+      // As a terminal opening the port: the line coding first.
+      control(0x21, 0x20, 0, iface_, 7, {0x00, 0xC2, 0x01, 0x00, 0, 0, 8});
+      return go(Step::CdcSetLine);
     }
     printf("[usb-host] configured; nothing more to do\n");
     go(Step::Idle);
@@ -1063,6 +1090,80 @@ private:
       reports_ = 0;
       deadline_ = now_us() + kTimeoutUs;
       return go(Step::HidPoll);
+
+    // ---- CDC ACM ----
+
+    case Step::CdcSetLine:
+      printf("[usb-host] SET_LINE_CODING 115200 8N1 %s\n",
+             ctl_.stalled ? "stalled" : "done");
+      control(0xA1, 0x21, 0, iface_, 7);        // GET_LINE_CODING
+      return go(Step::CdcGetLine);
+
+    case Step::CdcGetLine: {
+      const std::vector<uint8_t> &d = ctl_.data;
+      if (ctl_.stalled || d.size() < 7)
+        printf("[usb-host] GET_LINE_CODING %s\n",
+               ctl_.stalled ? "stalled" : "came back short");
+      else
+        printf("[usb-host] GET_LINE_CODING: %u baud, %u data bits, stop %u, "
+               "parity %u\n", d[0] | d[1] << 8 | d[2] << 16 | (uint32_t)d[3] << 24,
+               d[6], d[4], d[5]);
+      control(0x21, 0x22, 0x03, iface_, 0);     // SET_CONTROL_LINE_STATE
+      return go(Step::CdcSetCtrl);
+    }
+
+    case Step::CdcSetCtrl:
+      printf("[usb-host] SET_CONTROL_LINE_STATE DTR RTS %s; reading EP %02X "
+             "(data interface %u)\n", ctl_.stalled ? "stalled" : "done",
+             bulk_in_.addr, data_iface_);
+      cdc_line_.clear();
+      cdc_notif_us_ = 0;
+      return go(Step::CdcPoll);
+
+    case Step::CdcPoll: {
+      // What the device sends, a line at a time.
+      uint8_t buf[512];
+      bool short_pkt = false;
+      int n = dc_->in(bulk_in_.addr & 0xF, buf,
+                      std::min<int>(bulk_in_.max_packet, sizeof(buf)), &short_pkt);
+      for (int i = 0; i < n; i++) {
+        if (buf[i] == '\n') {
+          printf("[usb-serial] %s\n", cdc_line_.c_str());
+          cdc_line_.clear();
+        } else if (buf[i] >= 0x20 && buf[i] < 0x7F) {
+          cdc_line_ += (char)buf[i];
+        }
+      }
+      if (n > 0)
+        progressed_ = true;
+      // What the script types, once the device has a read queued.
+      std::deque<uint8_t> &tx = g_state->usb_serial_rx;
+      if (!tx.empty()) {
+        uint8_t out[512];
+        int len = (int)std::min<size_t>(tx.size(),
+                                         std::min<size_t>(bulk_out_.max_packet, sizeof(out)));
+        std::copy(tx.begin(), tx.begin() + len, out);
+        int m = dc_->out(bulk_out_.addr & 0xF, out, len);
+        if (m > 0) {
+          tx.erase(tx.begin(), tx.begin() + m);
+          printf("[usb-host] %d byte(s) to EP %02X\n", m, bulk_out_.addr);
+          progressed_ = true;
+        }
+      }
+      // The notification endpoint, polled as a PC polls it. This device
+      // never sends on it, so a NAK is the answer expected.
+      if (intr_in_.addr && now_us() >= cdc_notif_us_) {
+        cdc_notif_us_ = now_us() + 16000;
+        uint8_t nb[16];
+        bool sp = false;
+        int k = dc_->in(intr_in_.addr & 0xF, nb, sizeof(nb), &sp);
+        if (k >= 0)
+          printf("[usb-host] serial state notification, %d byte(s)\n", k);
+        else if (k == XFER_STALL)
+          printf("[usb-host] the notification endpoint stalled\n");
+      }
+      return;
+    }
 
     case Step::HidPoll: {
       uint8_t buf[512];
@@ -1419,7 +1520,7 @@ Usb2d g_usb2d;
 // The device side of an xHCI controller, as bdk's xusbd.c drives it on
 // Mariko (register layout in usb_t210.h, TRB and context layouts in xusbd.c).
 // Endpoints are numbered as device context indexes: 0 is the control
-// endpoint, 2 and 3 bulk OUT and IN. Each has a context (16 words at ECP +
+// endpoint, 2n and 2n + 1 endpoint n's OUT and IN. Each has a context (16 words at ECP +
 // 64 * index: word 2 holds its transfer ring's dequeue pointer and DCS) and a
 // ring of 16-byte TRBs the driver fills - Data and Status TRBs on the control
 // ring, Normal TRBs on the bulk ones, a Link TRB closing each ring - ringing
@@ -1483,7 +1584,7 @@ public:
       reg(off) &= ~val;
       return;
     case X_EP_RELOAD:
-      for (int i = 0; i < 4; i++)
+      for (int i = 0; i < 6; i++)
         if (val & (1u << i)) {
           load_ring(i);
           UTRACE("reload ep %d: ring %08X dcs %u\n", i, rings_[i].deq,
@@ -1546,7 +1647,7 @@ public:
   bool setup_taken() override { return true; }
 
   int in(int ep, uint8_t *buf, int max, bool *short_pkt) override {
-    int dci = ep ? 3 : 0;
+    int dci = ep ? ep * 2 + 1 : 0;
     int n = transfer(dci, true, buf, max);
     if (n >= 0) {
       // As on the USB2 controller, a TRB that moved less than the host asked
@@ -1562,7 +1663,7 @@ public:
   }
 
   int out(int ep, const uint8_t *buf, int len) override {
-    return transfer(ep ? 2 : 0, false, const_cast<uint8_t *>(buf), len);
+    return transfer(ep ? ep * 2 : 0, false, const_cast<uint8_t *>(buf), len);
   }
 
   uint32_t address() override { return (reg(X_CTRL) >> 24) & 0x7F; }
@@ -1579,7 +1680,7 @@ private:
     uint32_t deq = 0;
     uint32_t dcs = 0;
     bool valid = false;
-  } rings_[4];
+  } rings_[6];                              // endpoints 0 to 2
 
   uint32_t &reg(uint32_t off) { return regs_[(off % kSize) / 4]; }
 
